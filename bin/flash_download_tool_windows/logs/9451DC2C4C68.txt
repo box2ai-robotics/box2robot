@@ -1,0 +1,40 @@
+*************************** START ****************************
+Chip: ESP32
+Download mode: uart
+Start time: 20260402-14:49
+Connect baud: 115200
+Com:COM36
+connecting...
+MAC: [148, 81, 220, 44, 76, 104]
+crc_cal: 120
+crc_read: 120
+crc_test: 0
+ESP32 MAC CRC OK
+manufacturer_id: 0x46
+device_id: 0x4016
+fs:0x200200
+address/file: 4096 F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_bootloader.bin
+address/file: 32768 F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_partitions.bin
+address/file: 65536 F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_firmware.bin
+Wrote 25968 bytes (16367 compressed) at 0x00001000 in 0.4 seconds (effective 466.2 kbit/s)...
+Wrote 3072 bytes (105 compressed) at 0x00008000 in 0.0 seconds (effective 1072.5 kbit/s)...
+Wrote 1308400 bytes (839639 compressed) at 0x00010000 in 13.5 seconds (effective 774.1 kbit/s)...
+File: F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_bootloader.bin
+File  md5: f3ab162caf851f440cfd2679643cdd76
+Flash md5: f3ab162caf851f440cfd2679643cdd76
+Hash of data verified.
+File: F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_partitions.bin
+File  md5: 2b4b4b97d8ee2913058233539ae5c9e3
+Flash md5: 2b4b4b97d8ee2913058233539ae5c9e3
+Hash of data verified.
+File: F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_firmware.bin
+File  md5: 1dd528c5be29145bb6d4b63585e50ed8
+Flash md5: 1dd528c5be29145bb6d4b63585e50ed8
+Hash of data verified.
+
+Leaving...
+com closed
+Total use time: 19 s
+Download result: PASS
+*************************** END ****************************
+

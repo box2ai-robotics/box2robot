@@ -1,0 +1,28 @@
+*************************** START ****************************
+Chip: ESP32
+Download mode: uart
+Start time: 20260326-20:50
+Connect baud: 115200
+Com:COM36
+connecting...
+MAC: [136, 87, 33, 116, 198, 228]
+crc_cal: 151
+crc_read: 151
+crc_test: 0
+ESP32 MAC CRC OK
+manufacturer_id: 0x46
+device_id: 0x4016
+fs:0x200200
+address/file: 4096 F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_bootloader.bin
+Wrote 25968 bytes (16367 compressed) at 0x00001000 in 0.5 seconds (effective 420.8 kbit/s)...
+File: F:\PhoneArm\ESP32\BoxDriver_D1_joycon\Lerobot-ESP32\lerobot-esp32\bin\flash_download_tool\dl_temp\bin_tmp\downloadPanel1\box2driver_v0.4.5_bootloader.bin
+File  md5: f3ab162caf851f440cfd2679643cdd76
+Flash md5: f3ab162caf851f440cfd2679643cdd76
+Hash of data verified.
+
+Leaving...
+com closed
+Total use time: 3 s
+Download result: PASS
+*************************** END ****************************
+

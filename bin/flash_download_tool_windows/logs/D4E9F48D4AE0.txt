@@ -1,0 +1,57 @@
+*************************** START ****************************
+Chip: ESP32
+Download mode: uart
+Start time: 20260316-18:21
+Connect baud: 115200
+Com:COM27
+connecting...
+MAC: [212, 233, 244, 141, 74, 224]
+crc_cal: 169
+crc_read: 169
+crc_test: 0
+ESP32 MAC CRC OK
+manufacturer_id: 0x68
+device_id: 0x4016
+com closed
+Total use time: 6 s
+Download result: PASS
+*************************** END ****************************
+
+*************************** START ****************************
+Chip: ESP32
+Download mode: uart
+Start time: 20260316-18:26
+Connect baud: 115200
+Com:COM27
+connecting...
+MAC: [212, 233, 244, 141, 74, 224]
+crc_cal: 169
+crc_read: 169
+crc_test: 0
+ESP32 MAC CRC OK
+manufacturer_id: 0x68
+device_id: 0x4016
+com closed
+Total use time: 3 s
+Download result: PASS
+*************************** END ****************************
+
+*************************** START ****************************
+Chip: ESP32
+Download mode: uart
+Start time: 20260316-18:32
+Connect baud: 115200
+Com:COM27
+connecting...
+MAC: [212, 233, 244, 141, 74, 224]
+crc_cal: 169
+crc_read: 169
+crc_test: 0
+ESP32 MAC CRC OK
+manufacturer_id: 0x68
+device_id: 0x4016
+com closed
+Total use time: 3 s
+Download result: PASS
+*************************** END ****************************
+
