@@ -54,6 +54,7 @@ Now open the platform:
 
 Once bound, you have full access to all platform features:
 - **Remote Control** — Joystick control from the app
+- **AI Agent Control** — Use Claude Code, GPT, or any LLM agent to control your robot arm via CLI (see [AI Agent Control](#ai-agent-control) below)
 - **Calibration** — Auto-calibrate servo limits or manual center offset
 - **Data Collection** — Leader-Follower ESP-NOW dual-arm recording with camera sync
 - **Cloud Training** — Submit training jobs, monitor progress, deploy models
@@ -66,6 +67,7 @@ Once bound, you have full access to all platform features:
 |--------|--------|-------------|
 | **Arm Driver Board Firmware** | Open | ESP32 servo driver, ESP-NOW sync, WiFi+WS, calibration, OTA |
 | **Vision-Audio Module Firmware** | Open | ESP32-S3 camera (OV3660) + audio (ES8311), MJPEG stream, ADPCM voice |
+| **Skills CLI (AI Agent Control)** | Open | One-line CLI + SKILLS.md for Claude Code / GPT / any LLM agent |
 | **Flash Tools & Drivers** | Open | esptool, Flash Download Tool (Windows GUI), CP210x USB driver |
 | Cloud Platform (Server + App) | Coming soon | aiohttp backend + Vue3 UniApp frontend |
 | GPU Worker (Training & Inference) | Coming soon | LeRobot ACT framework, cloud training pipeline |
@@ -77,6 +79,7 @@ Once bound, you have full access to all platform features:
 ┌─────────────────────────────────────────────────────────────┐
 │  Cloud Platform: robot.box2ai.com                           │
 │  ├── User App (H5/Mobile)                                   │
+│  ├── AI Agent CLI (Claude Code / GPT → b2r.py → HTTP API)  │
 │  ├── ACT Skill Store (shared skills & models)               │
 │  ├── Cloud Training (submit job → GPU train → deploy)       │
 │  └── WebSocket Relay (real-time device control)             │
@@ -118,6 +121,14 @@ Once bound, you have full access to all platform features:
 - **Display:** SSD1306 OLED (128x64, binding code display)
 - **LED:** WS2812 RGB x2 (mode + status indicators)
 - **Features:** Auto-calibration, OTA update, trajectory record/playback, Go Home
+
+### Driver Enclosure Mounting
+
+The driver board is housed in a 3D-printed enclosure, which mounts to the robot arm's wrist joint area. Secure the enclosure to the arm structure using screws as shown (red box):
+
+<div align="center">
+  <img src="assets/Drive_enclosure_mounting_method.jpg" alt="Driver Enclosure Mounting" width="500"/>
+</div>
 
 ### Vision-Audio Module (ESP32-S3)
 
@@ -173,6 +184,83 @@ The firmware auto-detects servo type on boot, but **the two brands use different
 | **Feetech (飞特)** | Reversed | Connectors face opposite directions |
 
 > **Warning:** Using the wrong cable orientation may damage your servos or controller board. Always verify before connecting.
+
+### Camera Module Installation
+
+The Vision-Audio Module mounts onto the gripper of the robot arm. Follow these 4 steps:
+
+**Step 1 & 2: Locate the built-in nuts and mounting holes**
+
+The gripper has **hex nuts pre-embedded inside** (highlighted in red circle on the left). The corresponding **mounting holes are on the exterior** of the gripper (right).
+
+| Built-in Nuts (inside gripper) | Mounting Holes (outside) |
+|:---:|:---:|
+| ![Built-in nuts](assets/Camera_base%20mounting_nut.jpg) | ![Mounting holes](assets/Camera_base_mounting_hole.jpg) |
+
+**Step 3 & 4: Mount the camera base, then attach the camera**
+
+Align the camera base bracket with the mounting holes and secure with **two screws** (left). Then place the AtomS3R camera module (with Atomic Echo Base) onto the bracket and fix it with screws (right). Route the cable through the arm.
+
+| Camera Base Fixed with Screws | Camera Module Installed |
+|:---:|:---:|
+| ![Camera base fixed](assets/Camera_base_screw_placement_fixation.jpg) | ![Camera installed](assets/Camera_placement_and_screw_fixation.jpg) |
+
+## AI Agent Control
+
+Beyond the web interface, you can control your robot arm directly from **Claude Code**, **GPT**, or any AI agent using the `box2robot_skills/` CLI. This enables remote control, automation, and AI-driven task orchestration — all from your terminal.
+
+### Quick Start
+
+```bash
+cd box2robot_skills
+
+# 1. Login (token cached to ~/.b2r_token, no need to login again)
+python b2r.py login <username> <password>
+
+# 2. List devices
+python b2r.py devices
+
+# 3. Control
+python b2r.py home                    # Go to home position
+python b2r.py move 1 2048 500         # Move servo #1 to position 2048
+python b2r.py torque off              # Release torque (manual drag)
+python b2r.py record start            # Start recording trajectory
+python b2r.py record stop             # Stop recording
+python b2r.py play                    # List & play trajectories
+python b2r.py say "take a photo"      # Natural language command
+python b2r.py shell                   # Interactive shell mode
+```
+
+### Use with Claude Code
+
+Give Claude Code access to your robot arm by pointing it to the `SKILLS.md` file:
+
+```
+# In Claude Code, just ask:
+"Read box2robot_skills/SKILLS.md, then move servo 1 to position 2048"
+"Record a trajectory of me moving the arm, then play it back"
+"Check servo status and go to home position"
+```
+
+Claude Code will use `b2r.py` CLI commands to control the robot arm remotely — no web interface needed. The `SKILLS.md` file contains the full AI agent dispatch reference (all 79 actions, preflight checks, and workflow templates).
+
+### Available Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `login [user] [pass]` | Login & cache token | `b2r.py login user pass` |
+| `devices` | List all devices | `b2r.py devices` |
+| `status` | Servo positions & torque | `b2r.py status` |
+| `move <id> <pos> [speed]` | Move single servo | `b2r.py move 1 2048 500` |
+| `home` | Go to home position | `b2r.py home` |
+| `torque on/off` | Torque lock/release | `b2r.py torque off` |
+| `record start/stop` | Record trajectory | `b2r.py record start` |
+| `play [traj_id]` | Play trajectory | `b2r.py play` |
+| `say "text"` | Natural language command | `b2r.py say "take a photo"` |
+| `exec <action>` | Call any Action directly | `b2r.py exec camera.snapshot` |
+| `shell` | Interactive shell | `b2r.py shell` |
+
+> See `box2robot_skills/SKILLS.md` for the complete AI agent reference and `box2robot_skills/README.md` for details.
 
 ## Flash Firmware
 
@@ -282,7 +370,12 @@ box2robot/
 │   ├── hardware.jpg                         # Arm Driver Board photo
 │   ├── hardware_SchDoc.png                  # Arm Driver Board schematic
 │   ├── hardware_cam.jpg                      # Vision-Audio Module photo
+│   ├── Drive_enclosure_mounting_method.jpg   # Driver enclosure mounting
 │   ├── Hiwonder-feetech.png                # Servo cable orientation
+│   ├── Camera_base mounting_nut.jpg         # Camera install: built-in nuts
+│   ├── Camera_base_mounting_hole.jpg        # Camera install: mounting holes
+│   ├── Camera_base_screw_placement_fixation.jpg  # Camera install: base fixed
+│   ├── Camera_placement_and_screw_fixation.jpg   # Camera install: module mounted
 │   ├── flash_esp32.jpg                      # Flash tool: chip selection
 │   ├── flash_select_bins.jpg                # Flash tool: bin file selection
 │   └── flahs_succesful.jpg                  # Flash tool: success screen
@@ -297,6 +390,10 @@ box2robot/
 │   │   └── box2cam_v0.5.1_firmware.bin      # Application (addr: 0x10000)
 │   ├── flash_download_tool_windows/         # Espressif Flash Download Tool (Windows)
 │   └── download_driver_CP210x_USB_TO_UART/  # USB-to-UART driver (Windows)
+├── box2robot_skills/                        # AI Agent CLI (Claude Code / GPT control)
+│   ├── b2r.py                               # One-line command entry point
+│   ├── SKILLS.md                            # AI Agent dispatch reference (79 actions)
+│   └── README.md                            # CLI quick start guide
 ├── box2robot_dashboard/                     # (Coming soon) LAN Dashboard
 ├── box2robot_gpu_worker/                    # (Coming soon) Training & Inference
 ├── box2roboy_audio/                         # (Coming soon) Voice AI Node

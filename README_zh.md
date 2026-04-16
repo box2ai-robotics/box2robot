@@ -54,6 +54,7 @@ Box2Robot 是一个基于 ESP32 机械臂和视觉模块的开源具身智能平
 
 绑定完成后，即可使用平台全部功能：
 - **远程遥控** — APP 摇杆控制机械臂
+- **AI 智能体控制** — 通过 Claude Code、GPT 等 AI 智能体远程控制机械臂（见下方 [AI 智能体控制](#ai-智能体控制)）
 - **校准** — 自动校准舵机行程 / 手动中心偏移校准
 - **数据采集** — Leader-Follower ESP-NOW 双臂录制 + 摄像头同步
 - **云端训练** — 提交训练任务、监控进度、部署模型
@@ -66,6 +67,7 @@ Box2Robot 是一个基于 ESP32 机械臂和视觉模块的开源具身智能平
 |------|------|------|
 | **机械臂驱动板固件** | 已开源 | ESP32 舵机驱动、ESP-NOW 同步、WiFi+WS、校准、OTA |
 | **视觉语音模块固件** | 已开源 | ESP32-S3 摄像头 (OV3660) + 音频 (ES8311)、MJPEG 推流、ADPCM 语音 |
+| **Skills CLI (AI 智能体控制)** | 已开源 | 一行命令 CLI + SKILLS.md 供 Claude Code / GPT 等 AI 智能体调度 |
 | **烧录工具 & 驱动** | 已开源 | esptool、Flash Download Tool (Windows)、CP210x USB 驱动 |
 | 云端平台 (后端 + 前端) | 即将开放 | aiohttp 后端 + Vue3 UniApp 前端 |
 | GPU Worker (训练 & 推理) | 即将开放 | LeRobot ACT 框架、云端训练流水线 |
@@ -77,6 +79,7 @@ Box2Robot 是一个基于 ESP32 机械臂和视觉模块的开源具身智能平
 ┌─────────────────────────────────────────────────────────────┐
 │  云端平台: robot.box2ai.com                                  │
 │  ├── 用户 APP (H5/手机)                                      │
+│  ├── AI 智能体 CLI (Claude Code / GPT → b2r.py → HTTP API)  │
 │  ├── ACT 技能商店 (共享技能与模型)                              │
 │  ├── 云端训练 (提交任务 → GPU 训练 → 部署)                     │
 │  └── WebSocket 中继 (实时设备控制)                             │
@@ -118,6 +121,14 @@ Box2Robot 是一个基于 ESP32 机械臂和视觉模块的开源具身智能平
 - **显示：** SSD1306 OLED (128x64，显示绑定码)
 - **指示灯：** WS2812 RGB x2 (模式 + 状态指示)
 - **功能：** 自动校准、OTA 升级、轨迹录制/回放、回零位
+
+### 驱动盒安装
+
+驱动板装在 3D 打印的驱动盒中，固定在机械臂腕部关节处。如图所示（红框标注），用螺丝将驱动盒固定到臂体结构上：
+
+<div align="center">
+  <img src="assets/Drive_enclosure_mounting_method.jpg" alt="驱动盒安装方式" width="500"/>
+</div>
 
 ### 视觉语音模块 (ESP32-S3)
 
@@ -174,6 +185,83 @@ Box2Robot 是一个基于 ESP32 机械臂和视觉模块的开源具身智能平
 | **飞特 (Feetech)** | 反向 | 两端接插件面朝相反方向 |
 
 > **警告：** 使用错误的线序可能损坏舵机或驱动板。连接前务必确认线序与舵机品牌匹配。
+
+### 摄像头模块安装
+
+视觉语音模块安装在机械臂末端夹爪上，按以下 4 步操作：
+
+**第 1 & 2 步：确认内嵌螺母和安装孔位**
+
+夹爪内部**预埋了六角螺母**（左图红圈标注）。对应的**安装孔位在夹爪外侧**（右图红圈标注）。
+
+| 内嵌螺母（夹爪内部） | 安装孔位（夹爪外侧） |
+|:---:|:---:|
+| ![内嵌螺母](assets/Camera_base%20mounting_nut.jpg) | ![安装孔位](assets/Camera_base_mounting_hole.jpg) |
+
+**第 3 & 4 步：固定摄像头底座，安装摄像头**
+
+将摄像头底座支架对准安装孔，用**两颗螺丝**拧紧固定（左图）。然后将 AtomS3R 摄像头模块（含 Atomic Echo Base 音频底座）放置到支架上，用螺丝固定（右图）。线缆沿机械臂走线。
+
+| 螺丝固定摄像头底座 | 安装摄像头模块 |
+|:---:|:---:|
+| ![固定底座](assets/Camera_base_screw_placement_fixation.jpg) | ![安装摄像头](assets/Camera_placement_and_screw_fixation.jpg) |
+
+## AI 智能体控制
+
+除了网页端控制，你还可以通过 **Claude Code**、**GPT** 等 AI 智能体，使用 `box2robot_skills/` CLI 直接远程控制机械臂。无需打开浏览器，在终端即可完成自动化控制和 AI 驱动的任务编排。
+
+### 快速开始
+
+```bash
+cd box2robot_skills
+
+# 1. 登录 (token 缓存到 ~/.b2r_token，后续免登录)
+python b2r.py login <username> <password>
+
+# 2. 查看设备
+python b2r.py devices
+
+# 3. 操控
+python b2r.py home                    # 回零位
+python b2r.py move 1 2048 500         # 1号舵机转到2048
+python b2r.py torque off              # 释放力矩 (可手动拖拽)
+python b2r.py record start            # 开始录制轨迹
+python b2r.py record stop             # 停止录制
+python b2r.py play                    # 列出并播放轨迹
+python b2r.py say "拍个照"             # 自然语言指令
+python b2r.py shell                   # 交互式 Shell
+```
+
+### 配合 Claude Code 使用
+
+让 Claude Code 读取 `SKILLS.md` 即可获得完整的机械臂控制能力：
+
+```
+# 在 Claude Code 中直接说：
+"读一下 box2robot_skills/SKILLS.md，然后把1号舵机转到2048"
+"录一段我拖动机械臂的轨迹，录完后播放一遍"
+"查看舵机状态，然后回零位"
+```
+
+Claude Code 会通过 `b2r.py` CLI 命令远程控制机械臂 —— 无需打开网页。`SKILLS.md` 包含完整的 AI 智能体调度参考（79 个 Action、预检规则、工作流模板）。
+
+### 全部命令
+
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `login [user] [pass]` | 登录并缓存 token | `b2r.py login user pass` |
+| `devices` | 列出所有设备 | `b2r.py devices` |
+| `status` | 舵机位置和力矩状态 | `b2r.py status` |
+| `move <id> <pos> [speed]` | 移动单个舵机 | `b2r.py move 1 2048 500` |
+| `home` | 回零位 | `b2r.py home` |
+| `torque on/off` | 力矩锁定/释放 | `b2r.py torque off` |
+| `record start/stop` | 录制轨迹 | `b2r.py record start` |
+| `play [traj_id]` | 播放轨迹 | `b2r.py play` |
+| `say "文本"` | 自然语言指令 | `b2r.py say "拍个照"` |
+| `exec <action>` | 直接调用 Action | `b2r.py exec camera.snapshot` |
+| `shell` | 交互式 Shell | `b2r.py shell` |
+
+> 详见 `box2robot_skills/SKILLS.md`（AI 智能体调度手册）和 `box2robot_skills/README.md`。
 
 ## 烧录固件
 
@@ -283,7 +371,12 @@ box2robot/
 │   ├── hardware.jpg                         # 驱动板实物照片
 │   ├── hardware_SchDoc.png                  # 驱动板原理图
 │   ├── hardware_cam.jpg                      # 视觉语音模块照片
+│   ├── Drive_enclosure_mounting_method.jpg   # 驱动盒安装方式
 │   ├── Hiwonder-feetech.png                # 舵机线序对比
+│   ├── Camera_base mounting_nut.jpg         # 摄像头安装：内嵌螺母
+│   ├── Camera_base_mounting_hole.jpg        # 摄像头安装：安装孔位
+│   ├── Camera_base_screw_placement_fixation.jpg  # 摄像头安装：固定底座
+│   ├── Camera_placement_and_screw_fixation.jpg   # 摄像头安装：安装模块
 │   ├── flash_esp32.jpg                      # 烧录工具：芯片选择
 │   ├── flash_select_bins.jpg                # 烧录工具：文件选择
 │   └── flahs_succesful.jpg                  # 烧录工具：烧录成功
@@ -298,6 +391,10 @@ box2robot/
 │   │   └── box2cam_v0.5.1_firmware.bin      # 应用固件 (地址: 0x10000)
 │   ├── flash_download_tool_windows/         # Espressif Flash Download Tool (Windows)
 │   └── download_driver_CP210x_USB_TO_UART/  # USB 转串口驱动 (Windows)
+├── box2robot_skills/                        # AI 智能体 CLI (Claude Code / GPT 远程控制)
+│   ├── b2r.py                               # 一行命令入口
+│   ├── SKILLS.md                            # AI 智能体调度手册 (79 个 Action)
+│   └── README.md                            # CLI 快速开始
 ├── box2robot_dashboard/                     # (即将开放) 局域网 Dashboard
 ├── box2robot_gpu_worker/                    # (即将开放) 训练与推理
 ├── box2roboy_audio/                         # (即将开放) 语音 AI 节点
