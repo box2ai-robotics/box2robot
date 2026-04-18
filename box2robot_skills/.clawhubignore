@@ -1,0 +1,8 @@
+backup/
+__pycache__/
+*.pyc
+.env
+.b2r_token
+*.egg-info/
+dist/
+build/

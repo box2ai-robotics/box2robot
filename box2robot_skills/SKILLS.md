@@ -1,311 +1,313 @@
-# Box2Robot Skills — AI Agent 调度手册
+# Box2Robot Skills — AI Agent Reference Manual
 
-> 本文件供 Claude / GPT / CLAW 等 LLM Agent 在调度 Box2Robot 时参考。
-> Agent 通过 `b2r.py` CLI 或 HTTP API 控制机械臂。
+> This document is for LLM Agents (Claude / GPT / CLAW etc.) to reference when orchestrating Box2Robot.
+> Agents control the robotic arm via the `b2r.py` CLI or HTTP API.
 
 ---
 
-## 认证
+## Authentication
 
 ```bash
-# 登录 (一次性, token 自动缓存到 ~/.b2r_token)
+# Login (one-time, token cached to ~/.b2r_token)
 python b2r.py login <username> <password>
 
-# 或直接设环境变量
+# Or set environment variables directly
 export B2R_SERVER="https://robot.box2ai.com"
 export B2R_TOKEN="<jwt_token>"
 export B2R_DEVICE="B2R-XXXXXXXXXXXX"
 ```
 
-登录后所有命令自动携带 token，无需重复认证。
+Once logged in, all commands carry the token automatically — no repeated authentication needed.
 
 ---
 
-## CLI 命令速查
+## CLI Quick Reference
 
-### 设备
+### Devices
 ```bash
-b2r.py devices                     # 列出设备 (* 表示在线)
-b2r.py status                      # 当前舵机位置和力矩
+b2r.py devices                     # List devices (* = online)
+b2r.py status                      # Current servo positions and torque
 ```
 
-### 舵机控制
+### Servo Control
 ```bash
-b2r.py torque on                   # 锁定舵机
-b2r.py torque off                  # 释放 (可手动拖拽)
-b2r.py home                        # 安全回零位
-b2r.py move <舵机ID> <位置> [速度]  # 移动单个舵机
-# 位置: 0-4095 (中位 2048), 速度: 0-4000 (默认 1000)
-# 10° ≈ 114 counts
+b2r.py torque on                   # Lock servos
+b2r.py torque off                  # Release (allows manual dragging)
+b2r.py home                        # Safe return to home position
+b2r.py move <servo_id> <pos> [spd] # Move a single servo
+# Position: 0-4095 (center 2048), Speed: 0-4000 (default 1000)
+# 10 degrees ~ 114 counts
 ```
 
-### 录制与回放
+### Recording & Playback
 ```bash
-b2r.py record start                # 开始录制
-b2r.py record stop [名称]          # 停止录制
-b2r.py record status               # 录制状态
-b2r.py play                        # 列出所有轨迹
-b2r.py play <traj_id>              # 播放轨迹
+b2r.py record start                # Start recording
+b2r.py record stop [name]          # Stop recording
+b2r.py record status               # Recording status
+b2r.py play                        # List all trajectories
+b2r.py play <traj_id>              # Play a trajectory
 ```
 
-### 高级调用
+### Advanced
 ```bash
-b2r.py exec <action> [参数]        # 调用任意 Action
-b2r.py say "自然语言"               # 自然语言执行
-b2r.py shell                       # 交互式 Shell
+b2r.py exec <action> [params]      # Call any Action directly
+b2r.py say "natural language"      # Natural language execution
+b2r.py shell                       # Interactive shell
 ```
 
 ---
 
-## Action 体系 (79 个)
+## Action System (79 Actions)
 
-通过 `b2r.py exec <action_name>` 调用，参数用 JSON 或 key=value 格式。
+Invoke via `b2r.py exec <action_name>`. Parameters in JSON or key=value format.
 
-### device (设备管理)
-| Action | 说明 |
-|--------|------|
-| `device.list` | 列出设备 |
-| `device.status` | 设备状态 (控制模式+舵机) |
-| `device.bind` | 绑定设备 (需 bind_code) |
-| `device.unbind` | 解绑设备 |
-| `device.rename` | 改名 |
-| `device.wifi_add` | 添加WiFi |
-| `device.wifi_clear` | 清除WiFi配置 |
-| `device.factory_reset` | 恢复出厂 |
+### device (Device Management)
+| Action | Description |
+|--------|-------------|
+| `device.list` | List devices |
+| `device.status` | Device status (control mode + servos) |
+| `device.bind` | Bind device (requires bind_code) |
+| `device.unbind` | Unbind device |
+| `device.rename` | Rename device |
+| `device.wifi_add` | Add WiFi network |
+| `device.wifi_clear` | Clear WiFi config |
+| `device.factory_reset` | Factory reset |
 
-### servo (舵机控制)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `servo.status` | device_id | 读取位置/负载/温度 |
-| `servo.move` | device_id, servo_id, position, [speed] | 移动单个 |
-| `servo.move_batch` | device_id, commands:[{id,position,speed}] | 批量移动 |
-| `servo.torque` | device_id, enable:bool | 力矩开关 |
-| `servo.go_home` | device_id | 回零位 |
-| `servo.release_control` | device_id | 释放当前控制 |
-| `servo.control_mode` | device_id | 查询控制模式 |
-| `servo.set_id` | device_id, old_id, new_id | 烧录舵机ID |
+### servo (Servo Control)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `servo.status` | device_id | Read position/load/temperature |
+| `servo.move` | device_id, servo_id, position, [speed] | Move single servo |
+| `servo.move_batch` | device_id, commands:[{id,position,speed}] | Batch move |
+| `servo.torque` | device_id, enable:bool | Toggle torque |
+| `servo.go_home` | device_id | Return to home position |
+| `servo.release_control` | device_id | Release current control |
+| `servo.control_mode` | device_id | Query control mode |
+| `servo.set_id` | device_id, old_id, new_id | Burn servo ID |
 
-### recording (录制回放)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `record.start` | device_id, [mode], [camera_id] | 开始录制 (single/dual/phone) |
-| `record.stop` | device_id, [name] | 停止录制 |
-| `record.status` | device_id | 录制状态 |
-| `trajectory.list` | device_id | 轨迹列表 |
-| `trajectory.play` | device_id, trajectory_id | 播放 |
-| `trajectory.stop` | device_id, trajectory_id | 停止播放 |
-| `trajectory.delete` | device_id, trajectory_id | 删除 |
-| `trajectory.images` | device_id, trajectory_id | 轨迹图像 |
+### recording (Recording & Playback)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `record.start` | device_id, [mode], [camera_id] | Start recording (single/dual/phone) |
+| `record.stop` | device_id, [name] | Stop recording |
+| `record.status` | device_id | Recording status |
+| `trajectory.list` | device_id | List trajectories |
+| `trajectory.play` | device_id, trajectory_id | Play trajectory |
+| `trajectory.stop` | device_id, trajectory_id | Stop playback |
+| `trajectory.delete` | device_id, trajectory_id | Delete trajectory |
+| `trajectory.images` | device_id, trajectory_id | Trajectory images |
 
-### pairing (主从配对)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `pairing.list` | — | 列出配对 |
-| `pairing.create` | leader_id, follower_ids, [use_espnow] | 创建配对 |
-| `pairing.disconnect` | leader_id | 断开 (保留记录) |
-| `pairing.connect` | leader_id | 重连 |
-| `pairing.delete` | leader_id | 删除配对 |
-| `espnow.discover` | — | 扫描附近设备 |
-| `espnow.peers` | device_id | 查看邻居 |
+### pairing (Leader-Follower Pairing)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `pairing.list` | — | List pairings |
+| `pairing.create` | leader_id, follower_ids, [use_espnow] | Create pairing |
+| `pairing.disconnect` | leader_id | Disconnect (keep record) |
+| `pairing.connect` | leader_id | Reconnect |
+| `pairing.delete` | leader_id | Delete pairing |
+| `espnow.discover` | — | Scan nearby devices |
+| `espnow.peers` | device_id | View neighbors |
 
-### calibration (校准)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `calibrate.auto` | device_id, [servo_id=0] | 自动校准 (0=全部) |
-| `calibrate.status` | device_id | 校准进度 |
-| `calibrate.cancel` | device_id | 取消 |
-| `calibrate.manual` | device_id, servos:[{id,min,max,mid}] | 手动 |
-| `calibrate.center_offset` | device_id | 写入EEPROM中心偏移 |
+### calibration (Calibration)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `calibrate.auto` | device_id, [servo_id=0] | Auto-calibrate (0 = all) |
+| `calibrate.status` | device_id | Calibration progress |
+| `calibrate.cancel` | device_id | Cancel calibration |
+| `calibrate.manual` | device_id, servos:[{id,min,max,mid}] | Manual calibration |
+| `calibrate.center_offset` | device_id | Write EEPROM center offset |
 
-### camera (摄像头/语音)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `camera.status` | device_id | 摄像头状态 |
-| `camera.snapshot` | device_id | 拍照 |
-| `camera.stream_mode` | device_id, mode | 流模式 (idle/preview/inference) |
-| `camera.frame` | device_id | 获取最新一帧 JPEG |
-| `camera.voice_start` | device_id | 开麦 |
-| `camera.voice_stop` | device_id | 关麦 |
-| `camera.tts` | device_id, prompt | TTS播报 |
-| `camera.play_sound` | device_id, sound | 播放音效 |
-| `camera.record_audio_start` | device_id | 开始录音 |
-| `camera.record_audio_stop` | device_id | 停止录音 |
-| `camera.recordings` | device_id | 录音列表 |
+### camera (Camera & Voice)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `camera.status` | device_id | Camera status |
+| `camera.snapshot` | device_id | Take photo |
+| `camera.stream_mode` | device_id, mode | Stream mode (idle/preview/inference) |
+| `camera.frame` | device_id | Get latest JPEG frame |
+| `camera.voice_start` | device_id | Enable microphone |
+| `camera.voice_stop` | device_id | Disable microphone |
+| `camera.tts` | device_id, prompt | Text-to-speech |
+| `camera.play_sound` | device_id, sound | Play sound effect |
+| `camera.record_audio_start` | device_id | Start audio recording |
+| `camera.record_audio_stop` | device_id | Stop audio recording |
+| `camera.recordings` | device_id | List recordings |
 
-### training (训练/推理)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `training.submit` | name, dataset_ids, [model_type], [train_steps] | 提交训练 |
-| `training.list` | [page] | 任务列表 |
-| `training.status` | job_id | 训练进度 |
-| `training.cancel` | job_id | 取消 |
-| `training.deploy` | job_id, arm_device_id, gpu_device_id | 部署推理 |
-| `training.stop_inference` | job_id | 停止推理 |
-| `training.rate` | job_id, rating(1-5) | 评分 |
+### training (Training & Inference)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `training.submit` | name, dataset_ids, [model_type], [train_steps] | Submit training job |
+| `training.list` | [page] | Job list |
+| `training.status` | job_id | Training progress |
+| `training.cancel` | job_id | Cancel job |
+| `training.deploy` | job_id, arm_device_id, gpu_device_id | Deploy inference |
+| `training.stop_inference` | job_id | Stop inference |
+| `training.rate` | job_id, rating(1-5) | Rate result |
 
-### store (技能商店)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `store.list` | [search], [category] | 浏览商店 |
-| `store.execute` | task_id, device_id | 执行技能 |
-| `store.purchase` | task_id | 购买 |
-| `store.favorite` | task_id | 收藏 |
-| `store.like` | task_id | 点赞 |
-| `store.rate` | task_id, rating(1-5) | 评分 |
+### store (Skill Store)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `store.list` | [search], [category] | Browse store |
+| `store.execute` | task_id, device_id | Execute skill |
+| `store.purchase` | task_id | Purchase |
+| `store.favorite` | task_id | Favorite |
+| `store.like` | task_id | Like |
+| `store.rate` | task_id, rating(1-5) | Rate |
 
-### config (配置/OTA)
-| Action | 参数 | 说明 |
-|--------|------|------|
-| `config.get` | device_id | 查看配置 |
-| `config.set` | device_id, params:{key:val} | 修改配置 |
-| `config.speed` | device_id, speed(100-4000) | 调速 |
-| `config.led_brightness` | device_id, brightness(0-255) | LED亮度 |
-| `config.volume` | device_id, volume(0-255) | 音量 |
-| `config.camera_resolution` | device_id, resolution | 分辨率 |
-| `config.bluetooth` | device_id, enable:bool | 蓝牙开关 |
-| `ota.check` | — | 检查固件更新 |
-| `ota.update` | device_id | 推送更新 |
-
----
-
-## 自然语言映射
-
-`b2r.py say "文本"` 或交互 Shell 中直接输入：
-
-| 语音 | 映射到 |
-|------|--------|
-| "回零位" / "回家" | servo.go_home |
-| "释放力矩" / "松手" | servo.torque(False) |
-| "锁住" | servo.torque(True) |
-| "开始录制" / "我教你" | record.start |
-| "停止录制" / "录完了" | record.stop |
-| "拍照" | camera.snapshot |
-| "打开摄像头" | camera.stream_mode(preview) |
-| "自动校准" | calibrate.auto |
-| "声音大一点" | config.volume(200) |
-| "速度快一点" | config.speed(2000) |
-| "灯亮一点" | config.led_brightness(200) |
-| "1号舵机转到2048" | servo.move(1, 2048) |
-| "录制5个数据集" | workflow.batch_record(5) |
-| "我教你跳个舞" | workflow.teach_single |
+### config (Configuration & OTA)
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `config.get` | device_id | View config |
+| `config.set` | device_id, params:{key:val} | Update config |
+| `config.speed` | device_id, speed(100-4000) | Set speed |
+| `config.led_brightness` | device_id, brightness(0-255) | LED brightness |
+| `config.volume` | device_id, volume(0-255) | Volume |
+| `config.camera_resolution` | device_id, resolution | Resolution |
+| `config.bluetooth` | device_id, enable:bool | Bluetooth toggle |
+| `ota.check` | — | Check firmware update |
+| `ota.update` | device_id | Push update |
 
 ---
 
-## 预检规则
+## Natural Language Mapping
 
-Agent 在执行动作前必须检查：
+Via `b2r.py say "text"` or directly in the interactive shell:
 
-| 步骤 | 检查内容 | 失败处理 |
-|------|---------|---------|
-| ① | 设备在线 | "设备离线，检查电源" |
-| ② | 设备类型 = arm | "不是机械臂" |
-| ③ | 控制模式 = idle | release_control 释放 |
-| ④ | 有校准数据 | calibrate.auto 自动校准 |
-| ⑤ | 舵机数量匹配 | 轨迹需 N 轴 vs 设备 M 轴 |
-| ⑥ | 校准范围兼容 | ratio < 0.5 则不兼容 |
-| ⑦ | 视觉任务: cam+gpu 在线 | 提示哪个设备缺失 |
+| Input | Maps to |
+|-------|---------|
+| "go home" / "return home" | servo.go_home |
+| "release torque" / "let go" | servo.torque(False) |
+| "lock" / "hold" | servo.torque(True) |
+| "start recording" / "teach me" | record.start |
+| "stop recording" / "done recording" | record.stop |
+| "take a photo" / "snapshot" | camera.snapshot |
+| "open camera" | camera.stream_mode(preview) |
+| "auto calibrate" | calibrate.auto |
+| "louder" / "turn up volume" | config.volume(200) |
+| "faster" / "speed up" | config.speed(2000) |
+| "brighter" | config.led_brightness(200) |
+| "move servo 1 to 2048" | servo.move(1, 2048) |
+| "record 5 datasets" | workflow.batch_record(5) |
+| "teach you to dance" | workflow.teach_single |
+
+> Chinese natural language is also fully supported (e.g., "回零位", "释放力矩", "拍照").
 
 ---
 
-## 典型场景编排
+## Preflight Checks
 
-### 场景1: "请挥挥手"
+Agents must verify before executing actions:
+
+| Step | Check | On Failure |
+|------|-------|------------|
+| 1 | Device online | "Device offline — check power" |
+| 2 | Device type = arm | "Not a robotic arm" |
+| 3 | Control mode = idle | release_control to free |
+| 4 | Calibration data exists | calibrate.auto to calibrate |
+| 5 | Servo count matches | Trajectory needs N axes vs device has M |
+| 6 | Calibration range compatible | ratio < 0.5 = incompatible |
+| 7 | Vision tasks: cam + gpu online | Report which device is missing |
+
+---
+
+## Typical Orchestration Scenarios
+
+### Scenario 1: "Wave your hand"
 ```
-1. say "挥手" → 搜索本地轨迹/商店
-2. 找到 → 预检 → trajectory.play 或 store.execute
-3. 没找到 → 建议 "可以录制一个: 我教你挥手"
+1. say "wave" → search local trajectories / store
+2. Found → preflight → trajectory.play or store.execute
+3. Not found → suggest "You can record one: teach me to wave"
 ```
 
-### 场景2: "我教你倒水, 录5个"
+### Scenario 2: "Teach you to pour water, record 5 demos"
 ```
-1. torque off                              # 释放力矩
-2. camera.stream_mode(cam_id, "preview")   # 开摄像头
-3. 循环5次:
-   record.start(mode="single", camera_id)  # 录制
-   [用户演示]
-   record.stop(name="倒水_{n}")            # 保存
-4. training.submit(name="倒水", dataset_ids) # 提交训练
+1. torque off                              # Release torque
+2. camera.stream_mode(cam_id, "preview")   # Open camera
+3. Loop 5 times:
+   record.start(mode="single", camera_id)  # Record
+   [user demonstrates]
+   record.stop(name="pour_water_{n}")      # Save
+4. training.submit(name="pour_water", dataset_ids)  # Submit training
 ```
 
-### 场景3: 视觉推理闭环
+### Scenario 3: Visual Inference Loop
 ```
 1. training.deploy(job_id, arm_id, gpu_id, cam_id)
-2. GPU Worker 自动: 取图 → 推理 → 发指令 → arm 执行
-3. training.stop_inference(job_id)  # 停止
+2. GPU Worker auto-loop: capture image → inference → send command → arm executes
+3. training.stop_inference(job_id)  # Stop
 ```
 
 ---
 
-## HTTP API 直接调用
+## HTTP API Direct Access
 
-不用 CLI 也可以直接调 HTTP API：
+You can also call the HTTP API directly without the CLI:
 
 ```bash
-# 登录
+# Login
 curl -X POST https://robot.box2ai.com/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"xxx","password":"xxx"}'
 # → {"token": "eyJ..."}
 
-# 设备列表
+# List devices
 curl https://robot.box2ai.com/api/devices \
   -H "Authorization: Bearer <token>"
 
-# 移动舵机
+# Move servo
 curl -X POST https://robot.box2ai.com/api/device/B2R-xxx/command \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"id":1,"position":2048,"speed":1000}'
 
-# 回零位
+# Go home
 curl -X POST https://robot.box2ai.com/api/device/B2R-xxx/go_home \
   -H "Authorization: Bearer <token>"
 ```
 
-完整端点列表见 `box2robot_server/box2robot-cli/box2robot.md`
+Full endpoint list: see `box2robot_server/box2robot-cli/box2robot.md`
 
 ---
 
-## LLM 对话控制 (chat.py)
+## LLM Conversational Control (chat.py)
 
-通过自然语言 + 智谱AI function calling 控制机械臂，LLM 自动判断何时调用 API。
+Control the arm through natural language via Zhipu AI function calling — the LLM decides when to invoke APIs.
 
 ```bash
 cd box2robot_audio
 
-# 纯聊天
+# Chat only
 python chat.py
 
-# 聊天 + 机械臂控制
+# Chat + arm control
 python chat.py --robot
 
-# 首次需登录
+# First time: login required
 python chat.py --robot --login <user> <password>
 
-# 指定设备
+# Specify device
 python chat.py --robot --device B2R-XXXXXXXXXXXX
 ```
 
-### LLM 可用的 Tools (9 个)
+### Available LLM Tools (9)
 
-| Tool | 参数 | 说明 |
-|------|------|------|
-| `list_devices` | — | 列出所有设备及在线状态、类型 |
-| `servo_status` | — | 当前舵机 position/load/temp + 力矩状态 |
-| `move_servo` | servo_id, position, [speed] | 移动单个舵机 (ID 1-6, pos 0-4095) |
-| `go_home` | — | 所有舵机回校准中心位置 |
-| `set_torque` | enable:bool | 力矩开(锁)/关(释放) |
-| `record_start` | — | 开始录制轨迹 |
-| `record_stop` | — | 停止录制并保存 |
-| `list_trajectories` | — | 列出已保存的轨迹 |
-| `play_trajectory` | traj_id | 按 ID 播放轨迹 |
-| `search_and_play` | keyword | 按名称搜索并播放 (如"点头""挥手") |
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `list_devices` | — | List all devices with online status and type |
+| `servo_status` | — | Current servo position/load/temp + torque state |
+| `move_servo` | servo_id, position, [speed] | Move single servo (ID 1-6, pos 0-4095) |
+| `go_home` | — | All servos return to calibrated center |
+| `set_torque` | enable:bool | Torque on (lock) / off (release) |
+| `record_start` | — | Start trajectory recording |
+| `record_stop` | — | Stop recording and save |
+| `list_trajectories` | — | List saved trajectories |
+| `play_trajectory` | traj_id | Play trajectory by ID |
+| `search_and_play` | keyword | Search by name and play (e.g., "nod", "wave") |
 
-### API 反馈格式
+### API Feedback Format
 
-每个 tool 执行后返回结构化反馈，LLM 据此生成回复：
+Each tool returns structured feedback for the LLM to generate responses:
 
-**成功反馈** — 以 `OK:` 开头：
+**Success** — prefixed with `OK:`:
 ```
 OK: servo 1 moving to 2500 at speed 500. status=queued
 OK: torque=ON, stale=False, age=353ms, 6 servos
@@ -314,37 +316,37 @@ OK: torque=ON, stale=False, age=353ms, 6 servos
 OK: Returning home in 15 steps (max_delta=342)
 OK: Recording saved. id=abc123, frames=150, duration=5000ms
 OK: 4 devices | active=B2R-XXXX
-  白色从臂 | id=B2R-XXXX | type=arm | ONLINE
-  黑色主臂 | id=B2R-YYYY | type=arm | OFFLINE
+  White Follower | id=B2R-XXXX | type=arm | ONLINE
+  Black Leader   | id=B2R-YYYY | type=arm | OFFLINE
 ```
 
-**失败反馈** — 以 `ERROR:` 开头：
+**Failure** — prefixed with `ERROR:`:
 ```
-ERROR: Device not connected              → 设备离线，检查电源/WiFi
-ERROR: No servo data (stale=True)        → 设备刚开机，等几秒重试
-ERROR: Cannot disable torque while Virtual Serial is active → 关闭虚拟串口后重试
-ERROR: Already recording                 → 先 record_stop 再开新录制
-ERROR: Not recording                     → 无需停止
-ERROR: unauthorized                      → Token 过期，需重新登录
-ERROR: No device selected                → 需先选择设备
-ERROR: Invalid servo_id (0-253)          → 舵机ID超出范围
-ERROR: Invalid position (0-4095)         → 位置值超出范围
-ERROR: Trajectory not found              → 轨迹ID不存在
-ERROR: Cannot connect to server          → 网络问题，检查网络连接
-ERROR: Request timeout                   → 请求超时，服务器可能繁忙
+ERROR: Device not connected              → Device offline, check power/WiFi
+ERROR: No servo data (stale=True)        → Device just booted, retry in a few seconds
+ERROR: Cannot disable torque while Virtual Serial is active → Close VSerial first
+ERROR: Already recording                 → record_stop before starting new recording
+ERROR: Not recording                     → No need to stop
+ERROR: unauthorized                      → Token expired, re-login required
+ERROR: No device selected                → Select a device first
+ERROR: Invalid servo_id (0-253)          → Servo ID out of range
+ERROR: Invalid position (0-4095)         → Position value out of range
+ERROR: Trajectory not found              → Trajectory ID does not exist
+ERROR: Cannot connect to server          → Network issue, check connection
+ERROR: Request timeout                   → Server may be busy
 ```
 
-### 多设备处理
+### Multi-Device Handling
 
-- 启动时自动选择第一个在线的 arm 设备
-- 如果有多个 arm 在线，提示用户选择
-- 用户可通过 `--device B2R-XXXX` 指定，或在对话中说"切换到黑色主臂"
-- `list_devices` 返回中标注 `active=` 表示当前操控的设备
+- On startup, the first online arm device is auto-selected
+- If multiple arms are online, the user is prompted to choose
+- Users can specify via `--device B2R-XXXX`, or say "switch to the black leader" in conversation
+- `list_devices` output marks `active=` for the currently controlled device
 
-### LLM 行为规则
+### LLM Behavior Rules
 
-1. **执行前**: 用户意图不明确时先确认（"你要移动哪个舵机？"）
-2. **执行后**: 根据反馈生成回复（成功→告知结果，失败→解释原因+建议）
-3. **多步操作**: 录制流程需先释放力矩（set_torque false → record_start）
-4. **安全**: 不会在对话中主动执行危险操作（factory_reset、calibrate 等）
-5. **闲聊**: 不涉及机械臂的对话不调用任何 tool
+1. **Before execution**: Confirm when user intent is ambiguous ("Which servo do you want to move?")
+2. **After execution**: Generate response based on feedback (success → report result, failure → explain + suggest)
+3. **Multi-step operations**: Recording requires releasing torque first (set_torque false → record_start)
+4. **Safety**: Never proactively execute dangerous operations in conversation (factory_reset, calibrate, etc.)
+5. **Small talk**: Conversations unrelated to the arm should not trigger any tool calls
