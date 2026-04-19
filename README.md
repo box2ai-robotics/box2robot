@@ -91,6 +91,18 @@ python b2r.py shell                  # 交互式 Shell
 
 ---
 
+## GPU 训练与推理节点
+
+`box2robot_gpu_worker/` 是 GPU 算力节点，连接 Box2Robot 云端服务器，自动领取训练和推理任务。
+
+只需 3 步：安装 → 启动 → 在 APP 中输入绑定码。绑定后 Worker 自动轮询任务、下载数据集、训练模型、上报进度，所有操作均在 APP 端完成。
+
+支持 ACT (Action Chunking Transformer)、Diffusion Policy、MLP 等模型，需要 RTX 3060+ GPU。
+
+详见 [box2robot_gpu_worker/README.md](box2robot_gpu_worker/README.md)。
+
+---
+
 ## 烧录固件
 
 预编译固件在 `bin/` 目录下，两个设备需要分别烧录：

@@ -91,6 +91,18 @@ See `box2robot_skills/SKILLS.md` for the full AI agent reference (79 actions, pr
 
 ---
 
+## GPU Training & Inference Node
+
+`box2robot_gpu_worker/` is a GPU compute node that connects to the Box2Robot cloud server and automatically picks up training and inference jobs.
+
+Just 3 steps: install → start → enter binding code in the APP. Once bound, the Worker automatically polls for tasks, downloads datasets, trains models, and reports progress — all operations are managed from the APP.
+
+Supports ACT (Action Chunking Transformer), Diffusion Policy, MLP and more. Requires RTX 3060+ GPU.
+
+See [box2robot_gpu_worker/README.md](box2robot_gpu_worker/README.md) for details.
+
+---
+
 ## Flash Firmware
 
 Pre-built binaries are in `bin/`. Two devices need separate flashing:
