@@ -1,0 +1,44 @@
+# Diffusion Policy config for Box2Robot 6-DOF arm
+# These are recommended defaults passed via Server job custom_params.
+
+policy:
+  type: diffusion
+  horizon: 16                 # Action prediction horizon
+  n_obs_steps: 2              # Observation lookback
+  n_action_steps: 8           # Execute 8 steps per prediction
+  vision_backbone: resnet18
+  use_group_norm: true
+  spatial_softmax_num_keypoints: 32
+
+  # Unet architecture
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true
+
+  # Noise scheduler
+  noise_scheduler_type: DDPM
+  num_train_timesteps: 100
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  clip_sample: true
+  clip_sample_range: 1.0
+
+training:
+  steps: 10000
+  batch_size: 64
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  weight_decay: 1.0e-6
+  scheduler_warmup_steps: 500
+
+dataset:
+  fps: 20
+  servo_count: 6
+  pos_max: 4095
+
+# GPU recommendations:
+#   RTX 3060 (12GB): batch_size 32,  ~3h / 10000 steps
+#   RTX 3090 (24GB): batch_size 64,  ~2h / 10000 steps
+#   RTX 4090 (24GB): batch_size 128, ~1h / 10000 steps

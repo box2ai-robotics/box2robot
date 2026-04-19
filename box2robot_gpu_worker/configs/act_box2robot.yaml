@@ -1,0 +1,34 @@
+# ACT policy config for Box2Robot 6-DOF arm
+# These are recommended defaults passed via Server job custom_params.
+# Worker reads job_info from Server API, not this file directly.
+
+policy:
+  type: act
+  chunk_size: 20              # 20 actions per prediction (1s at 20Hz)
+  n_action_steps: 10          # Execute 10 before re-query (0.5s)
+  temporal_ensemble_coeff: 0.01
+  use_vae: true
+  dim_model: 256              # 6-DOF simpler than bimanual, 256 enough
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  latent_dim: 32
+  kl_weight: 10.0
+  vision_backbone: resnet18   # Only used if camera images present
+
+training:
+  steps: 10000
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 10.0
+
+dataset:
+  fps: 20
+  servo_count: 6
+  pos_max: 4095               # STS3215 encoder range
+
+# GPU recommendations:
+#   RTX 3060 (12GB): batch_size 32
+#   RTX 3090 (24GB): batch_size 64,  ~2h / 10000 steps
+#   RTX 4090 (24GB): batch_size 128, ~1h / 10000 steps

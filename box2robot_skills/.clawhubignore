@@ -6,3 +6,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+CLAWHUB_SPEC.md
+images_*/
+dataset_*/
+*.mp4
+*.jpg

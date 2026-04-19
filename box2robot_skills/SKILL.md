@@ -1,15 +1,14 @@
 ---
 name: box2robot
-description: Control Box2Robot robotic arms via cloud API — move servos, record trajectories, calibrate, camera, voice, and orchestrate AI training/inference.
-version: 0.2.0
+description: Control Box2Robot robotic arms via cloud API — move servos, record trajectories with camera, download datasets, generate videos, and orchestrate AI training/inference.
+version: 0.4.0
 homepage: https://robot.box2ai.com
 emoji: "\U0001F916"
 metadata:
   openclaw:
     requires:
-      env: [B2R_TOKEN]
-      bins: [python3]
       anyBins: [python3, python]
+      config: [~/.b2r_token]
     primaryEnv: B2R_TOKEN
     install:
       - kind: uv
@@ -19,7 +18,41 @@ metadata:
 
 # Box2Robot — Robotic Arm Control Skill
 
-Control ESP32-based robotic arms through a cloud server API. Move servos, record trajectories, calibrate, capture images, voice interaction, and orchestrate AI training/inference — all from a single CLI.
+Control ESP32-based robotic arms through a cloud server API. Move servos, record trajectories with camera, download datasets, generate replay videos, and orchestrate AI training/inference — all from a single CLI (`b2r.py`).
+
+> **Official skill** published by the Box2Robot team (https://robot.box2ai.com).
+
+## Safety & Supervision
+
+> **This skill controls physical robotic hardware and camera/microphone peripherals.**
+>
+> - **Human supervision required**: Do NOT run autonomously without operator oversight. Servo torque and motion commands cause physical movement that could injure people or damage objects.
+> - **Destructive operations** (`calibrate`) modify hardware state and require explicit user confirmation.
+> - **Privacy-sensitive operations** (`snapshot`, `frame`, `record start --cam`) access camera hardware — only invoke with user consent.
+> - **No OS shell access**: All operations are HTTP requests to `B2R_SERVER`. No arbitrary OS commands are executed. The only local subprocess is `ffmpeg` (optional, for video generation from downloaded JPEG frames).
+> - **Token sensitivity**: `~/.b2r_token` stores a JWT that grants device control. Created with mode 0600 (owner-only). Treat like an SSH key. Delete when no longer needed.
+
+## Credential Flow
+
+```
+login → POST /api/auth/login → JWT token
+  → saved to ~/.b2r_token (mode 0600, owner-only)
+  → all subsequent commands use this token automatically
+  → override with B2R_TOKEN env var
+  → delete ~/.b2r_token to revoke
+```
+
+All network calls go exclusively to `B2R_SERVER` (default: `https://robot.box2ai.com`). No other endpoints are contacted.
+
+## Environment Variables
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `B2R_SERVER` | No | Server URL | `https://robot.box2ai.com` |
+| `B2R_TOKEN` | No | JWT token (overrides ~/.b2r_token) | — |
+| `B2R_DEVICE` | No | Default device ID (overrides auto-select) | — |
+
+None are strictly required at install time. The `login` command handles authentication interactively and persists the token to `~/.b2r_token`. `B2R_TOKEN` is the primary credential variable and can be set to skip interactive login.
 
 ## Setup
 
@@ -29,14 +62,9 @@ pip install aiohttp
 
 # Login (one-time, token cached to ~/.b2r_token)
 python b2r.py login <username> <password>
-
-# Or set environment variables
-export B2R_SERVER="https://robot.box2ai.com"
-export B2R_TOKEN="<jwt_token>"
-export B2R_DEVICE="B2R-XXXXXXXXXXXX"
 ```
 
-## CLI Quick Reference
+## Commands
 
 ### Device & Status
 ```bash
@@ -48,170 +76,117 @@ b2r.py status                      # Servo positions, load, temperature
 ```bash
 b2r.py torque on                   # Lock servos
 b2r.py torque off                  # Release (allows manual dragging)
-b2r.py home                        # Safe return to home position
+b2r.py home                        # Return to home position
 b2r.py move <servo_id> <pos> [spd] # Move a single servo
-# Position: 0-4095 (center 2048), Speed: 0-4000 (default 1000)
+# Position: 0-4095 (home varies per joint), Speed: 0-4000 (default 1000)
 ```
 
 ### Recording & Playback
 ```bash
-b2r.py record start                # Start recording
+b2r.py record start                # Start recording (servo data only)
+b2r.py record start --cam CAM-xxx  # Record with camera (servo + images)
 b2r.py record stop [name]          # Stop and save
+b2r.py record status               # Current recording status
 b2r.py play                        # List all trajectories
 b2r.py play <traj_id>              # Play a trajectory
 ```
 
-### Camera & Calibration
+When starting a recording, if online cameras are detected, the CLI offers an interactive prompt to select one. Camera recording captures synchronized JPEG frames alongside servo position data.
+
+### Camera
 ```bash
-b2r.py snapshot                    # Camera snapshot
-b2r.py calibrate [servo_id]        # Auto-calibrate (0 = all)
+b2r.py snapshot                    # Request camera snapshot
+b2r.py frame [cam_id] [out.jpg]   # Download latest JPEG frame to local file
 ```
 
-## Action System (79 Actions)
+> **Privacy note**: These commands access camera hardware. Only invoke with user consent.
 
-Invoke via `b2r.py exec <action_name>`. Parameters in JSON or key=value format.
+### Data Download
+```bash
+b2r.py download <traj_id> [dir]    # Download trajectory images only
+b2r.py dataset <traj_id> [dir]     # Download full dataset (JSON + images)
+b2r.py video <traj_id> [out.mp4]   # Generate MP4 video from trajectory images
+b2r.py video <traj_id> out.mp4 --fps 5  # Custom frame rate
+```
 
-### device (Device Management)
-| Action | Description |
-|--------|-------------|
-| `device.list` | List devices |
-| `device.status` | Device status (control mode + servos) |
-| `device.bind` | Bind device (requires bind_code) |
-| `device.unbind` | Unbind device |
-| `device.rename` | Rename device |
-| `device.factory_reset` | Factory reset |
+`dataset` downloads the trajectory JSON (all frames with positions, timestamps, calibration snapshots) plus all camera images into a local directory.
 
-### servo (Servo Control)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `servo.status` | device_id | Read position/load/temperature |
-| `servo.move` | device_id, servo_id, position, [speed] | Move single servo |
-| `servo.move_batch` | device_id, commands:[{id,position,speed}] | Batch move |
-| `servo.torque` | device_id, enable:bool | Toggle torque |
-| `servo.go_home` | device_id | Return to home position |
-| `servo.set_id` | device_id, old_id, new_id | Burn servo ID |
+`video` downloads images to a temp directory and encodes them using `ffmpeg` (preferred) or `opencv-python` (fallback). Neither is required at install time — the command reports a clear error if both are missing.
 
-### recording (Recording & Playback)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `record.start` | device_id, [mode], [camera_id] | Start recording (single/dual/phone) |
-| `record.stop` | device_id, [name] | Stop recording |
-| `trajectory.list` | device_id | List trajectories |
-| `trajectory.play` | device_id, trajectory_id | Play trajectory |
-| `trajectory.stop` | device_id, trajectory_id | Stop playback |
-| `trajectory.delete` | device_id, trajectory_id | Delete trajectory |
+### Calibration
+```bash
+b2r.py calibrate [servo_id]        # Auto-calibrate (0 = all servos)
+```
 
-### pairing (Leader-Follower)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `pairing.create` | leader_id, follower_ids, [use_espnow] | Create pairing |
-| `pairing.disconnect` | leader_id | Disconnect |
-| `pairing.connect` | leader_id | Reconnect |
-| `pairing.delete` | leader_id | Delete pairing |
-| `espnow.discover` | — | Scan nearby devices |
+> **Hardware note**: Calibration physically moves servos to their limits. Ensure the arm is clear of obstacles.
 
-### calibration
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `calibrate.auto` | device_id, [servo_id=0] | Auto-calibrate (0 = all) |
-| `calibrate.manual` | device_id, servos:[{id,min,max,mid}] | Manual calibration |
-| `calibrate.center_offset` | device_id | Write EEPROM center offset |
+### Training & Inference
+```bash
+b2r.py train                       # Submit training job (interactive)
+b2r.py train --steps 50000 --name my_model
+b2r.py jobs                        # List training jobs and status
+b2r.py deploy <job_id>             # Deploy inference (interactive device selection)
+b2r.py stop-infer <job_id>         # Stop inference
+```
 
-### camera (Camera & Voice)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `camera.snapshot` | device_id | Take photo |
-| `camera.stream_mode` | device_id, mode | Stream mode (idle/preview/inference) |
-| `camera.voice_start` | device_id | Enable microphone |
-| `camera.voice_stop` | device_id | Disable microphone |
-| `camera.tts` | device_id, prompt | Text-to-speech |
+`train` interactively lists available trajectories, lets you select datasets (e.g., `1,3,5` or `1-5` or `all`), confirms parameters, then submits to the server.
 
-### training (Training & Inference)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `training.submit` | name, dataset_ids, [model_type] | Submit training job |
-| `training.list` | [page] | Job list |
-| `training.deploy` | job_id, arm_device_id, gpu_device_id | Deploy inference |
-| `training.stop_inference` | job_id | Stop inference |
+`deploy` interactively selects GPU device, arm device, camera (optional), and execution mode (original/fixed/adaptive/overlap), then deploys.
 
-### store (Skill Store)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `store.list` | [search], [category] | Browse store |
-| `store.execute` | task_id, device_id | Execute skill |
+## API Endpoints Used
 
-### config (Configuration)
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `config.get` | device_id | View config |
-| `config.set` | device_id, params:{key:val} | Update config |
-| `config.speed` | device_id, speed(100-4000) | Set speed |
-| `config.volume` | device_id, volume(0-255) | Volume |
+All commands are thin wrappers over HTTP API calls to `B2R_SERVER`:
 
-## Natural Language
+| Command | Method | Endpoint |
+|---------|--------|----------|
+| login | POST | `/api/auth/login` |
+| devices | GET | `/api/devices` |
+| status | GET | `/api/device/{id}/servos` |
+| move | POST | `/api/device/{id}/command` |
+| home | POST | `/api/device/{id}/go_home` |
+| torque | POST | `/api/device/{id}/torque` |
+| record start | POST | `/api/device/{id}/record/start` |
+| record stop | POST | `/api/device/{id}/record/stop` |
+| record status | GET | `/api/device/{id}/record/status` |
+| play | GET/POST | `/api/device/{id}/trajectories`, `.../trajectory/{id}/play` |
+| snapshot | POST | `/api/camera/{id}/snapshot` |
+| frame | GET | `/api/camera/{id}/frame` |
+| download | GET | `.../trajectory/{id}/images`, `/api/traj-image/{id}/{idx}` |
+| dataset | GET | `.../trajectory/{id}/data`, `.../trajectory/{id}/images` |
+| video | GET | `.../trajectory/{id}/images`, `/api/traj-image/{id}/{idx}` |
+| calibrate | POST | `/api/device/{id}/calibrate` |
+| train | POST | `/api/training/jobs` |
+| jobs | GET | `/api/training/jobs` |
+| deploy | POST | `/api/training/jobs/{id}/deploy` |
+| stop-infer | POST | `/api/training/jobs/{id}/stop-inference` |
 
-Via `b2r.py say "text"`:
+## Preflight Checks (for AI Agents)
 
-| Input | Maps to |
-|-------|---------|
-| "go home" / "回零位" | servo.go_home |
-| "release torque" / "释放力矩" | servo.torque(False) |
-| "start recording" / "开始录制" | record.start |
-| "take a photo" / "拍照" | camera.snapshot |
-| "auto calibrate" / "自动校准" | calibrate.auto |
-| "move servo 1 to 2048" | servo.move(1, 2048) |
-
-## Preflight Checks
-
-Agents must verify before executing:
+Agents should verify before executing servo/recording commands:
 
 | Step | Check | On Failure |
 |------|-------|------------|
 | 1 | Device online | "Device offline — check power" |
 | 2 | Device type = arm | "Not a robotic arm" |
-| 3 | Control mode = idle | release_control first |
-| 4 | Calibration exists | calibrate.auto first |
-| 5 | Servo count matches | Trajectory vs device axis count |
+| 3 | Calibration exists | Run `calibrate` first |
 
 ## Orchestration Examples
 
-### "Teach you to pour water, record 5 demos"
+### Record training data with camera
 ```
-1. torque off
-2. camera.stream_mode(cam_id, "preview")
-3. Loop 5x:
-   record.start(mode="single", camera_id)
-   [user demonstrates]
-   record.stop(name="pour_water_{n}")
-4. training.submit(name="pour_water", dataset_ids)
-```
-
-### Visual Inference Loop
-```
-1. training.deploy(job_id, arm_id, gpu_id, cam_id)
-2. GPU auto-loop: image → inference → command → arm
-3. training.stop_inference(job_id)
+1. b2r torque off
+2. b2r record start --cam CAM-xxx
+3. [user demonstrates task by hand]
+4. b2r record stop my_dataset
+5. b2r dataset <traj_id>           # download locally
+6. b2r video <traj_id> demo.mp4    # generate preview video
 ```
 
-## HTTP API Direct Access
-
-```bash
-# Login
-curl -X POST https://robot.box2ai.com/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"xxx","password":"xxx"}'
-
-# Move servo
-curl -X POST https://robot.box2ai.com/api/device/B2R-xxx/command \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"id":1,"position":2048,"speed":1000}'
+### Train and deploy
 ```
-
-## Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `B2R_SERVER` | Server URL | `https://robot.box2ai.com` |
-| `B2R_TOKEN` | JWT token (overrides ~/.b2r_token) | — |
-| `B2R_DEVICE` | Default device ID | — |
+1. b2r train                       # select datasets, submit job
+2. b2r jobs                        # monitor progress
+3. b2r deploy <job_id>             # deploy to GPU + arm
+4. [robot executes learned skill]
+5. b2r stop-infer <job_id>         # stop when done
+```

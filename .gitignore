@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# box2robot_gpu_worker
+box2robot_gpu_worker/cache/
+box2robot_gpu_worker/outputs/
+box2robot_gpu_worker/datasets/
+box2robot_gpu_worker/box2robot_gpu_worker.egg-info/
