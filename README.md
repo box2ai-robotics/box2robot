@@ -1,171 +1,165 @@
-English | [中文](README_zh.md)
+[English](README_en.md) | 中文
 
-# Box2Robot — Embodied AI Cloud Platform
+# Box2Robot — 具身智能云平台
 
-**Plug-and-play robot arm with cloud training, shared skills, and AI agent control.**
+**即插即用的机械臂，云端训练、技能共享、AI 智能体控制。**
 
 <div align="center">
-  <img src="assets/whole_robot_system.jpg" alt="Box2Robot System" width="500"/>
+  <img src="assets/whole_robot_system.jpg" alt="Box2Robot 系统" width="500"/>
 </div>
 
-Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robot arms and vision modules to a cloud platform for data collection, model training, and skill sharing. No complex setup — just flash, connect WiFi, bind your device, and start.
+Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块连接到云端平台，实现数据采集、模型训练和技能共享。无需复杂配置 —— 烧录固件、连 WiFi、绑定设备，即可开始。
 
-> **Current Release: v0.6.1**
+> **当前版本：v0.6.1**
 
-## Getting Started
+## 快速开始
 
-### 1. Get the Hardware
+### 1. 获取硬件
 
 <div align="center">
   <a href="https://item.taobao.com/item.htm?abbucket=5&id=1030962099420">
-    <img src="assets/hardware.jpg" alt="Box2AI Hardware" width="400"/>
+    <img src="assets/hardware.jpg" alt="Box2AI 机械臂套件" width="400"/>
   </a>
   <br>
-  <a href="https://item.taobao.com/item.htm?abbucket=5&id=1030962099420">Purchase the Box2AI Robot Arm Kit (Taobao)</a>
+  <a href="https://item.taobao.com/item.htm?abbucket=5&id=1030962099420">购买 Box2AI 机械臂套件 (淘宝)</a>
 </div>
 
-Assemble the robot arm and connect servos to the driver board. The firmware comes pre-flashed. If you need to flash manually, see [Flash Firmware](#flash-firmware) below.
+组装机械臂并将舵机连接到驱动板。固件已预装，如需手动烧录请参阅 [烧录固件](#烧录固件)。
 
-### 2. Connect to Device Hotspot
+### 2. 连接设备热点
 
-Power on the device. It creates a WiFi hotspot:
-- **Arm Driver Board:** `Box2Robot_XXXX` (XXXX = last 4 of MAC)
-- **Vision-Audio Module:** `Box2Cam_XXXX`
+给设备上电，设备会创建 WiFi 热点：
+- **机械臂驱动板：** `Box2Robot_XXXX` (XXXX 为 MAC 后 4 位)
+- **视觉语音模块：** `Box2Cam_XXXX`
 
-Connect your phone/PC to this hotspot. A captive portal opens automatically (or go to `192.168.4.1`).
+用手机或电脑连接该热点。会自动弹出配网页面（如未弹出，手动访问 `192.168.4.1`）。
 
-### 3. Configure WiFi
+### 3. 配置 WiFi
 
-Enter your WiFi name and password in the portal. The device saves credentials, reboots, and connects to your network.
+在配网页面输入 WiFi 名称和密码。设备会保存凭据、重启并连接到你的网络。
 
-### 4. Bind on Platform
+### 4. 绑定设备
 
-Once online, the device gets a **6-digit binding code**:
-- **Arm:** Shown on the OLED screen
-- **Camera:** Announced via TTS voice
+设备连上 WiFi 后，获取 **6 位绑定码**：
+- **机械臂：** 显示在 OLED 屏幕上
+- **摄像头：** 通过 TTS 语音播报
 
-Then:
-1. Open [**https://robot.box2ai.com**](https://robot.box2ai.com/#/)
-2. Register an account
-3. Go to **Device Management → Bind Device**
-4. Enter the 6-digit code
-5. Done!
+然后：
+1. 访问 [**https://robot.box2ai.com**](https://robot.box2ai.com/#/)
+2. 注册账号
+3. 进入 **设备管理 → 绑定设备**
+4. 输入 6 位绑定码
+5. 完成！
 
-You now have full access: remote control, calibration, data collection, cloud training, skill store, and voice interaction.
+绑定后即可使用全部功能：远程遥控、校准、数据采集、云端训练、技能商店、语音交互。
 
 ---
 
-## AI Agent Control (Skills CLI)
+## AI 智能体控制 (Skills CLI)
 
-Control your robot arm from **Claude Code**, **GPT**, or any AI agent using the `box2robot_skills/` CLI.
+通过 **Claude Code**、**GPT** 等 AI 智能体，使用 `box2robot_skills/` CLI 控制机械臂。
 
-### Quick Start
+### 快速开始
 
 ```bash
 cd box2robot_skills
 
-# Login (token cached, no re-login needed)
+# 登录 (token 缓存，后续免登录)
 python b2r.py login <username> <password>
 
-# Control
-python b2r.py devices                # List devices
-python b2r.py home                   # Go to home position
-python b2r.py move 1 2048 500        # Move servo #1 to position 2048
-python b2r.py torque off             # Release torque
-python b2r.py record start           # Start recording
-python b2r.py record stop            # Stop recording
-python b2r.py play                   # List & play trajectories
-python b2r.py say "take a photo"     # Natural language command
-python b2r.py shell                  # Interactive shell
+# 操控
+python b2r.py devices                # 查看设备
+python b2r.py home                   # 回零位
+python b2r.py move 1 2048 500        # 1号舵机转到2048
+python b2r.py torque off             # 释放力矩
+python b2r.py record start           # 开始录制
+python b2r.py record stop            # 停止录制
+python b2r.py play                   # 列出并播放轨迹
+python b2r.py say "拍个照"            # 自然语言指令
+python b2r.py shell                  # 交互式 Shell
 ```
 
-### Use with Claude Code
+### 配合 Claude Code 使用
 
 ```
-"Read box2robot_skills/SKILLS.md, then move servo 1 to position 2048"
-"Record a trajectory, then play it back"
-"Check servo status and go home"
+"读一下 box2robot_skills/SKILLS.md，然后把1号舵机转到2048"
+"录一段轨迹，录完后播放一遍"
+"查看舵机状态，然后回零位"
 ```
 
-See `box2robot_skills/SKILLS.md` for the full AI agent reference (79 actions, preflight checks, workflow templates).
+详见 `box2robot_skills/SKILLS.md`（AI 智能体调度手册，79 个 Action、预检规则、工作流模板）。
 
 ---
 
-## Flash Firmware
+## 烧录固件
 
-Pre-built binaries are in `bin/`. Two devices need separate flashing:
+预编译固件在 `bin/` 目录下，两个设备需要分别烧录：
 
-### USB Driver
+### USB 驱动
 
-If your PC doesn't recognize the USB port, install the CP210x driver from `bin/download_driver_CP210x_USB_TO_UART/`.
+如果电脑无法识别 USB 端口，请安装 `bin/download_driver_CP210x_USB_TO_UART/` 中的 CP210x 驱动。
 
-### Method 1: esptool (Cross-Platform)
+### 方法一：esptool (跨平台)
 
 ```bash
 pip install esptool
 ```
 
-**Arm Driver Board (ESP32):**
+**机械臂驱动板 (ESP32)：**
 
 ```bash
-python -m esptool --chip esp32 --port COM5 erase_flash
+python -m esptool --chip esp32 erase_flash
 
-python -m esptool --chip esp32 --port COM5 --baud 921600 write_flash \
-  0x1000  bin/box2robot_arm/box2arm_v0.6.1_bootloader.bin \
-  0x8000  bin/box2robot_arm/box2arm_v0.6.1_partitions.bin \
-  0x10000 bin/box2robot_arm/box2arm_v0.6.1_firmware.bin
+python -m esptool --chip esp32 --baud 921600 write_flash  0x1000  bin/box2robot_arm/box2arm_v0.6.1_bootloader.bin  0x8000  bin/box2robot_arm/box2arm_v0.6.1_partitions.bin  0x10000 bin/box2robot_arm/box2arm_v0.6.1_firmware.bin
 ```
 
-**Vision-Audio Module (ESP32-S3):**
+**视觉语音模块 (ESP32-S3)：**
 
 ```bash
-python -m esptool --chip esp32s3 --port COM6 erase_flash
+python -m esptool --chip esp32s3 erase_flash
 
-python -m esptool --chip esp32s3 --port COM6 --baud 921600 write_flash \
-  0x0     bin/box2robot_cam/box2cam_v0.6.1_bootloader.bin \
-  0x8000  bin/box2robot_cam/box2cam_v0.6.1_partitions.bin \
-  0x10000 bin/box2robot_cam/box2cam_v0.6.1_firmware.bin
+python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0 bin/box2robot_cam/box2cam_v0.6.1_bootloader.bin  0x8000  bin/box2robot_cam/box2cam_v0.6.1_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.1_firmware.bin
 ```
 
-> Replace `COM5`/`COM6` with your actual port. macOS: `/dev/cu.usbserial-0001`, Linux: `/dev/ttyUSB0`.
+> esptool 会自动检测串口。如果连接了多个设备，可用 `--port COM5` 手动指定。
 
-### Method 2: Flash Download Tool (Windows GUI)
+### 方法二：Flash Download Tool (Windows 图形工具)
 
-Use `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`.
+使用 `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`。
 
-1. Select chip type (**ESP32** for Arm, **ESP32-S3** for Camera), WorkMode: Develop, LoadMode: UART:
+1. 选择芯片类型（机械臂选 **ESP32**，摄像头选 **ESP32-S3**），WorkMode: Develop，LoadMode: UART：
 
-   ![Select Chip](assets/flash_esp32.jpg)
+   ![选择芯片](assets/flash_esp32.jpg)
 
-2. Add the 3 bin files with addresses (Arm: 0x1000/0x8000/0x10000, Camera: 0x0/0x8000/0x10000), select COM port, baud 921600, click **START**:
+2. 添加 3 个 bin 文件及地址（机械臂: 0x1000/0x8000/0x10000，摄像头: 0x0/0x8000/0x10000），选择 COM 端口，波特率 921600，点击 **START**：
 
-   ![Select bins](assets/flash_select_bins.jpg)
+   ![选择文件](assets/flash_select_bins.jpg)
 
-3. Wait for **FINISH**:
+3. 等待 **FINISH**：
 
-   ![Success](assets/flahs_succesful.jpg)
+   ![烧录成功](assets/flahs_succesful.jpg)
 
 ---
 
-## Changelog
+## 更新日志
 
-| Version | Date | Notes |
-|---------|------|-------|
-| v0.6.1 | 2026-04-19 | GPU Worker open-sourced, cloud training pipeline, inference deployment |
-| v0.5.1 | 2026-04-14 | Cloud platform integration, WebSocket relay, OTA, ESP-NOW 50Hz, camera MJPEG+ADPCM audio, voice AI, auto-calibration |
-| v0.4.5 | 2026-03-23 | (LeRobot-ESP32) Hiwonder LX servo support, auto-detect servo type |
+| 版本 | 日期 | 说明 |
+|------|------|------|
+| v0.6.1 | 2026-04-19 | GPU 训练推理节点开源，修复幻尔舵机校准偏置写入，新增舵机电压范围选择 (5V/7.4V/12V)，WiFi 主从遥操流畅度优化 |
+| v0.5.1 | 2026-04-14 | 云端平台集成、WebSocket 中继、OTA、ESP-NOW 50Hz 双通道、摄像头 MJPEG+ADPCM 音频、语音 AI 链路、自动校准、数据采集对齐 |
+| v0.4.5 | 2026-03-23 | (LeRobot-ESP32) 幻尔 LX 舵机支持、自动检测舵机类型 |
 
-## Links
+## 相关链接
 
-- **Cloud Platform:** [https://robot.box2ai.com](https://robot.box2ai.com/#/)
-- **Hardware Purchase:** [Taobao Store](https://item.taobao.com/item.htm?abbucket=5&id=1030962099420)
-- **Previous Project (ESP-NOW only):** [LeRobot-ESP32](https://github.com/box2ai-robotics/lerobot-esp32)
-- **LeRobot Framework:** [Hugging Face LeRobot](https://github.com/huggingface/lerobot)
+- **云端平台：** [https://robot.box2ai.com](https://robot.box2ai.com/#/)
+- **硬件购买：** [淘宝店铺](https://item.taobao.com/item.htm?abbucket=5&id=1030962099420)
+- **前代项目 (纯 ESP-NOW)：** [LeRobot-ESP32](https://github.com/box2ai-robotics/lerobot-esp32)
+- **LeRobot 框架：** [Hugging Face LeRobot](https://github.com/huggingface/lerobot)
 
-## License
+## 开源协议
 
 Apache 2.0 License
 
 ---
 
-If this project helps you, please give it a star!
+如果这个项目对你有帮助，请给个 Star！
