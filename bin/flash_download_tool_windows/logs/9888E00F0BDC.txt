@@ -1,0 +1,17 @@
+*************************** START ****************************
+Chip: ESP32S3
+Download mode: uart
+Start time: 20260420-23:43
+Connect baud: 115200
+Com:COM13
+connecting...
+manufacturer_id: 0xc8
+device_id: 0x4017
+fs:0x200200
+
+Leaving...
+com closed
+Total use time: 4 s
+Download result: PASS
+*************************** END ****************************
+

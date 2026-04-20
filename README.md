@@ -26,6 +26,31 @@ Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块
 
 组装机械臂并将舵机连接到驱动板。固件已预装，如需手动烧录请参阅 [烧录固件](#烧录固件)。
 
+### 摄像头模块安装
+
+<div align="center">
+  <img src="assets/Camera_base mounting_nut.jpg" style="width:30%;max-width:240px;"/>
+  <img src="assets/Camera_base_mounting_hole.jpg" style="width:30%;max-width:240px;"/>
+  <img src="assets/Camera_base_screw_placement_fixation.jpg" style="width:30%;max-width:240px;"/>
+</div>
+
+<div align="center">
+  <img src="assets/Camera_placement_and_screw_fixation.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/camera_line_connect.jpg" style="width:45%;max-width:360px;"/>
+</div>
+
+### 电池托盘与驱动器安装
+
+<div align="center">
+  <img src="assets/battery_base_install1.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/battery_base_install2.jpg" style="width:45%;max-width:360px;"/>
+</div>
+
+<div align="center">
+  <img src="assets/battery_base_and_driver_install.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/battery_install.jpg" style="width:45%;max-width:360px;"/>
+</div>
+
 ### 2. 连接设备热点
 
 给设备上电，设备会创建 WiFi 热点：
@@ -139,13 +164,19 @@ python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0 bin/box2robot_ca
 
 使用 `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`。
 
-1. 选择芯片类型（机械臂选 **ESP32**，摄像头选 **ESP32-S3**），WorkMode: Develop，LoadMode: UART：
+1. 选择芯片类型：机械臂选 **ESP32**，摄像头选 **ESP32-S3**。WorkMode: Develop，LoadMode: UART
 
-   ![选择芯片](assets/flash_esp32.jpg)
+<div align="center">
+  <img src="assets/arm_flash_esp32.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/cam_flash_S3.jpg" style="width:45%;max-width:360px;"/>
+</div>
 
-2. 添加 3 个 bin 文件及地址（机械臂: 0x1000/0x8000/0x10000，摄像头: 0x0/0x8000/0x10000），选择 COM 端口，波特率 921600，点击 **START**：
+2. 添加 3 个 bin 文件及对应地址。注意两者地址不同——机械臂 bootloader 起始地址为 **0x1000**，摄像头为 **0x0**；partition 和 firmware 地址相同（0x8000 / 0x10000）。选择 COM 端口，波特率 921600，点击 **START**
 
-   ![选择文件](assets/flash_select_bins.jpg)
+<div align="center">
+  <img src="assets/arm_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/cam_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
+</div>
 
 3. 等待 **FINISH**：
 

@@ -26,6 +26,31 @@ Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robo
 
 Assemble the robot arm and connect servos to the driver board. The firmware comes pre-flashed. If you need to flash manually, see [Flash Firmware](#flash-firmware) below.
 
+### Camera Module Installation
+
+<div align="center">
+  <img src="assets/Camera_base mounting_nut.jpg" style="width:30%;max-width:240px;"/>
+  <img src="assets/Camera_base_mounting_hole.jpg" style="width:30%;max-width:240px;"/>
+  <img src="assets/Camera_base_screw_placement_fixation.jpg" style="width:30%;max-width:240px;"/>
+</div>
+
+<div align="center">
+  <img src="assets/Camera_placement_and_screw_fixation.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/camera_line_connect.jpg" style="width:45%;max-width:360px;"/>
+</div>
+
+### Battery Tray & Driver Board Installation
+
+<div align="center">
+  <img src="assets/battery_base_install1.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/battery_base_install2.jpg" style="width:45%;max-width:360px;"/>
+</div>
+
+<div align="center">
+  <img src="assets/battery_base_and_driver_install.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/battery_install.jpg" style="width:45%;max-width:360px;"/>
+</div>
+
 ### 2. Connect to Device Hotspot
 
 Power on the device. It creates a WiFi hotspot:
@@ -139,13 +164,19 @@ python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0 bin/box2robot_ca
 
 Use `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`.
 
-1. Select chip type (**ESP32** for Arm, **ESP32-S3** for Camera), WorkMode: Develop, LoadMode: UART:
+1. Select chip type: **ESP32** for Arm, **ESP32-S3** for Camera. WorkMode: Develop, LoadMode: UART
 
-   ![Select Chip](assets/flash_esp32.jpg)
+<div align="center">
+  <img src="assets/arm_flash_esp32.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/cam_flash_S3.jpg" style="width:45%;max-width:360px;"/>
+</div>
 
-2. Add the 3 bin files with addresses (Arm: 0x1000/0x8000/0x10000, Camera: 0x0/0x8000/0x10000), select COM port, baud 921600, click **START**:
+2. Add the 3 bin files with their addresses. Note the difference — Arm bootloader starts at **0x1000**, Camera at **0x0**; partition and firmware addresses are the same (0x8000 / 0x10000). Select COM port, baud 921600, click **START**
 
-   ![Select bins](assets/flash_select_bins.jpg)
+<div align="center">
+  <img src="assets/arm_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
+  <img src="assets/cam_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
+</div>
 
 3. Wait for **FINISH**:
 
