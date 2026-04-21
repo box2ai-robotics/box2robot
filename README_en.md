@@ -10,7 +10,7 @@ English | [中文](README.md)
 
 Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robot arms and vision modules to a cloud platform for data collection, model training, and skill sharing. No complex setup — just flash, connect WiFi, bind your device, and start.
 
-> **Current Release: v0.6.1**
+> **Current Release: v0.6.3**
 
 ## Getting Started
 
@@ -77,6 +77,15 @@ Then:
 5. Done!
 
 You now have full access: remote control, calibration, data collection, cloud training, skill store, and voice interaction.
+
+### 5. Button Operations
+
+The gray button on the wireless driver box supports the following:
+
+| Action | Function |
+|--------|----------|
+| **Single Press** | Release Torque — unlocks all servos so you can freely move the arm by hand |
+| **Long Press (3+ seconds)** | Factory Reset — clears saved WiFi credentials; the device reboots into hotspot mode for re-provisioning |
 
 ---
 
@@ -147,7 +156,7 @@ pip install esptool
 ```bash
 python -m esptool --chip esp32 erase_flash
 
-python -m esptool --chip esp32 --baud 921600 write_flash  0x1000  bin/box2robot_arm/box2arm_v0.6.1_bootloader.bin  0x8000  bin/box2robot_arm/box2arm_v0.6.1_partitions.bin  0x10000 bin/box2robot_arm/box2arm_v0.6.1_firmware.bin
+python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.3_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.3_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.3_firmware.bin
 ```
 
 **Vision-Audio Module (ESP32-S3):**
@@ -155,7 +164,7 @@ python -m esptool --chip esp32 --baud 921600 write_flash  0x1000  bin/box2robot_
 ```bash
 python -m esptool --chip esp32s3 erase_flash
 
-python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0 bin/box2robot_cam/box2cam_v0.6.1_bootloader.bin  0x8000  bin/box2robot_cam/box2cam_v0.6.1_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.1_firmware.bin
+python -m esptool --chip esp32s3 --baud 921600 write_flash 0x0 bin/box2robot_cam/box2cam_v0.6.3_bootloader.bin 0x8000 bin/box2robot_cam/box2cam_v0.6.3_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.3_firmware.bin
 ```
 
 > esptool auto-detects the serial port. Use `--port COM5` to specify manually if multiple devices are connected.

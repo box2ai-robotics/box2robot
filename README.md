@@ -10,7 +10,7 @@
 
 Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块连接到云端平台，实现数据采集、模型训练和技能共享。无需复杂配置 —— 烧录固件、连 WiFi、绑定设备，即可开始。
 
-> **当前版本：v0.6.1**
+> **当前版本：v0.6.3**
 
 ## 快速开始
 
@@ -77,6 +77,15 @@ Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块
 5. 完成！
 
 绑定后即可使用全部功能：远程遥控、校准、数据采集、云端训练、技能商店、语音交互。
+
+### 5. 按键操作
+
+驱动盒上的灰色按钮支持以下操作：
+
+| 操作 | 功能 |
+|------|------|
+| **单击** | 取消力矩 — 释放所有舵机，可自由拖动机械臂 |
+| **长按 (3秒以上)** | 重置出厂设置 — 清除已保存的 WiFi 信息，设备重启后重新进入热点配网模式 |
 
 ---
 
@@ -147,7 +156,7 @@ pip install esptool
 ```bash
 python -m esptool --chip esp32 erase_flash
 
-python -m esptool --chip esp32 --baud 921600 write_flash  0x1000  bin/box2robot_arm/box2arm_v0.6.1_bootloader.bin  0x8000  bin/box2robot_arm/box2arm_v0.6.1_partitions.bin  0x10000 bin/box2robot_arm/box2arm_v0.6.1_firmware.bin
+python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.3_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.3_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.3_firmware.bin
 ```
 
 **视觉语音模块 (ESP32-S3)：**
@@ -155,7 +164,7 @@ python -m esptool --chip esp32 --baud 921600 write_flash  0x1000  bin/box2robot_
 ```bash
 python -m esptool --chip esp32s3 erase_flash
 
-python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0 bin/box2robot_cam/box2cam_v0.6.1_bootloader.bin  0x8000  bin/box2robot_cam/box2cam_v0.6.1_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.1_firmware.bin
+python -m esptool --chip esp32s3 --baud 921600 write_flash 0x0 bin/box2robot_cam/box2cam_v0.6.3_bootloader.bin 0x8000 bin/box2robot_cam/box2cam_v0.6.3_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.3_firmware.bin
 ```
 
 > esptool 会自动检测串口。如果连接了多个设备，可用 `--port COM5` 手动指定。
