@@ -198,7 +198,30 @@ class GPUWorker:
         print(f"  RAM: {self.hw_info['ram_gb']} GB")
         print(f"  Disk: {self.hw_info['disk_free_gb']} GB free")
         print(f"  PyTorch: {self.hw_info['torch_version']}")
+        print(f"  CUDA: {self.hw_info['cuda_version'] or 'N/A'}")
         print("=" * 50)
+
+        # Warn if GPU not available
+        if not torch.cuda.is_available():
+            print()
+            print("!" * 50)
+            print("  WARNING: GPU 不可用!")
+            cuda_ver = torch.version.cuda
+            if not cuda_ver:
+                print("  原因: 安装的是 CPU 版本的 PyTorch")
+                print()
+                print("  修复: 重新安装 CUDA 版本的 PyTorch:")
+                print("    pip uninstall torch torchvision torchaudio -y")
+                print("    pip install torch torchvision torchaudio \\")
+                print("        --index-url https://download.pytorch.org/whl/cu124")
+            else:
+                print(f"  PyTorch 编译的 CUDA 版本: {cuda_ver}")
+                print("  可能原因: NVIDIA 驱动版本太旧")
+                print("  请运行 nvidia-smi 检查驱动版本")
+            print()
+            print("  诊断工具: python scripts/check_gpu.py")
+            print("!" * 50)
+            print()
 
     def _activate(self) -> dict:
         try:
@@ -255,9 +278,9 @@ class GPUWorker:
                     last_upgrade_check = now
 
                 # Poll for jobs
-                job, action = self._poll_job()
+                job, action, resume_step = self._poll_job()
                 if job:
-                    self._process_job(job, action)
+                    self._process_job(job, action, resume_step)
                 else:
                     time.sleep(poll_interval)
 
@@ -356,15 +379,15 @@ class GPUWorker:
             logger.error("升级失败: %s", e)
 
     def _poll_job(self) -> tuple:
-        """Check for pending training or inference jobs. Returns (job, action)."""
+        """Check for pending training or inference jobs. Returns (job, action, resume_from_step)."""
         try:
             r = self.client.get(f"{self.server_url}/api/gpu/poll-job",
                 params={"device_id": self.device_id, "token": self.token})
             r.raise_for_status()
             data = r.json()
-            return data.get("job"), data.get("action", "train")
+            return data.get("job"), data.get("action", "train"), data.get("resume_from_step")
         except Exception:
-            return None, "train"
+            return None, "train", None
 
     def _start_bg_heartbeat(self):
         """Start background heartbeat thread (keeps GPU device online during blocking tasks)."""
@@ -386,7 +409,7 @@ class GPUWorker:
         if hasattr(self, '_bg_heartbeat_thread'):
             self._bg_heartbeat_thread.join(timeout=2)
 
-    def _process_job(self, job: dict, action: str = "train"):
+    def _process_job(self, job: dict, action: str = "train", resume_from_step: int = None):
         """Route to training or inference based on action."""
         job_id = job["id"]
         logger.info("=" * 40)
@@ -402,15 +425,19 @@ class GPUWorker:
                              job_id, arm_id, job["model_type"])
                 self._run_inference(job, arm_id)
             else:
-                logger.info("领取训练: %s (model=%s, steps=%d)",
-                             job_id, job["model_type"], job["train_steps"])
+                if resume_from_step:
+                    logger.info("恢复训练: %s (从 step %d, model=%s, steps=%d)",
+                                 job_id, resume_from_step, job["model_type"], job["train_steps"])
+                else:
+                    logger.info("领取训练: %s (model=%s, steps=%d)",
+                                 job_id, job["model_type"], job["train_steps"])
                 from box2robot_gpu_worker.worker import TrainingWorker
                 worker = TrainingWorker(
                     self.server_url,
                     pairing_key=job.get("pairing_key", ""),
                     output_dir=str(self.output_dir),
                 )
-                worker.process_job(job_id)
+                worker.process_job(job_id, resume_from_step=resume_from_step)
         except KeyboardInterrupt:
             logger.info("训练被手动中断 (Ctrl+C): %s", job_id)
             # 扫描已保存的 checkpoints，上报给 server

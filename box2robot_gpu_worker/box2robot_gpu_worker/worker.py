@@ -31,11 +31,20 @@ class TrainingWorker:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.client = httpx.Client(timeout=60)
         self._should_stop = False
+        self._should_pause = False
 
-    def process_job(self, job_id: str):
-        """Download dataset, train, report progress, complete."""
+    def process_job(self, job_id: str, resume_from_step: int = None):
+        """Download dataset, train, report progress, complete.
+
+        Args:
+            resume_from_step: If set, resume training from this checkpoint step
+                              (uses LeRobot --resume --checkpoint_path)
+        """
         import hashlib
-        logger.info("Processing job: %s", job_id)
+        self._should_stop = False
+        self._should_pause = False
+        logger.info("Processing job: %s%s", job_id,
+                     f" (resume from step {resume_from_step})" if resume_from_step else "")
         self._report_status(job_id, "downloading")
 
         # 1. 先获取 job 信息 (轻量, 不含轨迹帧数据)
@@ -107,12 +116,15 @@ class TrainingWorker:
         model_dir = str(self.output_dir / job_id / "model")
 
         def progress_cb(step, total, metrics):
-            if self._should_stop:
+            if self._should_stop or self._should_pause:
                 return
             resp = self._report_progress(job_id, step, total, metrics)
             if resp and resp.get("should_stop"):
                 logger.warning("Server requested stop")
                 self._should_stop = True
+            elif resp and resp.get("should_pause"):
+                logger.warning("Server requested pause — will save checkpoint and stop")
+                self._should_pause = True
 
         try:
             if model_type == "mlp":
@@ -131,10 +143,20 @@ class TrainingWorker:
                 result = self._train_lerobot(
                     trajectories, model_type, model_dir,
                     train_steps, batch_size, chunk_size, custom_params, progress_cb,
+                    resume_from_step=resume_from_step,
                 )
 
             if self._should_stop:
                 self._report_status(job_id, "cancelled")
+                return
+
+            if self._should_pause:
+                # 暂停: 上报 checkpoint 列表，保持 paused 状态 (server 已设为 paused)
+                ckpts = self._scan_checkpoints(model_dir)
+                if ckpts:
+                    self._report_progress(job_id, ckpts[-1], train_steps,
+                                          {"checkpoints": ckpts, "log": f"训练已暂停 (step {ckpts[-1]})，已保存 {len(ckpts)} 个 checkpoint"})
+                logger.info("Training paused at checkpoint. Checkpoints: %s", ckpts)
                 return
 
             # 3. Complete
@@ -146,17 +168,35 @@ class TrainingWorker:
             logger.error("Training failed: %s", e, exc_info=True)
             self._report_status(job_id, "failed", error_msg=str(e))
 
+    # VLA models that fine-tune from pretrained base (vision-language-action)
+    VLA_MODELS = {"smolvla", "pi0", "pi0_fast", "pi05"}
+    # Default pretrained base for each VLA model (HuggingFace Hub)
+    VLA_PRETRAINED = {
+        "smolvla": "lerobot/smolvla_base",
+        "pi0": "lerobot/pi0_base",
+        "pi0_fast": "lerobot/pi0_fast_base",
+        "pi05": "lerobot/pi05_base",
+    }
+
     def _train_lerobot(self, trajectories, model_type, model_dir,
-                       train_steps, batch_size, chunk_size, custom_params, progress_cb):
-        """Train using LeRobot (ACT/Diffusion/etc).
+                       train_steps, batch_size, chunk_size, custom_params, progress_cb,
+                       resume_from_step: int = None):
+        """Train using LeRobot (ACT/Diffusion/SmolVLA/Pi0/etc).
 
         Pipeline:
         1. Convert Box2Robot JSON trajectories → LeRobot v3 dataset (with images if available)
         2. Call lerobot-train via subprocess (draccus CLI, most reliable)
         3. Model saved to model_dir/checkpoints/last/pretrained_model/
+
+        VLA models (smolvla, pi0, pi0_fast, pi05) fine-tune from pretrained base with:
+        - --policy.path for pretrained weights (instead of --policy.type for from-scratch)
+        - bfloat16 dtype + gradient checkpointing for memory efficiency
+        - Frozen vision encoder + expert-only training (configurable)
         """
         import subprocess
         from box2robot_gpu_worker.convert import convert
+
+        is_vla = model_type in self.VLA_MODELS
 
         # 复用 process_job 中已算好的特征码和缓存路径
         import hashlib
@@ -171,6 +211,13 @@ class TrainingWorker:
         has_images = img_dir.is_dir() and any(img_dir.iterdir())
         datasets_root = Path(__file__).parent.parent / "datasets" / repo_id
         dataset_marker = datasets_root / "meta" / "info.json"
+
+        # VLA models require camera images
+        if is_vla and not has_images:
+            raise ValueError(
+                f"{model_type.upper()} 是视觉语言动作模型，需要摄像头图像数据。"
+                f"请使用带图像的数据集，或改用 ACT/Diffusion 等纯状态模型。"
+            )
 
         if dataset_marker.exists():
             logger.info("LeRobot dataset already exists: %s (skipping conversion)", datasets_root)
@@ -198,24 +245,67 @@ class TrainingWorker:
             sys.executable, lerobot_train,
             f"--dataset.repo_id={repo_id}",
             f"--dataset.root={datasets_root}",
-            f"--policy.type={model_type}",
             f"--steps={train_steps}",
             f"--batch_size={batch_size}",
             f"--num_workers=0",
             f"--output_dir={model_dir}",
-            f"--policy.repo_id=box2robot/{repo_id}",
             "--policy.push_to_hub=false",
             "--wandb.enable=false",
             f"--save_freq={max(100, min(5000, train_steps // 5))}",
             "--log_freq=1",
         ]
-        if chunk_size > 1:
-            cmd.append(f"--policy.chunk_size={chunk_size}")
-            cmd.append("--policy.n_action_steps=1")
-            cmd.append("--policy.temporal_ensemble_coeff=0.01")
-        # Custom params as CLI args
+
+        if is_vla:
+            # VLA: fine-tune from pretrained base
+            pretrained_path = custom_params.get(
+                "pretrained_path",
+                self.VLA_PRETRAINED.get(model_type, f"lerobot/{model_type}_base"),
+            )
+            cmd.append(f"--policy.path={pretrained_path}")
+            # Memory optimization (VLA models are large)
+            dtype = custom_params.get("dtype", "bfloat16")
+            cmd.append(f"--policy.dtype={dtype}")
+            cmd.append(f"--policy.gradient_checkpointing={custom_params.get('gradient_checkpointing', 'true')}")
+            # SmolVLA: freeze vision, train expert only (default for fine-tune)
+            if model_type == "smolvla":
+                cmd.append(f"--policy.freeze_vision_encoder={custom_params.get('freeze_vision_encoder', 'true')}")
+                cmd.append(f"--policy.train_expert_only={custom_params.get('train_expert_only', 'true')}")
+                cmd.append(f"--policy.train_state_proj={custom_params.get('train_state_proj', 'true')}")
+            # Pi0: optional compile for speed
+            elif model_type in ("pi0", "pi0_fast", "pi05"):
+                if custom_params.get("compile_model"):
+                    cmd.append(f"--policy.compile_model={custom_params['compile_model']}")
+                # Pi0 expert-only fine-tune (less VRAM)
+                if custom_params.get("train_expert_only"):
+                    cmd.append(f"--policy.train_expert_only={custom_params['train_expert_only']}")
+            # VLA chunk_size/n_action_steps: use model defaults (50) unless explicitly overridden
+            if chunk_size > 1 and custom_params.get("override_chunk_size"):
+                cmd.append(f"--policy.chunk_size={chunk_size}")
+                cmd.append(f"--policy.n_action_steps={chunk_size}")
+        else:
+            # ACT/Diffusion/etc: train from scratch
+            cmd.append(f"--policy.type={model_type}")
+            cmd.append(f"--policy.repo_id=box2robot/{repo_id}")
+            if chunk_size > 1:
+                cmd.append(f"--policy.chunk_size={chunk_size}")
+                cmd.append("--policy.n_action_steps=1")
+                cmd.append("--policy.temporal_ensemble_coeff=0.01")
+
+        # Resume from checkpoint (暂停后恢复训练)
+        if resume_from_step:
+            ckpt_path = Path(model_dir) / "checkpoints" / str(resume_from_step)
+            if ckpt_path.exists():
+                cmd.append("--resume=true")
+                cmd.append(f"--checkpoint_path={ckpt_path}")
+                logger.info("Resuming from checkpoint: %s (step %d)", ckpt_path, resume_from_step)
+            else:
+                logger.warning("Checkpoint %s not found, training from scratch", ckpt_path)
+        # Custom params as CLI args (skip keys already handled above)
+        _handled_keys = {"task", "pretrained_path", "dtype", "gradient_checkpointing",
+                         "freeze_vision_encoder", "train_expert_only", "train_state_proj",
+                         "compile_model", "override_chunk_size"}
         for k, v in custom_params.items():
-            if k not in ("task",):
+            if k not in _handled_keys:
                 cmd.append(f"--{k}={v}")
 
         logger.info("LeRobot train cmd: %s %s", model_type.upper(), " ".join(cmd[-6:]))
@@ -247,6 +337,17 @@ class TrainingWorker:
                 continue
             is_tqdm = "Training:" in line and "%" in line
             print(f"  [lerobot] {line}")
+
+            # 检查停止/暂停信号 → 终止子进程
+            if self._should_stop or self._should_pause:
+                reason = "paused" if self._should_pause else "cancelled"
+                logger.info("Stopping LeRobot subprocess (user %s)", reason)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
 
             if not progress_cb:
                 continue
@@ -294,7 +395,7 @@ class TrainingWorker:
                 progress_cb(last_report_step, train_steps, report_metrics)
 
         proc.wait()
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not self._should_stop and not self._should_pause:
             raise RuntimeError(f"LeRobot training failed (exit code {proc.returncode})")
 
         # Find the pretrained model path
@@ -316,12 +417,14 @@ class TrainingWorker:
         import json as _json
         inference_config = {
             "model_type": model_type,
+            "is_vla": is_vla,
             "pos_max": 4095,
             "use_vision": has_images,
             "lerobot_dataset": repo_id,
             "lerobot_checkpoint": str(ckpt_dir),
             "chunk_size": chunk_size,
             "n_servos": len(trajectories[0]["frames"][0]["positions"]) if trajectories else 6,
+            "task_description": custom_params.get("task", "manipulation task"),
         }
         with open(config_path, "w") as f:
             _json.dump(inference_config, f, indent=2)
@@ -397,6 +500,12 @@ class TrainingWorker:
             try:
                 r = self.client.post(url, json=payload)
                 if r.status_code == 409:
+                    try:
+                        body = r.json()
+                    except Exception:
+                        body = {}
+                    if body.get("should_pause"):
+                        return {"should_pause": True}
                     return {"should_stop": True}
                 r.raise_for_status()
                 return r.json()
@@ -474,7 +583,11 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     else:
         config = {"n_servos": 6, "pos_max": pos_max}
 
-    if model_type in ("act", "diffusion", "tdmpc", "vqbet"):
+    # VLA models use LeRobot's built-in preprocessing (VLM handles images internally)
+    is_vla = config.get("is_vla", model_type in ("smolvla", "pi0", "pi0_fast", "pi05"))
+    task_description = config.get("task_description", "manipulation task")
+
+    if model_type != "mlp":
         # LeRobot policy — 必须指向 checkpoints/.../pretrained_model/ 目录
         ckpt_path = config.get("lerobot_checkpoint", "")
         if not ckpt_path or not Path(ckpt_path).exists():
@@ -485,29 +598,42 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
 
         logger.info("Loading LeRobot %s from %s", model_type.upper(), ckpt_path)
         sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
-        from lerobot.policies.act.modeling_act import ACTPolicy
+        from lerobot.policies.factory import get_policy_class
         from safetensors.torch import load_file as _load_sf
-        model = ACTPolicy.from_pretrained(ckpt_path)
+
+        policy_cls = get_policy_class(model_type)
+        model = policy_cls.from_pretrained(ckpt_path)
         model.eval()
         if torch.cuda.is_available():
             model = model.cuda()
         model.reset()
 
-        # 加载 MEAN_STD 归一化参数 (select_action 不自动处理)
+        # 加载 MEAN_STD 归一化参数
+        # VLA models handle normalization differently — check if preprocessor files exist
         _ckpt = Path(ckpt_path)
-        _pre = _load_sf(_ckpt / "policy_preprocessor_step_3_normalizer_processor.safetensors")
-        _post = _load_sf(_ckpt / "policy_postprocessor_step_0_unnormalizer_processor.safetensors")
-        _state_mean = _pre["observation.state.mean"]
-        _state_std = _pre["observation.state.std"]
-        _action_mean = _post["action.mean"]
-        _action_std = _post["action.std"]
-        if torch.cuda.is_available():
-            _state_mean, _state_std = _state_mean.cuda(), _state_std.cuda()
-            _action_mean, _action_std = _action_mean.cuda(), _action_std.cuda()
+        _has_manual_norm = False
+        _state_mean = _state_std = _action_mean = _action_std = None
+        _pre_file = _ckpt / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+        _post_file = _ckpt / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+        if _pre_file.exists() and _post_file.exists():
+            _pre = _load_sf(str(_pre_file))
+            _post = _load_sf(str(_post_file))
+            if "observation.state.mean" in _pre and "action.mean" in _post:
+                _has_manual_norm = True
+                _state_mean = _pre["observation.state.mean"]
+                _state_std = _pre["observation.state.std"]
+                _action_mean = _post["action.mean"]
+                _action_std = _post["action.std"]
+                if torch.cuda.is_available():
+                    _state_mean, _state_std = _state_mean.cuda(), _state_std.cuda()
+                    _action_mean, _action_std = _action_mean.cuda(), _action_std.cuda()
 
-        logger.info("%s model loaded (chunk=%d, vision=%s, GPU=%s)",
-                     model_type.upper(), chunk_size, use_vision, torch.cuda.is_available())
+        logger.info("%s model loaded (chunk=%d, vision=%s, vla=%s, GPU=%s)",
+                     model_type.upper(), chunk_size, use_vision, is_vla, torch.cuda.is_available())
     else:
+        is_vla = False
+        _has_manual_norm = False
+        _state_mean = _state_std = _action_mean = _action_std = None
         from box2robot_gpu_worker.mlp_policy import load_mlp_model
         model = load_mlp_model(model_dir)
         logger.info("MLP model loaded: %d servos, pos_max=%d", config["n_servos"], pos_max)
@@ -590,31 +716,60 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
         return None
 
     def _build_obs(state_list, cam_image):
-        """构建 LeRobot 观测 dict"""
+        """构建 LeRobot 观测 dict.
+
+        ACT/Diffusion: manual MEAN_STD normalization + ImageNet normalization
+        VLA (SmolVLA/Pi0): raw values — the VLM preprocessor handles normalization
+        """
         state_t = torch.tensor([state_list], dtype=torch.float32)
         if torch.cuda.is_available():
             state_t = state_t.cuda()
-        state_norm = (state_t - _state_mean) / (_state_std + 1e-8)
-        obs = {"observation.state": state_norm}
-        if use_vision:
-            img = cam_image or Image.new("RGB", (640, 480))
-            img_arr = np.array(img, dtype=np.float32) / 255.0
-            img_t = torch.from_numpy(img_arr.transpose(2, 0, 1)).unsqueeze(0)
-            if torch.cuda.is_available():
-                img_t = img_t.cuda()
-            img_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-            img_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-            if torch.cuda.is_available():
-                img_mean, img_std = img_mean.cuda(), img_std.cuda()
-            img_t = (img_t - img_mean) / img_std
-            obs["observation.images.top"] = img_t
+
+        if is_vla:
+            # VLA models: pass raw state, the policy's internal preprocessor handles it
+            obs = {"observation.state": state_t}
+            if use_vision:
+                img = cam_image or Image.new("RGB", (640, 480))
+                # VLA models expect PIL Image or raw uint8 tensor — not ImageNet-normalized
+                img_arr = np.array(img, dtype=np.float32) / 255.0
+                img_t = torch.from_numpy(img_arr.transpose(2, 0, 1)).unsqueeze(0)
+                if torch.cuda.is_available():
+                    img_t = img_t.cuda()
+                obs["observation.images.top"] = img_t
+            # VLA models need task/language prompt
+            obs["task"] = task_description
+        else:
+            # ACT/Diffusion: manual MEAN_STD normalization
+            state_norm = (state_t - _state_mean) / (_state_std + 1e-8)
+            obs = {"observation.state": state_norm}
+            if use_vision:
+                img = cam_image or Image.new("RGB", (640, 480))
+                img_arr = np.array(img, dtype=np.float32) / 255.0
+                img_t = torch.from_numpy(img_arr.transpose(2, 0, 1)).unsqueeze(0)
+                if torch.cuda.is_available():
+                    img_t = img_t.cuda()
+                img_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                img_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                if torch.cuda.is_available():
+                    img_mean, img_std = img_mean.cuda(), img_std.cuda()
+                img_t = (img_t - img_mean) / img_std
+                obs["observation.images.top"] = img_t
         return obs
 
     def _unnorm_action(action_tensor):
-        """反归一化 action tensor → numpy [0,1]"""
+        """反归一化 action tensor → numpy [0,1].
+
+        ACT/Diffusion: manual un-normalization with saved mean/std
+        VLA: output is already in normalized [0,1] space (or close to it)
+        """
         at = action_tensor if isinstance(action_tensor, torch.Tensor) else action_tensor.get("action", list(action_tensor.values())[0])
-        action_01 = at * _action_std + _action_mean
-        return action_01.clamp(0, 1).cpu().numpy()
+        if is_vla or not _has_manual_norm:
+            # VLA models output actions in the dataset's original space
+            # The policy's internal postprocessor already un-normalizes
+            return at.clamp(0, 1).cpu().numpy()
+        else:
+            action_01 = at * _action_std + _action_mean
+            return action_01.clamp(0, 1).cpu().numpy()
 
     # ===== 执行循环 =====
     try:
