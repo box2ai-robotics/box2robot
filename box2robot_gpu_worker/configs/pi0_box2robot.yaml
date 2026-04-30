@@ -1,0 +1,51 @@
+# Pi0 config for Box2Robot 6-DOF arm (vision-language-action)
+# Requires camera images in training data. Fine-tunes from lerobot/pi0_base.
+
+policy:
+  type: pi0
+  pretrained_path: "lerobot/pi0_base"  # PaliGemma 2B + Gemma 300M action expert
+  chunk_size: 50              # 50 actions per prediction (2.5s at 20Hz)
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  # Architecture (from pi0_base, usually no need to change)
+  paligemma_variant: "gemma_2b"
+  action_expert_variant: "gemma_300m"
+  image_resolution: [224, 224]
+  max_state_dim: 32
+  max_action_dim: 32
+  num_inference_steps: 10     # Flow matching denoising steps
+
+  # Memory optimization
+  dtype: bfloat16
+  gradient_checkpointing: true
+  compile_model: false        # Set true for speed on A100+ (requires torch.compile)
+
+  # Fine-tune strategy
+  # Full fine-tune (default): train all parameters
+  # Expert-only: set train_expert_only=true for less VRAM (~12GB vs ~24GB)
+  train_expert_only: false
+  freeze_vision_encoder: false
+
+training:
+  steps: 20000                # Pi0 converges faster than SmolVLA
+  batch_size: 8               # Large model, small batch (increase with VRAM)
+  lr: 2.5e-5
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 20000
+  scheduler_decay_lr: 2.5e-6
+
+dataset:
+  fps: 20
+  servo_count: 6
+  pos_max: 4095
+
+# GPU recommendations (Pi0 ~3B params, needs significant VRAM):
+#   RTX 3090 (24GB): batch_size 4,  expert_only=true,  ~8h / 20000 steps
+#   RTX 4090 (24GB): batch_size 8,  expert_only=true,  ~4h / 20000 steps
+#   A100   (40GB):   batch_size 16, full fine-tune,     ~2h / 20000 steps
+#   A100   (80GB):   batch_size 32, full fine-tune,     ~1h / 20000 steps
+# Note: Requires camera images in dataset (aligned_frames with images)

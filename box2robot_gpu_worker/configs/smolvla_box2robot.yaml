@@ -1,24 +1,31 @@
 # SmolVLA config for Box2Robot 6-DOF arm (vision-language-action)
-# Requires camera images in training data. These are recommended defaults.
+# Requires camera images in training data. Fine-tunes from lerobot/smolvla_base.
 
 policy:
   type: smolvla
+  pretrained_path: "lerobot/smolvla_base"  # SmolVLM2-500M + action expert (~450M total)
   chunk_size: 50              # 50 actions per prediction (2.5s at 20Hz)
   n_action_steps: 50
   n_obs_steps: 1
 
-  # VLM backbone
+  # VLM backbone (from smolvla_base, usually no need to change)
   vlm_model_name: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
   num_vlm_layers: 16
   resize_imgs_with_padding: [512, 512]
+  max_state_dim: 32
+  max_action_dim: 32
 
   # Expert architecture
   expert_width_multiplier: 0.75
   self_attn_every_n_layers: 2
-  num_steps: 10               # Decoding steps
+  num_steps: 10               # Flow matching denoising steps
   use_cache: true
 
-  # Finetuning strategy (freeze VLM, train expert only)
+  # Memory optimization
+  dtype: bfloat16
+  gradient_checkpointing: true
+
+  # Finetuning strategy (freeze VLM, train expert only — recommended for fine-tune)
   freeze_vision_encoder: true
   train_expert_only: true
   train_state_proj: true

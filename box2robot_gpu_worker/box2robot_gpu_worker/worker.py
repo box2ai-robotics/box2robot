@@ -240,9 +240,26 @@ class TrainingWorker:
             progress_cb(0, train_steps, {"loss": 0})
 
         # Step 2: Train via lerobot CLI
-        lerobot_train = str(Path(__file__).parent.parent / "lerobot" / "src" / "lerobot" / "scripts" / "lerobot_train.py")
-        cmd = [
-            sys.executable, lerobot_train,
+        # 优先用 -m 模式 (pip install -e . 安装后，AutoDL 等云端环境)
+        # Fallback 到直接路径 (本地开发，lerobot 作为子目录)
+        lerobot_local = Path(__file__).parent.parent / "lerobot" / "src" / "lerobot" / "scripts" / "lerobot_train.py"
+        try:
+            import importlib.util
+            use_module_mode = importlib.util.find_spec("lerobot") is not None
+        except Exception:
+            use_module_mode = False
+
+        if use_module_mode:
+            cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
+        elif lerobot_local.exists():
+            cmd = [sys.executable, str(lerobot_local)]
+        else:
+            raise FileNotFoundError(
+                "lerobot 未安装且本地子目录不存在。"
+                "请 pip install -e lerobot/ 或确保 lerobot/ 子目录完整。"
+            )
+
+        cmd += [
             f"--dataset.repo_id={repo_id}",
             f"--dataset.root={datasets_root}",
             f"--steps={train_steps}",
@@ -312,10 +329,10 @@ class TrainingWorker:
 
         # Run with real-time stdout forwarding for progress
         import os as _os
-        train_env = {**_os.environ,
-            "PYTHONPATH": str(Path(__file__).parent.parent / "lerobot" / "src"),
-            "PYTHONUNBUFFERED": "1",  # 强制子进程不缓冲输出
-        }
+        train_env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
+        if not use_module_mode:
+            # 本地子目录模式：手动设 PYTHONPATH 让子进程能 import lerobot
+            train_env["PYTHONPATH"] = str(Path(__file__).parent.parent / "lerobot" / "src")
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=str(Path(__file__).parent.parent),
@@ -659,7 +676,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
 
     n_servos = config.get("n_servos", 6)
     step_count = 0
-    last_stop_check = 0
+    last_stop_check = time.time()  # 首次检查延迟 5 秒, 给模型加载后的初始化留缓冲
     interval = 1.0 / fps
 
     _stop_flag = False
