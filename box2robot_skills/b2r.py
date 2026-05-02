@@ -14,7 +14,9 @@ Usage:
   b2r record status                      # Recording status
   b2r play [traj_id]                     # Play trajectory (no args = list)
   b2r snapshot                           # Camera snapshot
-  b2r frame [cam_id] [output.jpg]        # Download latest camera frame
+  b2r frame [cam_id] [output.jpg]        # Download latest camera frame (one-shot)
+  b2r stream <cam_id> [--out DIR | --latest FILE] [--duration SEC]
+                                         # Live stream frames @10Hz via WebSocket
   b2r download <traj_id> [output_dir]    # Download trajectory images
   b2r dataset <traj_id> [output_dir]     # Download full dataset (JSON + images)
   b2r video <traj_id> [output.mp4]       # Generate video from trajectory images
@@ -110,6 +112,22 @@ def _need_device():
     sys.exit(1)
 
 
+async def _auto_select_device(session, server, token, dtype="arm"):
+    """Auto-select device when only one exists. Returns device_id or None."""
+    try:
+        devices = await _get(session, server, token, "/api/devices")
+        dev_list = devices if isinstance(devices, list) else devices.get("devices", [])
+        matches = [d for d in dev_list if d.get("device_type", "arm") == dtype]
+        if len(matches) == 1:
+            did = matches[0]["device_id"]
+            name = matches[0].get("nickname") or did
+            print(f"  Auto-selected {dtype}: {name} ({did})")
+            return did
+    except Exception:
+        pass
+    return None
+
+
 def pp(data):
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -196,9 +214,11 @@ async def cmd_status(args):
     if not token:
         _need_login()
     device = args[0] if args else device
-    if not device:
-        _need_device()
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         data = await _get(s, server, token, f"/api/device/{device}/servos")
         servos = data.get("servos", []) if isinstance(data, dict) else []
         torque = data.get("torque_enabled")
@@ -215,11 +235,13 @@ async def cmd_move(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
-    data = {"id": int(args[0]), "position": int(args[1]),
-            "speed": int(args[2]) if len(args) > 2 else 1000}
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
+        data = {"id": int(args[0]), "position": int(args[1]),
+                "speed": int(args[2]) if len(args) > 2 else 1000}
         pp(await _post(s, server, token, f"/api/device/{device}/command", data))
 
 
@@ -227,9 +249,11 @@ async def cmd_home(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         pp(await _post(s, server, token, f"/api/device/{device}/go_home"))
 
 
@@ -240,10 +264,12 @@ async def cmd_torque(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     enable = args[0].lower() in ("on", "true", "1", "yes")
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         pp(await _post(s, server, token, f"/api/device/{device}/torque",
                        {"enable": enable}))
 
@@ -257,9 +283,11 @@ async def cmd_record(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         if args[0] == "start":
             # Parse --cam CAM_ID from args
             camera_id = ""
@@ -314,9 +342,11 @@ async def cmd_play(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         if not args:
             data = await _get(s, server, token,
                               f"/api/device/{device}/trajectories")
@@ -367,6 +397,112 @@ async def cmd_frame(args):
             print(f"Saved {len(data)} bytes -> {output}")
 
 
+async def cmd_stream(args):
+    """Live-stream camera frames at 10Hz via persistent WebSocket.
+
+    Connects to /ws/camera/{cam_id}; the server auto-switches the cam
+    to preview mode (10fps push) on first viewer and back to idle on
+    disconnect. Frames arrive as JPEG binary messages — no polling.
+    """
+    if not args:
+        print("Usage: b2r stream <cam_id> [--out DIR] [--latest FILE] "
+              "[--duration SEC]")
+        print("  Default: writes to ./frame.jpg (overwrite-on-update)")
+        return
+    server, token, _ = _resolve()
+    if not token:
+        _need_login()
+
+    cam_id = args[0]
+    out_dir = None
+    latest_file = "frame.jpg"
+    duration = 0.0
+
+    rest = args[1:]
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--out" and i + 1 < len(rest):
+            out_dir = rest[i + 1]
+            latest_file = None
+            i += 2
+        elif rest[i] == "--latest" and i + 1 < len(rest):
+            latest_file = rest[i + 1]
+            i += 2
+        elif rest[i] == "--duration" and i + 1 < len(rest):
+            duration = float(rest[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # https → wss, http → ws
+    if server.startswith("https://"):
+        ws_base = "wss://" + server[len("https://"):]
+    elif server.startswith("http://"):
+        ws_base = "ws://" + server[len("http://"):]
+    else:
+        ws_base = server
+    ws_url = f"{ws_base}/ws/camera/{cam_id}"
+
+    print(f"  Connecting: {ws_url}")
+    print(f"  Output: {out_dir or latest_file}  (Ctrl-C to stop)")
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    last_report = start
+    count = 0
+
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        try:
+            async with s.ws_connect(ws_url, heartbeat=30,
+                                    headers=_headers(token)) as ws:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        data = msg.data
+                        if latest_file:
+                            tmp = latest_file + ".tmp"
+                            with open(tmp, "wb") as f:
+                                f.write(data)
+                            os.replace(tmp, latest_file)
+                        if out_dir:
+                            fname = os.path.join(out_dir, f"{count:06d}.jpg")
+                            with open(fname, "wb") as f:
+                                f.write(data)
+                        count += 1
+
+                        now = loop.time()
+                        if now - last_report >= 1.0:
+                            fps = count / (now - start)
+                            sys.stdout.write(
+                                f"\r  Frames: {count}  FPS: {fps:.1f}  ")
+                            sys.stdout.flush()
+                            last_report = now
+                        if duration > 0 and now - start >= duration:
+                            break
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED,
+                                      aiohttp.WSMsgType.ERROR):
+                        break
+        except KeyboardInterrupt:
+            pass
+        except aiohttp.ClientResponseError as e:
+            print(f"\n  HTTP {e.status}: {e.message}")
+            return
+        except aiohttp.WSServerHandshakeError as e:
+            print(f"\n  Handshake failed: HTTP {e.status} — "
+                  f"check cam_id / server URL")
+            return
+        except Exception as e:
+            print(f"\n  Error: {type(e).__name__}: {e}")
+            return
+
+    elapsed = loop.time() - start
+    avg = count / elapsed if elapsed > 0 else 0
+    print(f"\n  Done: {count} frames in {elapsed:.1f}s ({avg:.1f} fps avg)")
+
+
 async def cmd_download(args):
     """Download all images from a trajectory."""
     if not args:
@@ -375,13 +511,15 @@ async def cmd_download(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     traj_id = args[0]
     out_dir = args[1] if len(args) > 1 else f"images_{traj_id[:8]}"
     os.makedirs(out_dir, exist_ok=True)
 
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         data = await _get(s, server, token,
                           f"/api/device/{device}/trajectory/{traj_id}/images")
         images = data.get("images", [])
@@ -414,13 +552,15 @@ async def cmd_dataset(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     traj_id = args[0]
     out_dir = args[1] if len(args) > 1 else f"dataset_{traj_id[:12]}"
     os.makedirs(out_dir, exist_ok=True)
 
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         # 1. Download trajectory JSON
         print("Downloading trajectory data...")
         traj = await _get(s, server, token,
@@ -470,8 +610,6 @@ async def cmd_video(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     traj_id = args[0]
 
     # Parse output and fps
@@ -485,6 +623,10 @@ async def cmd_video(args):
             output = a
 
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         # Get image list
         img_data = await _get(s, server, token,
                               f"/api/device/{device}/trajectory/{traj_id}/images")
@@ -551,8 +693,6 @@ async def cmd_train(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
 
     # Parse optional flags
     steps = 100000
@@ -567,6 +707,10 @@ async def cmd_train(args):
             i += 1
 
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         # 1. Fetch trajectories with images (training needs image data)
         data = await _get(s, server, token,
                           f"/api/device/{device}/trajectories")
@@ -697,11 +841,13 @@ async def cmd_deploy(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     job_id = args[0]
 
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         # Verify job exists and is deployable
         job = await _get(s, server, token, f"/api/training/jobs/{job_id}")
         if "error" in job:
@@ -813,10 +959,12 @@ async def cmd_calibrate(args):
     server, token, device = _resolve()
     if not token:
         _need_login()
-    if not device:
-        _need_device()
     servo_id = int(args[0]) if args else 0
     async with aiohttp.ClientSession() as s:
+        if not device:
+            device = await _auto_select_device(s, server, token)
+        if not device:
+            _need_device()
         pp(await _post(s, server, token,
                        f"/api/device/{device}/calibrate",
                        {"servo_id": servo_id}))
@@ -835,6 +983,7 @@ COMMANDS = {
     "play": cmd_play,
     "snapshot": cmd_snapshot,
     "frame": cmd_frame,
+    "stream": cmd_stream,
     "download": cmd_download,
     "dataset": cmd_dataset,
     "video": cmd_video,

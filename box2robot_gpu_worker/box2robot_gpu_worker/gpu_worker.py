@@ -479,7 +479,10 @@ class GPUWorker:
 
         if not Path(model_path).exists():
             logger.error("模型不存在: %s", model_path)
-            self._report_status(job["id"], "failed", error_msg=f"模型路径不存在: {model_path}")
+            # 推理部署阶段模型缺失 → 训练成果完好, 仅本次部署失败
+            # 必须用 "completed" 而非 "failed", 否则训练任务会被永久标记为失败
+            self._report_status(job["id"], "completed",
+                                error_msg=f"推理部署失败: 模型路径不存在 {model_path}")
             return
 
         # 不改状态! 保持 deploying, run_inference_server 的 _should_stop 依赖此状态
@@ -510,7 +513,22 @@ class GPUWorker:
             logger.info("推理已停止 (Ctrl+C)")
         except Exception as e:
             logger.error("推理失败: %s", e)
-            self._report_status(job["id"], "failed", error_msg=str(e))
+            # 推理部署失败 → 恢复为 completed (训练结果完好), 仅把错误信息上报
+            # 不能用 "failed", 否则训练任务会被标记为彻底失败、无法再次部署
+            self._report_status(job["id"], "completed", error_msg=f"推理部署失败: {e}")
+            # 释放可能已开启的力矩 / 摄像头流 (不再重复上报状态, 避免覆盖 error_msg)
+            if arm_device_id:
+                try:
+                    self.client.post(f"{self.server_url}/api/device/{arm_device_id}/command",
+                                     json={"torque": False})
+                except Exception:
+                    pass
+            if camera_id:
+                try:
+                    self.client.post(f"{self.server_url}/api/camera/{camera_id}/stream/mode",
+                                     json={"mode": "idle"})
+                except Exception:
+                    pass
             return
 
         # 停止推理 → 通知 Server 释放力矩 + 恢复 completed

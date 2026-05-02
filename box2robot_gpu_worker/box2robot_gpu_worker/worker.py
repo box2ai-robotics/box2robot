@@ -831,6 +831,16 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             # ===== Chunk 模式: predict_action_chunk → ChunkOptimizer → batch 发送 =====
             from box2robot_gpu_worker.chunk_optimizer import ChunkOptimizer
 
+            # Diffusion 的 predict_action_chunk 直接从空的 self._queues 读取 → 必须
+            # 先 populate_queues, 否则触发 "torch.stack expects a non-empty TensorList".
+            # 其他 queue 类策略 (pi0/smolvla/multi_task_dit/...) 在 predict_action_chunk
+            # 内部已自行 populate, 不需要外部介入.
+            _needs_manual_populate = (model_type == "diffusion")
+            if _needs_manual_populate:
+                sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
+                from lerobot.policies.utils import populate_queues as _populate_queues
+                from lerobot.utils.constants import OBS_IMAGES as _OBS_IMAGES
+
             # 读一次确定 servo 数量
             servo_ids, state = _read_state()
             while servo_ids is None and not _should_stop():
@@ -867,7 +877,19 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 t_infer = time.perf_counter()
                 obs = _build_obs(state, cam_image)
                 with torch.no_grad():
-                    raw_chunk = model.predict_action_chunk(obs)  # (1, chunk_size, n_servos)
+                    if _needs_manual_populate:
+                        # 与 Diffusion.select_action 前置逻辑一致: 先把多路 image
+                        # 堆叠到 OBS_IMAGES key, 再 populate_queues, 最后调用
+                        # predict_action_chunk (它内部从 queue 读取)
+                        batch = dict(obs)
+                        img_feats = getattr(model.config, 'image_features', None)
+                        if img_feats:
+                            batch[_OBS_IMAGES] = torch.stack(
+                                [batch[k] for k in img_feats], dim=-4)
+                        model._queues = _populate_queues(model._queues, batch)
+                        raw_chunk = model.predict_action_chunk(batch)
+                    else:
+                        raw_chunk = model.predict_action_chunk(obs)  # (1, chunk_size, n_servos)
                 # 反归一化: (1, chunk_size, n_servos) → (chunk_size, n_servos) [0,1]
                 chunk_01 = (raw_chunk[0] * _action_std + _action_mean).clamp(0, 1).cpu().numpy()
                 infer_ms = (time.perf_counter() - t_infer) * 1000
