@@ -10,7 +10,7 @@ English | [中文](README.md)
 
 Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robot arms and vision modules to a cloud platform for data collection, model training, and skill sharing. No complex setup — just flash, connect WiFi, bind your device, and start.
 
-> **Current Release: v0.6.3**
+> **Current Release: v0.6.5** (Arm firmware v0.6.5 / Camera firmware v0.6.3)
 
 ## Getting Started
 
@@ -109,6 +109,14 @@ python b2r.py torque off             # Release torque
 python b2r.py record start           # Start recording
 python b2r.py record stop            # Stop recording
 python b2r.py play                   # List & play trajectories
+
+# Skill Store (ACT Store — browse / buy / run skills shared by others)
+python b2r.py store list             # Browse the store
+python b2r.py store info <task>      # Skill details
+python b2r.py store buy  <task>      # Purchase a paid skill
+python b2r.py store run  <task>      # Execute a skill on your device
+python b2r.py store mine             # My purchased skills
+
 python b2r.py say "take a photo"     # Natural language command
 python b2r.py shell                  # Interactive shell
 ```
@@ -156,7 +164,7 @@ pip install esptool
 ```bash
 python -m esptool --chip esp32 erase_flash
 
-python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.3_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.3_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.3_firmware.bin
+python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.5_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.5_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.5_firmware.bin
 ```
 
 **Vision-Audio Module (ESP32-S3):**
@@ -197,6 +205,8 @@ Use `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v0.6.5 (arm) | 2026-05-02 | CLI adds ACT Skill Store commands (`store list/info/buy/run/mine`); device/trajectory/job listings now show short codes; GPU Worker training/inference flow polished |
+| v0.6.3 | 2026-04-26 | Flash docs revamped (esptool + Flash Download Tool); legacy bin files archived under `History/` |
 | v0.6.1 | 2026-04-19 | GPU Worker open-sourced, fix Hiwonder servo calibration offset write, add servo voltage range selection (5V/7.4V/12V), WiFi Leader-Follower teleoperation smoothness optimization |
 | v0.5.1 | 2026-04-14 | Cloud platform integration, WebSocket relay, OTA, ESP-NOW 50Hz, camera MJPEG+ADPCM audio, voice AI, auto-calibration |
 | v0.4.5 | 2026-03-23 | (LeRobot-ESP32) Hiwonder LX servo support, auto-detect servo type |

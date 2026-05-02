@@ -13,6 +13,11 @@ Usage:
   b2r record stop [name]                 # Stop recording
   b2r record status                      # Recording status
   b2r play [traj_id]                     # Play trajectory (no args = list)
+  b2r store list [keyword]               # Browse ACT Store (others' uploaded skills)
+  b2r store info <task>                  # Skill detail (TASK-... or task_id)
+  b2r store buy <task>                   # Purchase a paid skill
+  b2r store run <task> [device]          # Execute a skill on a device
+  b2r store mine                         # My purchased skills
   b2r snapshot                           # Camera snapshot
   b2r frame [cam_id] [output.jpg]        # Download latest camera frame (one-shot)
   b2r stream <cam_id> [--out DIR | --latest FILE] [--duration SEC]
@@ -205,8 +210,9 @@ async def cmd_devices(args):
             dtype = d.get("device_type", "arm")
             name = d.get("nickname") or d.get("device_id", "")
             did = d.get("device_id", "")
+            code = d.get("code") or "-"
             mark = "*" if online else " "
-            print(f"  {mark} [{dtype:6s}] {name:12s} {did}")
+            print(f"  {mark} [{dtype:6s}] {code:20s} {name:12s} {did}")
 
 
 async def cmd_status(args):
@@ -353,10 +359,11 @@ async def cmd_play(args):
             trajs = data if isinstance(data, list) else data.get("trajectories", [])
             for t in trajs:
                 tid = t.get("id", t.get("traj_id", "?"))
+                code = t.get("code") or "-"
                 name = t.get("name", "unnamed")
                 frames = t.get("frame_count", "?")
                 imgs = " +img" if t.get("has_images") else ""
-                print(f"  {str(tid)[:8]}  {name} ({frames} frames{imgs})")
+                print(f"  {code:20s} {name} ({frames} frames{imgs})  {str(tid)[:16]}")
         else:
             pp(await _post(s, server, token,
                            f"/api/device/{device}/trajectory/{args[0]}/play"))
@@ -813,6 +820,7 @@ async def cmd_jobs(args):
             status = j.get("status", "?")
             name = j.get("name", "unnamed")
             jid = j.get("id", "?")
+            code = j.get("code") or "-"
             progress = j.get("progress", 0)
             steps = j.get("train_steps", 0)
             # Status indicator
@@ -829,7 +837,7 @@ async def cmd_jobs(args):
                 flag = "[CANCELLED]"
             else:
                 flag = f"[{status.upper()}]"
-            print(f"  {flag:16s} {name:20s} {jid[:16]}")
+            print(f"  {flag:16s} {code:20s} {name:20s} {jid[:16]}")
 
 
 async def cmd_deploy(args):
@@ -955,6 +963,120 @@ async def cmd_stop_infer(args):
         pp(resp)
 
 
+async def cmd_store(args):
+    """Browse / execute ACT Store skills (others' uploaded skills).
+
+    Subcommands:
+        list [keyword] [--type T] [--cat C]   Browse store
+        info <task>                            Skill detail (TASK-... or task_id)
+        buy  <task>                            Purchase
+        run  <task> [device]                   Execute on a device
+        mine                                   My purchased skills
+        meta                                   Categories/types/tags
+    """
+    if not args:
+        print("Usage: b2r store list/info/buy/run/mine/meta")
+        return
+    sub = args[0]
+    rest = args[1:]
+    server, token, device = _resolve()
+    if not token:
+        _need_login()
+
+    async with aiohttp.ClientSession() as s:
+        if sub == "list":
+            params = {"page": 1}
+            i = 0
+            while i < len(rest):
+                if rest[i] == "--type" and i + 1 < len(rest):
+                    params["task_type"] = rest[i + 1]; i += 2
+                elif rest[i] == "--cat" and i + 1 < len(rest):
+                    params["category"] = rest[i + 1]; i += 2
+                else:
+                    params["search"] = rest[i]; i += 1
+            data = await _get(s, server, token, "/api/act/tasks", params)
+            items = data.get("items", []) if isinstance(data, dict) else []
+            total = data.get("total", len(items)) if isinstance(data, dict) else len(items)
+            if not items:
+                print("No skills found.")
+                return
+            print(f"  ACT Store ({len(items)}/{total}):")
+            for t in items:
+                code = t.get("code") or "-"
+                name = (t.get("name") or "")[:24]
+                ttype = t.get("task_type", "?")
+                price = t.get("price", 0)
+                price_s = f"{price}积分" if price else "free"
+                rating = t.get("rating", 0)
+                exec_n = t.get("execute_count", 0)
+                print(f"  {code:20s} [{ttype:14s}] {name:24s}  "
+                      f"{price_s:8s}  rate={rating:.1f}  runs={exec_n}")
+
+        elif sub == "info":
+            if not rest:
+                print("Usage: b2r store info <TASK-... | task_id>")
+                return
+            t = await _get(s, server, token, f"/api/act/tasks/{rest[0]}")
+            if t.get("error"):
+                print(f"Error: {t.get('error')}")
+                return
+            print(f"  Code:        {t.get('code') or '-'}")
+            print(f"  Task ID:     {t.get('task_id', '?')}")
+            print(f"  Name:        {t.get('name', '?')}")
+            print(f"  Type:        {t.get('task_type', '?')}")
+            print(f"  Category:    {t.get('category', '?')}")
+            print(f"  Price:       {t.get('price', 0)} (积分)")
+            print(f"  Servo count: {t.get('servo_count', 0)}")
+            print(f"  Arm type:    {t.get('arm_type', '-')}")
+            print(f"  Rating:      {t.get('rating', 0):.1f} ({t.get('rating_count', 0)} votes)")
+            print(f"  Executions:  {t.get('execute_count', 0)}")
+            desc = t.get("description", "")
+            if desc:
+                print(f"  Description: {desc}")
+
+        elif sub == "buy":
+            if not rest:
+                print("Usage: b2r store buy <TASK-... | task_id>")
+                return
+            pp(await _post(s, server, token, f"/api/act/tasks/{rest[0]}/purchase"))
+
+        elif sub == "run":
+            if not rest:
+                print("Usage: b2r store run <TASK-... | task_id> [device]")
+                return
+            task_ref = rest[0]
+            target = rest[1] if len(rest) > 1 else device
+            if not target:
+                target = await _auto_select_device(s, server, token)
+            if not target:
+                _need_device()
+            resp = await _post(s, server, token,
+                               f"/api/act/tasks/{task_ref}/execute",
+                               {"device_id": target})
+            pp(resp)
+
+        elif sub == "mine":
+            data = await _get(s, server, token, "/api/act/my-purchases")
+            items = data.get("items", []) if isinstance(data, dict) else (
+                data if isinstance(data, list) else [])
+            if not items:
+                print("You haven't purchased any skills yet.")
+                return
+            print(f"  Purchased skills ({len(items)}):")
+            for t in items:
+                code = t.get("code") or "-"
+                name = t.get("name", "?")
+                ttype = t.get("task_type", "?")
+                print(f"  {code:20s} [{ttype:14s}] {name}")
+
+        elif sub == "meta":
+            pp(await _get(s, server, token, "/api/act/meta"))
+
+        else:
+            print(f"Unknown store subcommand: {sub}")
+            print("Usage: b2r store list/info/buy/run/mine/meta")
+
+
 async def cmd_calibrate(args):
     server, token, device = _resolve()
     if not token:
@@ -988,6 +1110,7 @@ COMMANDS = {
     "dataset": cmd_dataset,
     "video": cmd_video,
     "calibrate": cmd_calibrate,
+    "store": cmd_store,
     "train": cmd_train,
     "jobs": cmd_jobs,
     "deploy": cmd_deploy,

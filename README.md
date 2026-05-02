@@ -10,7 +10,7 @@
 
 Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块连接到云端平台，实现数据采集、模型训练和技能共享。无需复杂配置 —— 烧录固件、连 WiFi、绑定设备，即可开始。
 
-> **当前版本：v0.6.3**
+> **当前版本：v0.6.5**（机械臂固件 v0.6.5 / 摄像头固件 v0.6.3）
 
 ## 快速开始
 
@@ -109,6 +109,14 @@ python b2r.py torque off             # 释放力矩
 python b2r.py record start           # 开始录制
 python b2r.py record stop            # 停止录制
 python b2r.py play                   # 列出并播放轨迹
+
+# 技能商店（ACT Store —— 浏览/购买/运行他人共享的技能）
+python b2r.py store list             # 浏览技能商店
+python b2r.py store info <task>      # 查看技能详情
+python b2r.py store buy <task>       # 购买付费技能
+python b2r.py store run <task>       # 在自己的设备上执行技能
+python b2r.py store mine             # 已购技能列表
+
 python b2r.py say "拍个照"            # 自然语言指令
 python b2r.py shell                  # 交互式 Shell
 ```
@@ -156,7 +164,7 @@ pip install esptool
 ```bash
 python -m esptool --chip esp32 erase_flash
 
-python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.3_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.3_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.3_firmware.bin
+python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.5_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.5_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.5_firmware.bin
 ```
 
 **视觉语音模块 (ESP32-S3)：**
@@ -197,6 +205,8 @@ python -m esptool --chip esp32s3 --baud 921600 write_flash 0x0 bin/box2robot_cam
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| v0.6.5 (arm) | 2026-05-02 | CLI 新增 ACT 技能商店命令 (`store list/info/buy/run/mine`)，设备/轨迹/任务列表展示短码 (code)，GPU Worker 训练/推理流程优化 |
+| v0.6.3 | 2026-04-26 | 烧录工具说明优化 (esptool / Flash Download Tool 双方案)，bin 文件统一归档 |
 | v0.6.1 | 2026-04-19 | GPU 训练推理节点开源，修复幻尔舵机校准偏置写入，新增舵机电压范围选择 (5V/7.4V/12V)，WiFi 主从遥操流畅度优化 |
 | v0.5.1 | 2026-04-14 | 云端平台集成、WebSocket 中继、OTA、ESP-NOW 50Hz 双通道、摄像头 MJPEG+ADPCM 音频、语音 AI 链路、自动校准、数据采集对齐 |
 | v0.4.5 | 2026-03-23 | (LeRobot-ESP32) 幻尔 LX 舵机支持、自动检测舵机类型 |
