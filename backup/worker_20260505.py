@@ -679,13 +679,6 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     last_stop_check = time.time()  # 首次检查延迟 5 秒, 给模型加载后的初始化留缓冲
     interval = 1.0 / fps
 
-    # EMA action smoothing — 抑制 ACT 预测噪声 + 舵机背隙抖动
-    # alpha=1.0 关闭(原值直通); alpha 越小越平滑, 0.3 经验值 (新值30%+历史70%)
-    _ema_alpha = float((chunk_params or {}).get("ema_alpha", 0.3))
-    _ema_alpha = max(0.0, min(1.0, _ema_alpha))
-    _ema_state = None
-    logger.info("EMA smoothing alpha=%.2f (1.0=off)", _ema_alpha)
-
     _stop_flag = False
 
     def _should_stop():
@@ -795,26 +788,6 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             action_01 = at * _action_std + _action_mean
             return action_01.clamp(0, 1).cpu().numpy()
 
-    def _ema_smooth(action_01):
-        """跨 chunk 持续 EMA 低通滤波, 输入 1D 单帧或 2D (T, n_servos) 块."""
-        nonlocal _ema_state
-        if _ema_alpha >= 1.0:
-            return action_01
-        arr = np.asarray(action_01, dtype=np.float32)
-        if arr.ndim == 1:
-            if _ema_state is None:
-                _ema_state = arr.copy()
-            else:
-                _ema_state = _ema_alpha * arr + (1.0 - _ema_alpha) * _ema_state
-            return _ema_state.copy()
-        out = np.empty_like(arr)
-        if _ema_state is None:
-            _ema_state = arr[0].copy()
-        for i in range(arr.shape[0]):
-            _ema_state = _ema_alpha * arr[i] + (1.0 - _ema_alpha) * _ema_state
-            out[i] = _ema_state
-        return out
-
     # ===== 执行循环 =====
     try:
         if execution_mode == "original" or not hasattr(model, 'predict_action_chunk'):
@@ -838,7 +811,6 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                     action = model.predict(state)
 
                 infer_ms = (time.perf_counter() - t_infer) * 1000
-                action = _ema_smooth(np.asarray(action, dtype=np.float32))
                 positions = [int(max(0, min(pos_max, a * pos_max))) for a in action]
                 cmds = [{"id": servo_ids[i], "position": positions[i], "speed": 0}
                         for i in range(min(len(positions), len(servo_ids)))]
@@ -924,7 +896,6 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
 
                 # 3. ChunkOptimizer 决定执行步数
                 n_exec, batch_actions = optimizer.feed_chunk(chunk_01)
-                batch_actions = _ema_smooth(batch_actions)
 
                 # 4. 转换为 play_batch 帧格式, 一次性发给 ESP32
                 base_t = 0

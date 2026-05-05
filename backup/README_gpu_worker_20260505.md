@@ -132,52 +132,6 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 2. 关闭其他大型程序 (浏览器、游戏等) 释放内存
 3. 如果仍然卡死，手动分步安装 (见上方手动安装步骤)
 
-## 训练失败排查
-
-启动 worker 时会先跑 `preflight` 自检 (依赖/CUDA/路径/编码)。一般问题在自检阶段就会暴露。手动跑诊断:
-
-```bash
-conda activate b2r
-python scripts/check_gpu.py             # GPU + 依赖 + 路径 全套体检
-python -m box2robot_gpu_worker.preflight # 仅 preflight (与 worker 启动时一致)
-```
-
-### 常见报错对照表
-
-| 报错关键词 | 根因 | 修复 |
-|---|---|---|
-| `require_package('datasets', extra='dataset')` | 缺 HuggingFace `datasets` 库 (LeRobot 隐式依赖) | `pip install datasets huggingface_hub safetensors draccus` 或重跑 `setup_windows.bat` |
-| `CUDA out of memory` / `OutOfMemoryError` | 显存被其它程序占用 (浏览器/SD/游戏) 或 batch_size 过大 | 关程序、`nvidia-smi` 看占用、降 batch_size；worker 已支持检测到 OOM 后自动减半 batch_size 重试一次 |
-| `torch.cuda.is_available() == False` | 装成 CPU 版 PyTorch | `pip uninstall torch torchvision torchaudio -y` 后按驱动选 cu118/cu121/cu124/cu128 重装 |
-| `FileNotFoundError: [WinError 3] ...` 路径很长 | Windows 260 字符路径限制 | 把项目移到更短路径 (如 `D:\b2r\`)；或注册表开 `LongPathsEnabled=1` |
-| 中文乱码 / `UnicodeDecodeError` | Windows cp936 默认编码 | 已统一 `encoding="utf-8"`; 仍异常时 `set PYTHONUTF8=1` |
-| 训练 23 分钟后崩 / resume 失败 | 多半是 preflight 没装 → 第一次跳过 convert 看不到, resume 时才 import lerobot.datasets | 升级到当前版本 (preflight 启动即检测), 重跑 setup_windows.bat |
-| `lerobot/setup.py 未找到` | submodule 未拉取 | 主仓库根目录 `git submodule update --init --recursive` |
-
-### 显存预案
-
-- worker 在每次开始训练前会 **预检显存**, 不够会立即 fail (而不是跑 23 分钟才 OOM)
-- 训练子进程一旦输出 `out of memory`, worker 会 **自动把 batch_size 减半重试一次** (从最近 checkpoint resume)
-- 仍失败时考虑:
-  - 关浏览器 GPU 加速 / Stable Diffusion / ComfyUI / 游戏
-  - VLA 模型 (smolvla/pi0/pi05) 加 `gradient_checkpointing=true` (默认已开)
-  - `batch_size=8` 起步, 显存够再加
-  - `nvidia-smi -l 1` 实时监控
-
-### 跨平台路径
-
-- 项目根路径建议放在 **不超过 60 字符** 的目录, 如 `D:\b2r\` / `~/b2r/`
-- HuggingFace / Torch 缓存默认在 `~/.cache/`, 经常爆 C 盘. 建议设环境变量:
-  ```bash
-  # Windows
-  set HF_HOME=D:\b2r\hf_cache
-  set TORCH_HOME=D:\b2r\torch_cache
-  # Linux/macOS
-  export HF_HOME=/data/b2r/hf_cache
-  export TORCH_HOME=/data/b2r/torch_cache
-  ```
-- `b2r_config.json` 的 checkpoint 路径以 POSIX 风格保存 (Windows 训练 → Linux 推理可直接迁移)
-
 ## 启动
 
 ```bash

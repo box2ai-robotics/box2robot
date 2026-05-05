@@ -23,12 +23,6 @@ setup(
         "httpx",
         "pyyaml",
         "psutil",
-        "pillow",
-        # LeRobot 隐式依赖 — 不装会在 convert() 第一次调用 import lerobot.datasets 时崩
-        "datasets",
-        "huggingface_hub",
-        "safetensors",
-        "draccus",
     ],
     extras_require={
         "train": ["accelerate>=1.10", "wandb"],
