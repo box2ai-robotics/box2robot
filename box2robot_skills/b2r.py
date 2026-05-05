@@ -4,32 +4,39 @@ Box2Robot CLI — control your robotic arm with a single command.
 
 Usage:
   b2r login [user] [pass]                # Login (saves token to ~/.b2r_token)
+  b2r logout                             # Delete cached token (revoke local access)
   b2r devices                            # List devices
   b2r status                             # Servo status
-  b2r move <id> <pos> [speed]            # Move servo
-  b2r home                               # Go to home position
-  b2r torque on/off                      # Toggle torque
+  b2r move <id> <pos> [speed]            # Move servo *
+  b2r home                               # Go to home position *
+  b2r torque on/off                      # Toggle torque *
   b2r record start [--cam CAM_ID] [name] # Record (with optional camera)
   b2r record stop [name]                 # Stop recording
   b2r record status                      # Recording status
-  b2r play [traj_id]                     # Play trajectory (no args = list)
+  b2r play [traj_id]                     # Play trajectory (no args = list) *
   b2r store list [keyword]               # Browse ACT Store (others' uploaded skills)
   b2r store info <task>                  # Skill detail (TASK-... or task_id)
-  b2r store buy <task>                   # Purchase a paid skill
-  b2r store run <task> [device]          # Execute a skill on a device
+  b2r store buy <task>                   # Purchase a paid skill *
+  b2r store run <task> [device]          # Execute a skill on a device *
   b2r store mine                         # My purchased skills
   b2r snapshot                           # Camera snapshot
   b2r frame [cam_id] [output.jpg]        # Download latest camera frame (one-shot)
   b2r stream <cam_id> [--out DIR | --latest FILE] [--duration SEC]
                                          # Live stream frames @10Hz via WebSocket
+                                         # (default --duration 60; pass 0 for unlimited)
   b2r download <traj_id> [output_dir]    # Download trajectory images
   b2r dataset <traj_id> [output_dir]     # Download full dataset (JSON + images)
   b2r video <traj_id> [output.mp4]       # Generate video from trajectory images
-  b2r calibrate [servo_id]               # Auto-calibrate (0 = all)
+  b2r calibrate [servo_id]               # Auto-calibrate (0 = all) *
   b2r train [--steps N] [--name NAME]    # Submit training job (interactive)
   b2r jobs                               # List training jobs
-  b2r deploy <job_id>                    # Deploy inference (interactive)
+  b2r deploy <job_id>                    # Deploy inference (interactive) *
   b2r stop-infer <job_id>               # Stop inference
+
+Global flag:
+  --yes / -y     Skip confirmation prompt for commands marked with * above.
+                 Use ONLY after explicit user approval — these commands move
+                 hardware or spend account credits.
 
 Environment variables:
   B2R_SERVER   Server URL        (default: https://robot.box2ai.com)
@@ -38,6 +45,7 @@ Environment variables:
 
 Credential storage:
   ~/.b2r_token  JSON {token, server, device}. Owner-only (0600).
+                Run `b2r logout` (or just delete the file) when done.
 """
 
 import asyncio
@@ -157,6 +165,53 @@ def _pick(prompt, options, key_fn, label_fn):
             return None
 
 
+# ── Confirmation gate (security: hardware control + spend) ────────────
+
+_AUTO_YES = False  # toggled by --yes / -y in argv
+
+
+def _strip_yes_flag(argv):
+    """Pop --yes / -y from argv and set the module-level _AUTO_YES."""
+    global _AUTO_YES
+    while "--yes" in argv:
+        argv.remove("--yes")
+        _AUTO_YES = True
+    while "-y" in argv:
+        argv.remove("-y")
+        _AUTO_YES = True
+
+
+def _confirm(action, details=None):
+    """Gate a destructive / impactful action. Return True if approved.
+
+    - With ``--yes`` / ``-y`` on the command line: skip prompt, log, proceed.
+    - Interactive TTY: prompt 'Proceed? [y/N]' (default no).
+    - Non-interactive (agent / script): refuse with explicit error so the
+      caller surfaces the action to a human and re-runs with ``--yes``.
+
+    AI agents wrapping this CLI MUST surface ``action`` (and ``details``) to
+    the user and only pass ``--yes`` after explicit user approval.
+    """
+    detail_s = ""
+    if details:
+        detail_s = "  (" + ", ".join(f"{k}={v}" for k, v in details.items()) + ")"
+    if _AUTO_YES:
+        print(f"  [auto-yes] {action}{detail_s}")
+        return True
+    print(f"  CONFIRM: {action}{detail_s}")
+    if not sys.stdin.isatty():
+        print("  ERROR: non-interactive run — refusing without --yes. "
+              "Re-run with --yes after explicit user approval.",
+              file=sys.stderr)
+        return False
+    try:
+        ans = input("  Proceed? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("y", "yes")
+
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 async def cmd_login(args):
@@ -196,6 +251,25 @@ async def cmd_login(args):
         print(f"\nLogin OK! Token saved to {TOKEN_FILE}")
         if arm_id:
             print(f"Default device: {arm_id}")
+
+
+async def cmd_logout(args):
+    """Delete the cached JWT at ~/.b2r_token (revokes local device control).
+
+    Server-side sessions are not invalidated — change your password at
+    https://robot.box2ai.com to force-revoke a leaked token.
+    """
+    if os.path.exists(TOKEN_FILE):
+        try:
+            os.remove(TOKEN_FILE)
+            print(f"  Deleted {TOKEN_FILE}")
+        except OSError as e:
+            print(f"  Failed to delete {TOKEN_FILE}: {e}")
+            return
+    else:
+        print(f"  No token file at {TOKEN_FILE}")
+    print("  To revoke server-side: change your password at "
+          "https://robot.box2ai.com")
 
 
 async def cmd_devices(args):
@@ -248,6 +322,8 @@ async def cmd_move(args):
             _need_device()
         data = {"id": int(args[0]), "position": int(args[1]),
                 "speed": int(args[2]) if len(args) > 2 else 1000}
+        if not _confirm(f"Move servo on {device} (physical motion)", data):
+            return
         pp(await _post(s, server, token, f"/api/device/{device}/command", data))
 
 
@@ -260,6 +336,9 @@ async def cmd_home(args):
             device = await _auto_select_device(s, server, token)
         if not device:
             _need_device()
+        if not _confirm("Move arm to home position (physical motion)",
+                        {"device": device}):
+            return
         pp(await _post(s, server, token, f"/api/device/{device}/go_home"))
 
 
@@ -276,6 +355,11 @@ async def cmd_torque(args):
             device = await _auto_select_device(s, server, token)
         if not device:
             _need_device()
+        warn = ("locks servos, arm holds position" if enable
+                else "RELEASES servos — unsupported arm may drop")
+        if not _confirm(f"Set torque {'ON' if enable else 'OFF'} ({warn})",
+                        {"device": device}):
+            return
         pp(await _post(s, server, token, f"/api/device/{device}/torque",
                        {"enable": enable}))
 
@@ -365,6 +449,9 @@ async def cmd_play(args):
                 imgs = " +img" if t.get("has_images") else ""
                 print(f"  {code:20s} {name} ({frames} frames{imgs})  {str(tid)[:16]}")
         else:
+            if not _confirm("Play trajectory (physical motion)",
+                            {"device": device, "trajectory": args[0]}):
+                return
             pp(await _post(s, server, token,
                            f"/api/device/{device}/trajectory/{args[0]}/play"))
 
@@ -423,7 +510,7 @@ async def cmd_stream(args):
     cam_id = args[0]
     out_dir = None
     latest_file = "frame.jpg"
-    duration = 0.0
+    duration = 60.0  # privacy default cap; pass --duration 0 for unlimited
 
     rest = args[1:]
     i = 0
@@ -455,6 +542,12 @@ async def cmd_stream(args):
 
     print(f"  Connecting: {ws_url}")
     print(f"  Output: {out_dir or latest_file}  (Ctrl-C to stop)")
+    if duration > 0:
+        print(f"  [privacy] Streaming camera frames for up to "
+              f"{duration:g}s — only run with consent of people on camera.")
+    else:
+        print("  [privacy] Streaming camera frames INDEFINITELY — only run "
+              "with consent of people on camera. Use --duration N to cap.")
 
     loop = asyncio.get_event_loop()
     start = loop.time()
@@ -941,6 +1034,13 @@ async def cmd_deploy(args):
             print(f"  CAM: {cam_id}")
         print(f"  Mode: {exec_mode}")
 
+        if not _confirm(
+                "Deploy ML inference — arm will move autonomously until "
+                "stop-infer. Ensure human supervision.",
+                {"job": job_id[:16], "arm": arm["device_id"],
+                 "gpu": gpu["device_id"], "mode": exec_mode}):
+            return
+
         resp = await _post(s, server, token,
                            f"/api/training/jobs/{job_id}/deploy", body)
         if "error" in resp:
@@ -1038,6 +1138,10 @@ async def cmd_store(args):
             if not rest:
                 print("Usage: b2r store buy <TASK-... | task_id>")
                 return
+            if not _confirm(
+                    "Purchase ACT Store skill — credits will be deducted "
+                    "from your account.", {"task": rest[0]}):
+                return
             pp(await _post(s, server, token, f"/api/act/tasks/{rest[0]}/purchase"))
 
         elif sub == "run":
@@ -1050,6 +1154,11 @@ async def cmd_store(args):
                 target = await _auto_select_device(s, server, token)
             if not target:
                 _need_device()
+            if not _confirm(
+                    "Execute ACT Store skill — robot will move "
+                    "autonomously. Ensure human supervision.",
+                    {"task": task_ref, "device": target}):
+                return
             resp = await _post(s, server, token,
                                f"/api/act/tasks/{task_ref}/execute",
                                {"device_id": target})
@@ -1087,6 +1196,12 @@ async def cmd_calibrate(args):
             device = await _auto_select_device(s, server, token)
         if not device:
             _need_device()
+        target = "ALL servos" if servo_id == 0 else f"servo {servo_id}"
+        if not _confirm(
+                f"Auto-calibrate {target} on {device} — arm will move to "
+                "physical limits. Ensure clear workspace.",
+                {"device": device, "servo": servo_id}):
+            return
         pp(await _post(s, server, token,
                        f"/api/device/{device}/calibrate",
                        {"servo_id": servo_id}))
@@ -1096,6 +1211,7 @@ async def cmd_calibrate(args):
 
 COMMANDS = {
     "login": cmd_login,
+    "logout": cmd_logout,
     "devices": cmd_devices,
     "status": cmd_status,
     "move": cmd_move,
@@ -1130,7 +1246,9 @@ def main():
         print(f"Unknown command: {cmd}")
         print(f"Available: {', '.join(COMMANDS.keys())}")
         return
-    asyncio.run(COMMANDS[cmd](sys.argv[2:]))
+    args = sys.argv[2:]
+    _strip_yes_flag(args)
+    asyncio.run(COMMANDS[cmd](args))
 
 
 if __name__ == "__main__":

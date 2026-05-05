@@ -10,7 +10,7 @@
 
 Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块连接到云端平台，实现数据采集、模型训练和技能共享。无需复杂配置 —— 烧录固件、连 WiFi、绑定设备，即可开始。
 
-> **当前版本：v0.6.5**（机械臂固件 v0.6.5 / 摄像头固件 v0.6.3）
+> **当前版本：v0.6.6**（机械臂固件 v0.6.6 / 摄像头固件 v0.6.3）
 
 ## 快速开始
 
@@ -91,12 +91,21 @@ Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块
 
 ## AI 智能体控制 (Skills CLI)
 
-通过 **Claude Code**、**GPT** 等 AI 智能体，使用 `box2robot_skills/` CLI 控制机械臂。
+让 **Claude Code**、**GPT** 等 AI 智能体直接控制你的机械臂。Box2Robot 提供两种接入方式：
 
-### 快速开始
+### 方式一：从 ClawHub 一键安装（推荐）
+
+[**ClawHub · box2robot-skills →**](https://clawhub.ai/boxjod/box2robot-skills)
+
+无需克隆代码，直接从 ClawHub 平台下载并安装 `box2robot-skills` 技能包，AI Agent 即可接入云端控制机械臂。适合大多数用户。
+
+### 方式二：克隆仓库本地使用（开发者）
+
+如果你想自定义 Action、修改源码或离线运行 CLI，克隆仓库使用：
 
 ```bash
-cd box2robot_skills
+git clone https://github.com/box2ai-robotics/box2robot.git
+cd box2robot/box2robot_skills
 
 # 登录 (token 缓存，后续免登录)
 python b2r.py login <username> <password>
@@ -133,71 +142,32 @@ python b2r.py shell                  # 交互式 Shell
 
 ---
 
-## GPU 训练与推理节点
+## GPU 训练与推理节点（高级）
 
-`box2robot_gpu_worker/` 是 GPU 算力节点，连接 Box2Robot 云端服务器，自动领取训练和推理任务。
+`box2robot_gpu_worker/` 是 GPU 算力节点，连接 Box2Robot 云端服务器，自动领取训练和推理任务。需要 **RTX 3060+ GPU**，支持 ACT (Action Chunking Transformer)、Diffusion Policy、MLP 等模型。
 
 只需 3 步：安装 → 启动 → 在 APP 中输入绑定码。绑定后 Worker 自动轮询任务、下载数据集、训练模型、上报进度，所有操作均在 APP 端完成。
 
-支持 ACT (Action Chunking Transformer)、Diffusion Policy、MLP 等模型，需要 RTX 3060+ GPU。
+克隆仓库时**必须带上 `--recurse-submodules`** 拉取 LeRobot 子仓库：
+
+```bash
+git clone --recurse-submodules https://github.com/box2ai-robotics/box2robot.git
+```
+
+> 已 clone 但没拉 submodule？在仓库根目录执行 `git submodule update --init --recursive` 即可补上 LeRobot。
 
 详见 [box2robot_gpu_worker/README.md](box2robot_gpu_worker/README.md)。
 
 ---
 
-## 烧录固件
+## 固件升级
 
-预编译固件在 `bin/` 目录下，两个设备需要分别烧录：
+设备出厂已预装最新固件，**推荐使用在线 OTA 升级**：
 
-### USB 驱动
+1. 设备绑定后进入 [https://robot.box2ai.com](https://robot.box2ai.com/#/) → **设备管理**
+2. 在设备详情中点击 **固件升级**，云端会自动推送最新固件并完成升级
 
-如果电脑无法识别 USB 端口，请安装 `bin/download_driver_CP210x_USB_TO_UART/` 中的 CP210x 驱动。
-
-### 方法一：esptool (跨平台)
-
-```bash
-pip install esptool
-```
-
-**机械臂驱动板 (ESP32)：**
-
-```bash
-python -m esptool --chip esp32 erase_flash
-
-python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.5_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.5_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.5_firmware.bin
-```
-
-**视觉语音模块 (ESP32-S3)：**
-
-```bash
-python -m esptool --chip esp32s3 erase_flash
-
-python -m esptool --chip esp32s3 --baud 921600 write_flash 0x0 bin/box2robot_cam/box2cam_v0.6.3_bootloader.bin 0x8000 bin/box2robot_cam/box2cam_v0.6.3_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.3_firmware.bin
-```
-
-> esptool 会自动检测串口。如果连接了多个设备，可用 `--port COM5` 手动指定。
-
-### 方法二：Flash Download Tool (Windows 图形工具)
-
-使用 `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`。
-
-1. 选择芯片类型：机械臂选 **ESP32**，摄像头选 **ESP32-S3**。WorkMode: Develop，LoadMode: UART
-
-<div align="center">
-  <img src="assets/arm_flash_esp32.jpg" style="width:45%;max-width:360px;"/>
-  <img src="assets/cam_flash_S3.jpg" style="width:45%;max-width:360px;"/>
-</div>
-
-2. 添加 3 个 bin 文件及对应地址。注意两者地址不同——机械臂 bootloader 起始地址为 **0x1000**，摄像头为 **0x0**；partition 和 firmware 地址相同（0x8000 / 0x10000）。选择 COM 端口，波特率 921600，点击 **START**
-
-<div align="center">
-  <img src="assets/arm_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
-  <img src="assets/cam_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
-</div>
-
-3. 等待 **FINISH**：
-
-   ![烧录成功](assets/flahs_succesful.jpg)
+**手动烧录**（适用于首次烧录空板、设备无法启动、需要刷写自编译固件等场景）：详见 [`bin/README.md`](bin/README.md)。
 
 ---
 
@@ -205,6 +175,7 @@ python -m esptool --chip esp32s3 --baud 921600 write_flash 0x0 bin/box2robot_cam
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| v0.6.6 (arm) | 2026-05-04 | 修复录制中 WS 断连（transport_poll_write）：RAM 录制缓冲 1200→300 帧释放约 80KB BSS，heap 从 30KB 恢复至约 110KB；长录制由 SPIFFS 兜底 |
 | v0.6.5 (arm) | 2026-05-02 | CLI 新增 ACT 技能商店命令 (`store list/info/buy/run/mine`)，设备/轨迹/任务列表展示短码 (code)，GPU Worker 训练/推理流程优化 |
 | v0.6.3 | 2026-04-26 | 烧录工具说明优化 (esptool / Flash Download Tool 双方案)，bin 文件统一归档 |
 | v0.6.1 | 2026-04-19 | GPU 训练推理节点开源，修复幻尔舵机校准偏置写入，新增舵机电压范围选择 (5V/7.4V/12V)，WiFi 主从遥操流畅度优化 |

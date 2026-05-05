@@ -10,7 +10,7 @@ English | [中文](README.md)
 
 Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robot arms and vision modules to a cloud platform for data collection, model training, and skill sharing. No complex setup — just flash, connect WiFi, bind your device, and start.
 
-> **Current Release: v0.6.5** (Arm firmware v0.6.5 / Camera firmware v0.6.3)
+> **Current Release: v0.6.6** (Arm firmware v0.6.6 / Camera firmware v0.6.3)
 
 ## Getting Started
 
@@ -24,7 +24,7 @@ Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robo
   <a href="https://item.taobao.com/item.htm?abbucket=5&id=1030962099420">Purchase the Box2AI Robot Arm Kit (Taobao)</a>
 </div>
 
-Assemble the robot arm and connect servos to the driver board. The firmware comes pre-flashed. If you need to flash manually, see [Flash Firmware](#flash-firmware) below.
+Assemble the robot arm and connect servos to the driver board. The firmware comes pre-flashed. If you need to flash manually, see [Firmware Update](#firmware-update) below.
 
 ### Camera Module Installation
 
@@ -91,12 +91,21 @@ The gray button on the wireless driver box supports the following:
 
 ## AI Agent Control (Skills CLI)
 
-Control your robot arm from **Claude Code**, **GPT**, or any AI agent using the `box2robot_skills/` CLI.
+Let **Claude Code**, **GPT**, or any AI agent control your robot arm directly. Box2Robot offers two ways to plug in:
 
-### Quick Start
+### Option 1: One-Click Install from ClawHub (Recommended)
+
+[**ClawHub · box2robot-skills →**](https://clawhub.ai/boxjod/box2robot-skills)
+
+No need to clone the repo — install the `box2robot-skills` package from ClawHub and your AI Agent can control the arm through the cloud out of the box. Recommended for most users.
+
+### Option 2: Clone the Repository (Developers)
+
+If you want to customize Actions, modify the source, or run the CLI offline, clone the repo:
 
 ```bash
-cd box2robot_skills
+git clone https://github.com/box2ai-robotics/box2robot.git
+cd box2robot/box2robot_skills
 
 # Login (token cached, no re-login needed)
 python b2r.py login <username> <password>
@@ -133,71 +142,32 @@ See `box2robot_skills/SKILLS.md` for the full AI agent reference (79 actions, pr
 
 ---
 
-## GPU Training & Inference Node
+## GPU Training & Inference Node (Advanced)
 
-`box2robot_gpu_worker/` is a GPU compute node that connects to the Box2Robot cloud server and automatically picks up training and inference jobs.
+`box2robot_gpu_worker/` is a GPU compute node that connects to the Box2Robot cloud server and automatically picks up training and inference jobs. Requires an **RTX 3060+ GPU**, supports ACT (Action Chunking Transformer), Diffusion Policy, MLP and more.
 
 Just 3 steps: install → start → enter binding code in the APP. Once bound, the Worker automatically polls for tasks, downloads datasets, trains models, and reports progress — all operations are managed from the APP.
 
-Supports ACT (Action Chunking Transformer), Diffusion Policy, MLP and more. Requires RTX 3060+ GPU.
+When cloning, **you must include `--recurse-submodules`** to pull the LeRobot submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/box2ai-robotics/box2robot.git
+```
+
+> Already cloned without submodules? Run `git submodule update --init --recursive` in the repo root to fetch LeRobot.
 
 See [box2robot_gpu_worker/README.md](box2robot_gpu_worker/README.md) for details.
 
 ---
 
-## Flash Firmware
+## Firmware Update
 
-Pre-built binaries are in `bin/`. Two devices need separate flashing:
+The device ships with the latest firmware pre-flashed. **Online OTA update is recommended**:
 
-### USB Driver
+1. After binding, open [https://robot.box2ai.com](https://robot.box2ai.com/#/) → **Device Management**
+2. In device details, click **Firmware Update**. The cloud will push the latest firmware automatically.
 
-If your PC doesn't recognize the USB port, install the CP210x driver from `bin/download_driver_CP210x_USB_TO_UART/`.
-
-### Method 1: esptool (Cross-Platform)
-
-```bash
-pip install esptool
-```
-
-**Arm Driver Board (ESP32):**
-
-```bash
-python -m esptool --chip esp32 erase_flash
-
-python -m esptool --chip esp32 --baud 921600 write_flash 0x1000 bin/box2robot_arm/box2arm_v0.6.5_bootloader.bin 0x8000 bin/box2robot_arm/box2arm_v0.6.5_partitions.bin 0x10000 bin/box2robot_arm/box2arm_v0.6.5_firmware.bin
-```
-
-**Vision-Audio Module (ESP32-S3):**
-
-```bash
-python -m esptool --chip esp32s3 erase_flash
-
-python -m esptool --chip esp32s3 --baud 921600 write_flash 0x0 bin/box2robot_cam/box2cam_v0.6.3_bootloader.bin 0x8000 bin/box2robot_cam/box2cam_v0.6.3_partitions.bin 0x10000 bin/box2robot_cam/box2cam_v0.6.3_firmware.bin
-```
-
-> esptool auto-detects the serial port. Use `--port COM5` to specify manually if multiple devices are connected.
-
-### Method 2: Flash Download Tool (Windows GUI)
-
-Use `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`.
-
-1. Select chip type: **ESP32** for Arm, **ESP32-S3** for Camera. WorkMode: Develop, LoadMode: UART
-
-<div align="center">
-  <img src="assets/arm_flash_esp32.jpg" style="width:45%;max-width:360px;"/>
-  <img src="assets/cam_flash_S3.jpg" style="width:45%;max-width:360px;"/>
-</div>
-
-2. Add the 3 bin files with their addresses. Note the difference — Arm bootloader starts at **0x1000**, Camera at **0x0**; partition and firmware addresses are the same (0x8000 / 0x10000). Select COM port, baud 921600, click **START**
-
-<div align="center">
-  <img src="assets/arm_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
-  <img src="assets/cam_flash_select_bins.jpg" style="width:45%;max-width:360px;"/>
-</div>
-
-3. Wait for **FINISH**:
-
-   ![Success](assets/flahs_succesful.jpg)
+**Manual flashing** (for first-time flashing of blank boards, devices that won't boot, or custom-built firmware): see [`bin/README_en.md`](bin/README_en.md).
 
 ---
 
@@ -205,6 +175,7 @@ Use `bin/flash_download_tool_windows/flash_download_tool_3.9.9_R2.exe`.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v0.6.6 (arm) | 2026-05-04 | Fix WS disconnect during recording (transport_poll_write): RAM recording buffer 1200→300 frames frees ~80KB BSS, heap recovers from 30KB to ~110KB; long recordings fall back to SPIFFS |
 | v0.6.5 (arm) | 2026-05-02 | CLI adds ACT Skill Store commands (`store list/info/buy/run/mine`); device/trajectory/job listings now show short codes; GPU Worker training/inference flow polished |
 | v0.6.3 | 2026-04-26 | Flash docs revamped (esptool + Flash Download Tool); legacy bin files archived under `History/` |
 | v0.6.1 | 2026-04-19 | GPU Worker open-sourced, fix Hiwonder servo calibration offset write, add servo voltage range selection (5V/7.4V/12V), WiFi Leader-Follower teleoperation smoothness optimization |

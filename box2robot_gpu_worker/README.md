@@ -13,6 +13,27 @@ GPU 算力节点 — 连接 Box2Robot 服务器，自动领取训练/推理任�
 
 ## 安装
 
+### 前置：拉取 LeRobot submodule
+
+GPU Worker 依赖 HuggingFace LeRobot 训练框架。本仓库已通过 git submodule 关联到 [huggingface/lerobot](https://github.com/huggingface/lerobot) 并锁定到我们已验证兼容的 commit，**clone 主仓库时一并拉取即可**，无需手动 clone。
+
+**方式 A（推荐）：clone 主仓库时直接带上 submodule**
+
+```bash
+git clone --recurse-submodules <Box2Robot 主仓库地址>
+```
+
+**方式 B：已经 clone 过主仓库，补拉 submodule**
+
+```bash
+cd <Box2Robot 主仓库根目录>
+git submodule update --init --recursive
+```
+
+完成后 `box2robot_gpu_worker/lerobot/` 会自动检出锁定版本，下面一键脚本和手动步骤都能直接使用。LeRobot 上游有 breaking change 不会影响你的本地代码——只有维护者主动 bump 版本时才会跟进。
+
+> 国内网络拉取慢/超时时，可单独进入 `box2robot_gpu_worker/lerobot/` 把 `origin` 改为镜像地址后 `git fetch` 再 `git checkout` 锁定的 commit。
+
 ### Windows (推荐: 一键脚本)
 
 ```cmd
@@ -28,6 +49,7 @@ scripts\setup_windows.bat cu118    # CUDA 11.8 (旧驱动)
 ```
 
 脚本会自动创建 conda 环境 `b2r`，安装 CUDA 版 PyTorch + LeRobot + GPU Worker。
+（脚本不会自动拉 submodule，请先按上一节"前置：拉取 LeRobot submodule"完成。）
 
 ### Windows (手动安装)
 
@@ -43,7 +65,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 REM 3. 验证 GPU
 python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
 
-REM 4. 安装 LeRobot
+REM 4. 安装 LeRobot (前置已通过 submodule 拉取到 lerobot/ 目录)
 cd lerobot
 pip install -e . --no-build-isolation
 cd ..
@@ -64,7 +86,7 @@ conda activate b2r
 # 2. 安装 PyTorch (CUDA)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-# 3. 安装 LeRobot + GPU Worker
+# 3. 安装 LeRobot + GPU Worker (前置已通过 submodule 拉取到 lerobot/ 目录)
 cd lerobot && pip install -e . --no-build-isolation && cd ..
 pip install -e .
 ```
