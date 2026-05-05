@@ -1,0 +1,3 @@
+[submodule "box2robot_gpu_worker/lerobot"]
+	path = box2robot_gpu_worker/lerobot
+	url = https://github.com/huggingface/lerobot.git
