@@ -177,6 +177,43 @@ class TrainingWorker:
         "pi0_fast": "lerobot/pi0_fast_base",
         "pi05": "lerobot/pi05_base",
     }
+    # Box2Robot dataset 当前的图像 key (convert.py 写死了; 单相机)
+    DATASET_VISION_KEY = "observation.images.top"
+
+    @staticmethod
+    def _get_base_visual_keys(pretrained_path: str) -> list:
+        """下载 base 的 config.json, 提取 input_features 中所有 VISUAL 类型的 key.
+
+        VLA base (pi05_base 用 droid 数据训练, pi0_base 用 aloha) 的相机 key 通常和我们
+        Box2Robot dataset 的 'observation.images.top' 不一样, 直接训会抛
+        "All image features are missing from the batch". 拿到 base 期望的 key 列表后,
+        外层用 --rename_map 把 dataset 的 top 映射到 base 第一个 cam, 其余 base cam
+        会被 modeling_pi0.prepare_images 自动用 -1 填充 (siglip empty camera).
+
+        Returns: list of visual key names, e.g.
+            ["observation.images.exterior_1_left", "observation.images.exterior_2_left",
+             "observation.images.wrist_left"]  (pi05_base / droid)
+        失败时返回 [], 调用方退化为不加 rename_map (旧行为).
+        """
+        import os as _os
+        try:
+            if _os.path.isdir(pretrained_path):
+                cfg_path = _os.path.join(pretrained_path, "config.json")
+                if not _os.path.isfile(cfg_path):
+                    logger.warning("Local base path %s has no config.json", pretrained_path)
+                    return []
+            else:
+                # HF hub repo_id like "lerobot/pi05_base"
+                from huggingface_hub import hf_hub_download
+                cfg_path = hf_hub_download(repo_id=pretrained_path, filename="config.json")
+            with open(cfg_path, encoding="utf-8") as f:
+                base_cfg = json.load(f)
+            feats = base_cfg.get("input_features", {}) or {}
+            visual_keys = [k for k, v in feats.items() if (v or {}).get("type") == "VISUAL"]
+            return visual_keys
+        except Exception as e:
+            logger.warning("Failed to read base visual keys from %s: %s", pretrained_path, e)
+            return []
 
     def _train_lerobot(self, trajectories, model_type, model_dir,
                        train_steps, batch_size, chunk_size, custom_params, progress_cb,
@@ -279,6 +316,54 @@ class TrainingWorker:
                 self.VLA_PRETRAINED.get(model_type, f"lerobot/{model_type}_base"),
             )
             cmd.append(f"--policy.path={pretrained_path}")
+
+            # === 图像 key 适配 (rename_map) ===
+            # base 训练时用了不同数据集 (pi0_base=aloha, pi05_base=droid, smolvla=...),
+            # input_features 里的 cam 命名跟我们 Box2Robot dataset 的 'observation.images.top'
+            # 对不上, 不处理会抛 "All image features are missing from the batch".
+            #
+            # 解法 (官方 rename_map.mdx): dataset 第一个 cam 映射到 base 第一个 cam,
+            # 其余 base cam 由 pi0/pi05 modeling.prepare_images 自动 -1 填充 (siglip empty).
+            #
+            # 用户可通过 custom_params['rename_map'] 显式覆盖 (JSON string).
+            user_rename = custom_params.get("rename_map")
+            if user_rename:
+                # 用户显式指定 (来自前端高级选项); 透传
+                rename_str = user_rename if isinstance(user_rename, str) else json.dumps(user_rename)
+                cmd.append(f"--rename_map={rename_str}")
+                logger.info("VLA rename_map (user-specified): %s", rename_str)
+            else:
+                base_visual_keys = self._get_base_visual_keys(pretrained_path)
+                if base_visual_keys:
+                    # 把我们的 top 映射到 base 第一个 cam (一般是主视角, 如 droid 的 exterior_1_left)
+                    rename_map = {self.DATASET_VISION_KEY: base_visual_keys[0]}
+                    cmd.append(f"--rename_map={json.dumps(rename_map)}")
+                    n_padded = max(0, len(base_visual_keys) - 1)
+                    logger.info(
+                        "VLA rename_map: %s -> %s (base has %d cams; %d will be -1-padded as empty)",
+                        self.DATASET_VISION_KEY, base_visual_keys[0],
+                        len(base_visual_keys), n_padded,
+                    )
+                else:
+                    logger.warning(
+                        "Could not fetch base visual keys for %s; training may fail with "
+                        "'All image features are missing'. 可在 custom_params 里手动指定 rename_map.",
+                        pretrained_path,
+                    )
+
+            # === Normalization 适配 ===
+            # pi05 默认 STATE/ACTION = QUANTILES, 但 LeRobotDataset.create() 默认只算
+            # mean/std, 不算 q01/q99 → normalizer 找不到 quantile stats 训练时崩.
+            # 文档 (pi05.mdx) 给出两种方案:
+            # 1. 数据集补算 quantile (augment_dataset_quantile_stats.py) — 额外步骤
+            # 2. 训练时切到 MEAN_STD — 一行 CLI, 我们采用这个
+            # 用户可通过 custom_params['normalization_mapping'] 显式覆盖.
+            if model_type == "pi05" and "normalization_mapping" not in custom_params:
+                norm_map = {"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}
+                cmd.append(f"--policy.normalization_mapping={json.dumps(norm_map)}")
+                logger.info("Pi05 normalization: %s (override default QUANTILES, "
+                             "dataset 没算 q01/q99 stats)", norm_map)
+
             # Memory optimization (VLA models are large)
             dtype = custom_params.get("dtype", "bfloat16")
             cmd.append(f"--policy.dtype={dtype}")
@@ -320,7 +405,8 @@ class TrainingWorker:
         # Custom params as CLI args (skip keys already handled above)
         _handled_keys = {"task", "pretrained_path", "dtype", "gradient_checkpointing",
                          "freeze_vision_encoder", "train_expert_only", "train_state_proj",
-                         "compile_model", "override_chunk_size"}
+                         "compile_model", "override_chunk_size", "rename_map",
+                         "normalization_mapping"}
         for k, v in custom_params.items():
             if k not in _handled_keys:
                 cmd.append(f"--{k}={v}")

@@ -5,14 +5,17 @@ from setuptools import setup, find_packages
 #
 # Correct installation:
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#   pip install -e ./lerobot --no-build-isolation
+#   pip install 'lerobot[dataset] @ ./lerobot'   # video deps (av/datasets/pyarrow/torchcodec)
 #   pip install -e .
 #
-# Or use the automated script:
-#   scripts/setup_windows.bat
+# Or use the automated scripts:
+#   scripts/setup_windows.bat   (Windows)
+#   scripts/setup_linux.sh      (Linux/Ubuntu)
 
 setup(
     name="box2robot-gpu-worker",
-    version="0.6.1",
+    version="0.6.2",
     packages=find_packages(),
     python_requires=">=3.12",
     install_requires=[
@@ -23,12 +26,10 @@ setup(
         "httpx",
         "pyyaml",
         "psutil",
-        "pillow",
-        # LeRobot 隐式依赖 — 不装会在 convert() 第一次调用 import lerobot.datasets 时崩
-        "datasets",
-        "huggingface_hub",
-        "safetensors",
-        "draccus",
+        # av: 视频解码 (lerobot 加载图像/视频数据集时必需,
+        # 否则 VLA 模型 (pi0/pi05/smolvla) 会在数据加载阶段崩溃。
+        # 等价于 `pip install 'lerobot[dataset]'` 中的 av-dep)
+        "av>=15.0.0,<16.0.0",
     ],
     extras_require={
         "train": ["accelerate>=1.10", "wandb"],

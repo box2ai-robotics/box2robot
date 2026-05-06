@@ -135,6 +135,210 @@ def get_usage_stats() -> dict:
     return stats
 
 
+def _preflight(server_url: str, output_dir: Path) -> bool:
+    """启动前完整自检 — 依赖 + 系统资源 + 网络 + 写入权限.
+
+    每次 b2r-gpu 启动都跑一遍, 输出统一的 [READY] / [WARNING] / [BLOCKED] 报告:
+    - BLOCKED: 关键问题, worker 无法启动 → 返回 False, sys.exit(1)
+    - WARNING: 可启动但部分功能受影响 (如 VLA 训练依赖缺) → 仅警告
+    - READY: 所有项通过
+
+    检查项:
+    1. Python 依赖 (av/numpy/torch/lerobot/...)
+    2. CUDA-torch 兼容
+    3. 磁盘空间 (HF 缓存 + base ckpt 下载需要 ~30GB)
+    4. HF Hub 连通性 (下载 base 模型依赖)
+    5. Server URL 连通性
+    6. 写入权限 (outputs/ datasets/ cache/ HF cache)
+    """
+    issues = []  # [(level, category, msg, fix_hint)]
+
+    # ===== 1. Python 依赖 =====
+    _check_dependencies(issues)
+    # ===== 2. CUDA-torch 兼容 =====
+    _check_cuda_torch(issues)
+    # ===== 3. 磁盘空间 =====
+    _check_disk_space(issues, output_dir)
+    # ===== 4. 网络 =====
+    _check_hf_hub(issues)
+    _check_server_url(issues, server_url)
+    # ===== 5. 写入权限 =====
+    _check_write_permissions(issues, output_dir)
+
+    # ===== 输出统一报告 =====
+    blocked = [i for i in issues if i[0] == "BLOCKED"]
+    warnings_ = [i for i in issues if i[0] == "WARNING"]
+
+    print()
+    print("=" * 60)
+    print("  Box2Robot GPU Worker — 启动自检")
+    print("=" * 60)
+    if not issues:
+        print("  [READY] 全部 6 项检查通过, 可以启动")
+        print("=" * 60)
+        return True
+
+    if warnings_:
+        print(f"  [WARNING] {len(warnings_)} 项可启动但受限:")
+        for _, cat, msg, hint in warnings_:
+            print(f"    - {cat}: {msg}")
+            if hint:
+                print(f"      修复: {hint}")
+
+    if blocked:
+        print(f"  [BLOCKED] {len(blocked)} 项致命, worker 无法启动:")
+        for _, cat, msg, hint in blocked:
+            print(f"    - {cat}: {msg}")
+            if hint:
+                print(f"      修复: {hint}")
+        print()
+        print("  完整体检: python scripts/check_gpu.py")
+        print("  一键修复 (Windows): scripts\\setup_windows.bat")
+        print("  一键修复 (Linux):   bash scripts/setup_linux.sh")
+        print("=" * 60)
+        return False
+
+    print("=" * 60)
+    return True
+
+
+def _check_dependencies(issues: list):
+    """Python 依赖 import 检查."""
+    import importlib
+    # (import_name, pip_pkg, hard_fail, fix_hint)
+    deps = [
+        ("numpy",        "numpy",        True,  "pip install numpy"),
+        ("httpx",        "httpx",        True,  "pip install httpx"),
+        ("pyarrow",      "pyarrow",      True,  "pip install pyarrow"),
+        ("yaml",         "pyyaml",       True,  "pip install pyyaml"),
+        ("psutil",       "psutil",       True,  "pip install psutil"),
+        ("lerobot",      "lerobot",      True,
+         "cd lerobot && pip install -e . --no-build-isolation"),
+        ("av",           "av",           True,
+         'pip install "av>=15.0.0,<16.0.0"   # 或 pip install "lerobot[dataset] @ file:./lerobot"'),
+        # VLA-only, 仅 warning
+        ("datasets",     "datasets",     False,
+         'pip install "lerobot[dataset] @ file:./lerobot" --no-build-isolation'),
+        ("transformers", "transformers", False, "pip install transformers accelerate"),
+        ("accelerate",   "accelerate",   False, "pip install accelerate"),
+    ]
+    for import_name, pip_pkg, hard_fail, fix_hint in deps:
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            level = "BLOCKED" if hard_fail else "WARNING"
+            cat = "依赖" if hard_fail else "VLA 依赖"
+            issues.append((level, cat, f"{pip_pkg} 未安装", fix_hint))
+
+
+def _check_cuda_torch(issues: list):
+    """CUDA 驱动版本 vs torch 编译 CUDA 是否兼容."""
+    if not torch.cuda.is_available():
+        compiled_cuda = getattr(torch.version, "cuda", None)
+        if compiled_cuda is None:
+            issues.append((
+                "BLOCKED", "GPU",
+                "PyTorch 是 CPU build, GPU 不可用",
+                "pip install torch torchvision torchaudio "
+                "--index-url https://download.pytorch.org/whl/cu124",
+            ))
+        else:
+            issues.append((
+                "WARNING", "GPU",
+                f"torch 编译 CUDA {compiled_cuda} 但运行时 GPU 不可用 (驱动太旧?)",
+                "运行 nvidia-smi 检查驱动版本; 必要时升级",
+            ))
+
+
+def _check_disk_space(issues: list, output_dir: Path):
+    """磁盘空间 — HF 缓存 + base ckpt 下载需要 ~30GB."""
+    import shutil as _sh
+    try:
+        _, _, free = _sh.disk_usage(str(output_dir.resolve()))
+        free_gb = free / 1024**3
+        if free_gb < 5:
+            issues.append((
+                "BLOCKED", "磁盘",
+                f"剩余空间 {free_gb:.1f}GB, 不够基本运行 (要 5GB+)",
+                "清理磁盘或更换 --output 目录",
+            ))
+        elif free_gb < 30:
+            issues.append((
+                "WARNING", "磁盘",
+                f"剩余空间 {free_gb:.1f}GB, VLA 模型 (pi0 ~10GB / pi05 ~10GB) 可能装不下",
+                "腾出 30GB+ 推荐",
+            ))
+    except Exception as e:
+        issues.append(("WARNING", "磁盘", f"无法检测: {e}", ""))
+
+
+def _check_hf_hub(issues: list):
+    """HF Hub 连通性 — pi0/pi05/smolvla base 都从 HF 下载."""
+    import urllib.request
+    import urllib.error
+    try:
+        # HEAD 请求, 不下载数据, 5 秒超时
+        req = urllib.request.Request("https://huggingface.co", method="HEAD")
+        urllib.request.urlopen(req, timeout=5)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        issues.append((
+            "WARNING", "HF Hub",
+            f"无法访问 huggingface.co ({e}), VLA 训练下载 base 会失败",
+            "检查网络/代理; 国内可设 HF_ENDPOINT=https://hf-mirror.com",
+        ))
+
+
+def _check_server_url(issues: list, server_url: str):
+    """Server URL 连通性 — worker 必须能连 server."""
+    import urllib.request
+    import urllib.error
+    if not server_url:
+        issues.append(("BLOCKED", "Server", "未指定 --server URL", ""))
+        return
+    try:
+        req = urllib.request.Request(server_url.rstrip("/"), method="HEAD")
+        urllib.request.urlopen(req, timeout=5)
+    except (urllib.error.HTTPError,) as e:
+        # 4xx/5xx 也算可达 (server 在线只是 HEAD 不被支持)
+        if 400 <= e.code < 600:
+            return
+        issues.append((
+            "BLOCKED", "Server",
+            f"无法访问 {server_url}: HTTP {e.code}",
+            "检查 URL 是否正确; server 是否在运行",
+        ))
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        issues.append((
+            "BLOCKED", "Server",
+            f"无法连接 {server_url}: {e}",
+            "检查网络 / server 地址 / 端口防火墙",
+        ))
+
+
+def _check_write_permissions(issues: list, output_dir: Path):
+    """写入权限 — outputs/ datasets/ cache/ HF cache 都要可写."""
+    import os as _os
+    pkg_root = Path(__file__).parent.parent
+    paths = [
+        ("output_dir", output_dir),
+        ("datasets", pkg_root / "datasets"),
+        ("cache", pkg_root / "cache"),
+        ("HF cache", Path(_os.path.expanduser("~/.cache/huggingface"))),
+    ]
+    for label, p in paths:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            test_file = p / ".write_test"
+            test_file.write_text("ok")
+            test_file.unlink()
+        except Exception as e:
+            issues.append((
+                "BLOCKED", "写入权限",
+                f"{label} ({p}) 不可写: {e}",
+                f"chmod +w {p}; 或用其它 --output 目录",
+            ))
+
+
 class GPUWorker:
     """GPU Worker: register → bind → poll jobs → train → report."""
 
@@ -146,9 +350,18 @@ class GPUWorker:
         self.device_id = ""
         self.token = ""
         self.hw_info = get_hw_info()
+        # 当前正在处理的训练/推理 job_id, 心跳时上报给 server 作为 worker liveness
+        # (覆盖训练子进程下载大模型 / 慢 GPU 单步等长阻塞期, server 才不会误判卡死)
+        self._active_job_id: str = ""
 
     def run(self):
         """Main loop: activate → wait for bind → poll jobs → train."""
+        # Step 0: 完整启动自检 — 依赖 + GPU + 磁盘 + 网络 + 写入权限
+        # BLOCKED 项任意一个不通过 → 直接退出, 给出修复指令.
+        # WARNING 项 (如 VLA 依赖缺失) 仅警告, ACT/MLP 训练不受影响.
+        if not _preflight(self.server_url, self.output_dir):
+            sys.exit(1)
+
         self._print_banner()
 
         # Step 1: Activate (register with server)
@@ -288,20 +501,28 @@ class GPUWorker:
             print("\nWorker stopped.")
 
     def _heartbeat(self):
-        """Send heartbeat with updated hw info + real-time usage."""
+        """Send heartbeat with updated hw info + real-time usage.
+
+        如果当前正在跑某个训练/推理 job, 会带上 active_job_id —
+        Server 据此刷新该 job 的 updated_at, 避免长下载 / 慢 step 误判卡死.
+        """
         usage = get_usage_stats()
         # Update disk_free in hw_info
         if "disk_free_gb" in usage:
             self.hw_info["disk_free_gb"] = usage.pop("disk_free_gb")
 
+        payload = {
+            "device_id": self.device_id,
+            "token": self.token,
+            "fw_version": WORKER_VERSION,
+            "gpu_info": self.hw_info,
+            "usage": usage,
+        }
+        if self._active_job_id:
+            payload["active_job_id"] = self._active_job_id
+
         try:
-            self.client.post(f"{self.server_url}/api/gpu/heartbeat", json={
-                "device_id": self.device_id,
-                "token": self.token,
-                "fw_version": WORKER_VERSION,
-                "gpu_info": self.hw_info,
-                "usage": usage,
-            })
+            self.client.post(f"{self.server_url}/api/gpu/heartbeat", json=payload)
         except Exception as e:
             logger.warning("Heartbeat failed: %s", e)
 
@@ -414,6 +635,8 @@ class GPUWorker:
         job_id = job["id"]
         logger.info("=" * 40)
 
+        # 标记当前活跃 job — 心跳带上, server 据此刷新 updated_at 避免误判
+        self._active_job_id = job_id
         # Start background heartbeat (keeps GPU online during blocking training)
         self._start_bg_heartbeat()
 
@@ -454,6 +677,7 @@ class GPUWorker:
             raise  # 继续向上传播，退出 worker
         finally:
             self._stop_bg_heartbeat()
+            self._active_job_id = ""
 
         logger.info("任务完成: %s", job_id)
         logger.info("=" * 40)
