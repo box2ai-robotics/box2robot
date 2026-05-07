@@ -515,6 +515,12 @@ class TrainingWorker:
         # 比较慢但是最直接的验证.
         py2 = "\n".join([
             "import json",
+            # 必须先 import policy 模块, 否则 pi05_prepare_state_tokenizer_processor_step
+            # 等专属 step 不会注册到 ProcessorStepRegistry, from_pretrained 会 KeyError
+            "import lerobot.policies.pi05.processor_pi05  # noqa",
+            "import lerobot.policies.pi0.processor_pi0  # noqa",
+            "import lerobot.policies.pi0_fast.processor_pi0_fast  # noqa",
+            "import lerobot.policies.smolvla.processor_smolvla  # noqa",
             "from lerobot.processor.pipeline import PolicyProcessorPipeline",
             "from lerobot.processor import batch_to_transition, transition_to_batch",
             f"overrides = {{'rename_observations_processor': {{'rename_map': {json.dumps(rename_map_dict)}}}}}",
@@ -780,6 +786,26 @@ class TrainingWorker:
                         "'All image features are missing' 失败. 可在 custom_params 里手动指定 rename_map.",
                         pretrained_path,
                     )
+
+            # === use_relative_actions 与 pretrained 互斥 ===
+            # lerobot_train.py 当 use_relative_actions=true + 有 pretrained_path + 不 resume 时,
+            # 会把 processor_pretrained_path 设成 None (warning: "Building processors from current
+            # policy config"), 导致 preprocessor 从头建, 我们的 rename_map override 全部丢失,
+            # batch 里仍然是 'observation.images.top' → 训练第一步报 "All image features are missing".
+            # 这里强制剥掉, 让 lerobot 走 from_pretrained + override 路径.
+            ura_val = str(custom_params.get("use_relative_actions", "")).lower()
+            if ura_val in ("true", "1", "yes"):
+                logger.warning(
+                    "[RENAME-MAP] 检测到 custom_params.use_relative_actions=%s — VLA fine-tune "
+                    "from pretrained 时此选项会让 lerobot 重建 preprocessor 并丢弃 rename_map, "
+                    "训练会立刻挂在 'All image features are missing'. 已自动剥掉此选项.",
+                    custom_params.get("use_relative_actions"),
+                )
+                # 从已经追加的 cmd 里移除 (worker 在前面 _add_policy_param 时可能已经加进去)
+                cmd[:] = [a for a in cmd if not a.startswith("--policy.use_relative_actions")]
+                # 防止后续 custom_params 透传循环再加回来 (整个 key 删掉, 走 PI05Config 默认值 False)
+                custom_params = {k: v for k, v in custom_params.items()
+                                 if k != "use_relative_actions"}
 
             # 预检 (preflight): 在启动训练前验证 draccus 能正确解析 --rename_map,
             # 且 from_pretrained + overrides 后, rename 步骤里的 rename_map 跟我们传的一致.
