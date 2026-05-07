@@ -1284,6 +1284,25 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     logger.info("%s model loaded (chunk=%d, vision=%s, vla=%s, GPU=%s)",
                  model_type.upper(), chunk_size, use_vision, is_vla, torch.cuda.is_available())
 
+    # === 推理时图像 key 适配 (跟训练 rename_map 对应) ===
+    # 训练时 worker 传 --rename_map 把 dataset 的 'observation.images.top' 映射到 base 期望的
+    # 第一个 cam (如 pi05_base 的 base_0_rgb / pi0_base 的 cam_high). lerobot 训练 pipeline
+    # 自动 rename, 但保存的 ckpt config.json 里 input_features 仍是 base 训练时的 cam keys.
+    # 推理时这里直接构造 batch 不走 lerobot pipeline, 必须手动重命名 key, 否则
+    # modeling_pi0.prepare_images 找不到任何匹配 image key, 抛 "All image features are missing".
+    _vision_key = "observation.images.top"  # 默认 (ACT/Diffusion 跟 dataset 一致)
+    if is_vla:
+        try:
+            img_feats = getattr(model.config, "image_features", None) or {}
+            if img_feats:
+                # 取 base config 的第一个 cam — 跟训练 rename_map 的目标一致
+                _vision_key = next(iter(img_feats.keys()))
+                logger.info("Inference image key: '%s' (base expects %d cams: %s)",
+                             _vision_key, len(img_feats), list(img_feats.keys()))
+        except Exception as e:
+            logger.warning("Failed to read model image_features, fallback to '%s': %s",
+                            _vision_key, e)
+
     client = httpx.Client(base_url=server_url, timeout=10,
                           headers={"Authorization": f"Bearer {token}"} if token else {})
 
@@ -1388,11 +1407,15 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 img_t = torch.from_numpy(img_arr.transpose(2, 0, 1)).unsqueeze(0)
                 if torch.cuda.is_available():
                     img_t = img_t.cuda()
-                obs["observation.images.top"] = img_t
+                # 用 _vision_key (model.config.image_features 的第一个 cam, 训练时 rename_map
+                # 的目标), 不是写死 'observation.images.top'. 其它 cam (如 pi05 base 的
+                # left_wrist_0_rgb/right_wrist_0_rgb) 会被 prepare_images 自动 -1 padding.
+                obs[_vision_key] = img_t
             # VLA models need task/language prompt
             obs["task"] = task_description
         else:
-            # ACT/Diffusion: manual MEAN_STD normalization
+            # ACT/Diffusion: manual MEAN_STD normalization. ACT from-scratch 训练时
+            # input_features 自动从 dataset 推导, 推理时 _vision_key 跟 dataset 一致 (top).
             state_norm = (state_t - _state_mean) / (_state_std + 1e-8)
             obs = {"observation.state": state_norm}
             if use_vision:
@@ -1406,7 +1429,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 if torch.cuda.is_available():
                     img_mean, img_std = img_mean.cuda(), img_std.cuda()
                 img_t = (img_t - img_mean) / img_std
-                obs["observation.images.top"] = img_t
+                obs[_vision_key] = img_t
         return obs
 
     def _unnorm_action(action_tensor):
