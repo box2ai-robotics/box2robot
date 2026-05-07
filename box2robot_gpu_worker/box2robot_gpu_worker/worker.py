@@ -459,6 +459,109 @@ class TrainingWorker:
             parts.append("最后日志:\n  " + "\n  ".join(tail_lines[-5:]))
         return "\n".join(parts)
 
+    @staticmethod
+    def _preflight_rename_map(pretrained_path: str, rename_map_dict: dict, lerobot_src: Path) -> None:
+        """启动训练前预检 rename_map 是否真能生效.
+
+        分两步在子进程里跑 (避免污染 worker 进程的 import):
+        1. draccus 解析 cfg.rename_map (用我们传的 --rename_map=... arg)
+        2. PolicyProcessorPipeline.from_pretrained(..., overrides) 后,
+           检查 rename_observations_processor 步骤的 rename_map 是不是我们想要的
+
+        任一失败 → 大声 logger.error 但不抛 (训练继续, 让真实错误暴露具体细节).
+        """
+        import os as _os
+        import subprocess as _sp
+        rename_str = json.dumps(rename_map_dict)
+        logger.info("[PREFLIGHT] 开始 rename_map 预检 (base=%s)", pretrained_path)
+
+        # Step 1: draccus dict[str,str] 解析
+        py = "\n".join([
+            "import json, draccus",
+            "from dataclasses import dataclass, field",
+            "from typing import Dict",
+            "@dataclass",
+            "class _T:",
+            "    rename_map: Dict[str, str] = field(default_factory=dict)",
+            f"args=[{json.dumps('--rename_map=' + rename_str)}]",
+            "cfg=draccus.parse(config_class=_T, args=args)",
+            "print('[PREFLIGHT-DRACCUS] cfg.rename_map =', json.dumps(cfg.rename_map))",
+        ])
+        env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
+        if lerobot_src.exists():
+            old_pp = env.get("PYTHONPATH", "")
+            sep = ";" if _os.name == "nt" else ":"
+            env["PYTHONPATH"] = (
+                f"{lerobot_src}{sep}{old_pp}" if old_pp else str(lerobot_src)
+            )
+        try:
+            r = _sp.run([sys.executable, "-c", py], capture_output=True, text=True,
+                        env=env, timeout=30)
+            for line in (r.stdout or "").splitlines():
+                logger.info("[PREFLIGHT] %s", line)
+            for line in (r.stderr or "").splitlines():
+                if line.strip():
+                    logger.warning("[PREFLIGHT-stderr] %s", line)
+            if r.returncode != 0:
+                logger.error("[PREFLIGHT] draccus 解析失败 (rc=%d) — 真训练时 cfg.rename_map "
+                             "也会丢失, 必然走到 'All image features are missing'!",
+                             r.returncode)
+                return
+        except Exception as e:
+            logger.warning("[PREFLIGHT] draccus 检查跳过: %s", e)
+
+        # Step 2: 用 from_pretrained + overrides 实际加载 preprocessor, 看 rename 步骤
+        # 是不是真的拿到我们的 rename_map. 这一步会下载 (如果未缓存) policy_preprocessor.json,
+        # 比较慢但是最直接的验证.
+        py2 = "\n".join([
+            "import json",
+            "from lerobot.processor.pipeline import PolicyProcessorPipeline",
+            "from lerobot.processor import batch_to_transition, transition_to_batch",
+            f"overrides = {{'rename_observations_processor': {{'rename_map': {json.dumps(rename_map_dict)}}}}}",
+            "pp = PolicyProcessorPipeline.from_pretrained(",
+            f"    pretrained_model_name_or_path={json.dumps(pretrained_path)},",
+            "    config_filename='policy_preprocessor.json',",
+            "    overrides=overrides,",
+            "    to_transition=batch_to_transition,",
+            "    to_output=transition_to_batch,",
+            ")",
+            "for s in pp.steps:",
+            "    cls_name = type(s).__name__",
+            "    if cls_name == 'RenameObservationsProcessorStep':",
+            "        print('[PREFLIGHT-RENAME-STEP] rename_map =', json.dumps(s.rename_map))",
+            "    else:",
+            "        print('[PREFLIGHT-STEP]', cls_name)",
+            # 真正模拟 dataloader 给的 batch, 跑一遍 preprocessor, 看 key 是否被改了
+            "import torch",
+            "fake_batch = {",
+            "    'observation.images.top': torch.zeros(3, 480, 640, dtype=torch.uint8),",
+            "    'observation.state': torch.zeros(6),",
+            "    'task': 'preflight test',",
+            "    'action': torch.zeros(6),",
+            "}",
+            "try:",
+            "    out = pp(fake_batch)",
+            "    print('[PREFLIGHT-AFTER-PREPROCESS] keys =', sorted(out.keys()))",
+            "except Exception as e:",
+            "    print('[PREFLIGHT-AFTER-PREPROCESS] ERROR:', type(e).__name__, str(e)[:200])",
+        ])
+        try:
+            r = _sp.run([sys.executable, "-c", py2], capture_output=True, text=True,
+                        env=env, timeout=120)
+            for line in (r.stdout or "").splitlines():
+                if "[PREFLIGHT" in line:
+                    logger.info("[PREFLIGHT] %s", line)
+            for line in (r.stderr or "").splitlines():
+                if line.strip() and ("Warning" not in line):
+                    logger.warning("[PREFLIGHT-stderr] %s", line[:200])
+            if r.returncode != 0:
+                logger.error("[PREFLIGHT] from_pretrained+overrides 失败 (rc=%d) — "
+                             "真训练时也会失败. stderr 末尾: %s",
+                             r.returncode, (r.stderr or "")[-500:])
+        except Exception as e:
+            logger.warning("[PREFLIGHT] from_pretrained 检查跳过: %s", e)
+        logger.info("[PREFLIGHT] 完成")
+
     @classmethod
     def _get_base_visual_keys(cls, pretrained_path: str) -> list:
         """获取 base 期望的相机 key 列表 (用于自动构造 --rename_map).
@@ -634,30 +737,56 @@ class TrainingWorker:
             # 其余 base cam 由 pi0/pi05 modeling.prepare_images 自动 -1 填充 (siglip empty).
             #
             # 用户可通过 custom_params['rename_map'] 显式覆盖 (JSON string).
+            logger.info("=" * 60)
+            logger.info("[RENAME-MAP] 构建 VLA rename_map (model=%s base=%s)",
+                        model_type, pretrained_path)
             user_rename = custom_params.get("rename_map")
+            rename_map_dict = None
             if user_rename:
                 # 用户显式指定 (来自前端高级选项); 透传
-                rename_str = user_rename if isinstance(user_rename, str) else json.dumps(user_rename)
+                if isinstance(user_rename, str):
+                    rename_str = user_rename
+                    try:
+                        rename_map_dict = json.loads(user_rename)
+                    except Exception as e:
+                        logger.error("[RENAME-MAP] 用户指定的 rename_map 不是合法 JSON: %s (%s)",
+                                     user_rename, e)
+                else:
+                    rename_map_dict = user_rename
+                    rename_str = json.dumps(user_rename)
                 cmd.append(f"--rename_map={rename_str}")
-                logger.info("VLA rename_map (user-specified): %s", rename_str)
+                logger.info("[RENAME-MAP] 来源: user custom_params")
+                logger.info("[RENAME-MAP] dict: %s", rename_map_dict)
+                logger.info("[RENAME-MAP] CLI arg: --rename_map=%s", rename_str)
             else:
                 base_visual_keys = self._get_base_visual_keys(pretrained_path)
+                logger.info("[RENAME-MAP] base_visual_keys (从 base config.json 读取): %s",
+                            base_visual_keys)
                 if base_visual_keys:
                     # 把我们的 top 映射到 base 第一个 cam (一般是主视角, 如 droid 的 exterior_1_left)
-                    rename_map = {self.DATASET_VISION_KEY: base_visual_keys[0]}
-                    cmd.append(f"--rename_map={json.dumps(rename_map)}")
+                    rename_map_dict = {self.DATASET_VISION_KEY: base_visual_keys[0]}
+                    rename_str = json.dumps(rename_map_dict)
+                    cmd.append(f"--rename_map={rename_str}")
                     n_padded = max(0, len(base_visual_keys) - 1)
-                    logger.info(
-                        "VLA rename_map: %s -> %s (base has %d cams; %d will be -1-padded as empty)",
-                        self.DATASET_VISION_KEY, base_visual_keys[0],
-                        len(base_visual_keys), n_padded,
-                    )
+                    logger.info("[RENAME-MAP] 来源: 自动生成 (base 第一个 cam)")
+                    logger.info("[RENAME-MAP] dict: %s", rename_map_dict)
+                    logger.info("[RENAME-MAP] CLI arg: --rename_map=%s", rename_str)
+                    logger.info("[RENAME-MAP] %s -> %s (base 共 %d 个 cam; %d 个会被 -1 填充)",
+                                self.DATASET_VISION_KEY, base_visual_keys[0],
+                                len(base_visual_keys), n_padded)
                 else:
-                    logger.warning(
-                        "Could not fetch base visual keys for %s; training may fail with "
-                        "'All image features are missing'. 可在 custom_params 里手动指定 rename_map.",
+                    logger.error(
+                        "[RENAME-MAP] 无法获取 base visual keys (%s); 训练大概率会因 "
+                        "'All image features are missing' 失败. 可在 custom_params 里手动指定 rename_map.",
                         pretrained_path,
                     )
+
+            # 预检 (preflight): 在启动训练前验证 draccus 能正确解析 --rename_map,
+            # 且 from_pretrained + overrides 后, rename 步骤里的 rename_map 跟我们传的一致.
+            # 任何一步失败都说明真训练时也会失败 — 提前暴露问题, 不浪费 GPU 时间.
+            if rename_map_dict:
+                self._preflight_rename_map(pretrained_path, rename_map_dict, lerobot_src)
+            logger.info("=" * 60)
 
             # 注: pi05 默认 normalization=QUANTILES (用 q01/q99 鲁棒缩放, 比 mean/std
             # 抗异常值好). 这里我们 *不* 改模型 normalization, 而是在 dataset 准备阶段
@@ -732,6 +861,12 @@ class TrainingWorker:
             self._add_policy_param(cmd, model_type, k, v)
 
         logger.info("LeRobot train cmd: %s %s", model_type.upper(), " ".join(cmd[-6:]))
+        # 完整 cmd dump — 出问题时直接复制粘贴可复现
+        logger.info("=" * 60)
+        logger.info("[CMD] 完整训练命令 (复制即可手动复现):")
+        for i, arg in enumerate(cmd):
+            logger.info("[CMD]   [%d] %s", i, arg)
+        logger.info("=" * 60)
 
         # Run with real-time stdout forwarding for progress
         import os as _os
