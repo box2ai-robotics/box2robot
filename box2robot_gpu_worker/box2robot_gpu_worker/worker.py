@@ -1255,11 +1255,51 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     from safetensors.torch import load_file as _load_sf
 
     policy_cls = get_policy_class(model_type)
-    model = policy_cls.from_pretrained(ckpt_path)
+
+    # === LoRA / PEFT 格式自动检测 ===
+    # 用户开 LoRA 微调训练时, lerobot 保存的 ckpt 不含 model.safetensors,
+    # 而是 adapter_config.json + adapter_model.safetensors (PEFT 格式).
+    # 直接 policy_cls.from_pretrained 会"加载 config + 跳过权重", 退化成随机初始化模型.
+    # 检测到 adapter_config.json 时走 PEFT 路径: 先加载 base 再贴 adapter, 最后 merge.
+    _adapter_cfg_file = Path(ckpt_path) / "adapter_config.json"
+    if _adapter_cfg_file.exists():
+        logger.info("LoRA adapter detected at %s — loading via PEFT path", ckpt_path)
+        try:
+            from peft import PeftConfig, PeftModel
+        except ImportError:
+            raise RuntimeError(
+                "ckpt 是 LoRA 格式但 worker 缺 peft 库. "
+                "解决: pip install peft accelerate"
+            )
+        peft_cfg = PeftConfig.from_pretrained(str(ckpt_path))
+        base_path = getattr(peft_cfg, "base_model_name_or_path", "") or ""
+        if not base_path:
+            # 兜底: 用 model_type 对应的 HF base
+            VLA_BASE_FALLBACK = {
+                "pi0": "lerobot/pi0_base", "pi0_fast": "lerobot/pi0_fast_base",
+                "pi05": "lerobot/pi05_base", "smolvla": "lerobot/smolvla_base",
+            }
+            base_path = VLA_BASE_FALLBACK.get(model_type, f"lerobot/{model_type}_base")
+            logger.warning("adapter_config 没记录 base_model_name_or_path, 用 fallback: %s", base_path)
+        logger.info("Loading PEFT base model: %s", base_path)
+        model = policy_cls.from_pretrained(base_path)
+        logger.info("Applying LoRA adapter from %s", ckpt_path)
+        model = PeftModel.from_pretrained(model, str(ckpt_path))
+        # merge_and_unload: 把 LoRA 权重合并进 base, 返回普通 model. 推理速度 = 全量微调.
+        # 不 merge 推理也能跑但慢一些 (要走 PEFT forward hook).
+        try:
+            model = model.merge_and_unload()
+            logger.info("LoRA adapter merged into base model (merge_and_unload)")
+        except Exception as e:
+            logger.warning("merge_and_unload 失败 (%s), 保持 PeftModel wrapper, 推理稍慢", e)
+    else:
+        # 全量训练 ckpt — 直接加载
+        model = policy_cls.from_pretrained(ckpt_path)
     model.eval()
     if torch.cuda.is_available():
         model = model.cuda()
-    model.reset()
+    if hasattr(model, "reset"):
+        model.reset()
 
     # 加载 MEAN_STD 归一化参数
     # VLA models handle normalization differently — check if preprocessor files exist
@@ -1284,24 +1324,41 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     logger.info("%s model loaded (chunk=%d, vision=%s, vla=%s, GPU=%s)",
                  model_type.upper(), chunk_size, use_vision, is_vla, torch.cuda.is_available())
 
-    # === 推理时图像 key 适配 (跟训练 rename_map 对应) ===
-    # 训练时 worker 传 --rename_map 把 dataset 的 'observation.images.top' 映射到 base 期望的
-    # 第一个 cam (如 pi05_base 的 base_0_rgb / pi0_base 的 cam_high). lerobot 训练 pipeline
-    # 自动 rename, 但保存的 ckpt config.json 里 input_features 仍是 base 训练时的 cam keys.
-    # 推理时这里直接构造 batch 不走 lerobot pipeline, 必须手动重命名 key, 否则
-    # modeling_pi0.prepare_images 找不到任何匹配 image key, 抛 "All image features are missing".
-    _vision_key = "observation.images.top"  # 默认 (ACT/Diffusion 跟 dataset 一致)
+    # === VLA 推理: 加载 lerobot 完整 preprocessor/postprocessor pipeline ===
+    # VLA 模型 (pi0/pi05/smolvla) 推理需要的处理远不止 image key rename:
+    #   1. RenameObservations  — top → 模型期望的 cam (base_0_rgb 等)
+    #   2. AddBatchDimension   — 加 batch 维
+    #   3. RelativeActions     — 相对动作转换 (use_relative_actions=true 时)
+    #   4. NormalizerProcessor — 用训练时 dataset stats (q01/q99 for pi05) 归一化 state/action
+    #   5. Pi05PrepareStateTokenizer — pi05 把 state 离散化进 token
+    #   6. TokenizerProcessor  — PaliGemma tokenizer 把 'task' 字符串 → observation.language.tokens
+    #   7. DeviceProcessor     — 移到 GPU
+    # 之前 worker 手动构造 batch 跳过这些, 导致缺 language.tokens / normalize 不一致 / state 没离散化等.
+    # 正解: 用 lerobot make_pre_post_processors 加载训练时保存的完整 pipeline (含 stats).
+    _vla_pre = _vla_post = None
+    _vision_key = "observation.images.top"  # ACT/Diffusion 默认 (跟 dataset 一致, 它们 from-scratch)
     if is_vla:
         try:
-            img_feats = getattr(model.config, "image_features", None) or {}
-            if img_feats:
-                # 取 base config 的第一个 cam — 跟训练 rename_map 的目标一致
-                _vision_key = next(iter(img_feats.keys()))
-                logger.info("Inference image key: '%s' (base expects %d cams: %s)",
-                             _vision_key, len(img_feats), list(img_feats.keys()))
+            from lerobot.policies import make_pre_post_processors
+            _vla_pre, _vla_post = make_pre_post_processors(
+                policy_cfg=model.config,
+                pretrained_path=ckpt_path,
+            )
+            logger.info("VLA preprocessor/postprocessor loaded from %s", ckpt_path)
+            # preprocessor 内部 RenameObservations 自动处理图像 key 映射, 不需要手动 _vision_key.
+            # 但保留 _vision_key 作输入端 dataset key (preprocessor 期望我们用 dataset 时的 key).
         except Exception as e:
-            logger.warning("Failed to read model image_features, fallback to '%s': %s",
-                            _vision_key, e)
+            logger.warning("Failed to load VLA preprocessor: %s. Falling back to manual key rename "
+                            "(no normalize/no tokenize → 推理质量会差, pi05 会缺 language.tokens 直接崩)",
+                            e)
+            # Fallback: 手动 rename image key (上一版逻辑), 缺 tokenizer 仍会崩
+            try:
+                img_feats = getattr(model.config, "image_features", None) or {}
+                if img_feats:
+                    _vision_key = next(iter(img_feats.keys()))
+                    logger.info("Fallback inference image key: '%s'", _vision_key)
+            except Exception:
+                pass
 
     client = httpx.Client(base_url=server_url, timeout=10,
                           headers={"Authorization": f"Bearer {token}"} if token else {})
@@ -1397,21 +1454,35 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
         if torch.cuda.is_available():
             state_t = state_t.cuda()
 
-        if is_vla:
-            # VLA models: pass raw state, the policy's internal preprocessor handles it
+        if is_vla and _vla_pre is not None:
+            # VLA + 完整 lerobot pipeline 路径 (推荐)
+            # raw obs 用 dataset 时的 key (top), 不带 batch dim — preprocessor 会自动:
+            #   RenameObservations (top → cam_high/base_0_rgb 等)
+            #   AddBatchDimension
+            #   Normalizer (用训练时 dataset stats: q01/q99 for pi05)
+            #   Pi05PrepareStateTokenizer (state 离散化)
+            #   TokenizerProcessor (task → observation.language.tokens)
+            #   DeviceProcessor (move to GPU)
+            raw = {
+                "observation.state": state_t.squeeze(0),  # (n_servos,) 不带 batch dim
+                "task": task_description,
+            }
+            if use_vision:
+                img = cam_image or Image.new("RGB", (640, 480))
+                img_arr = np.array(img, dtype=np.float32) / 255.0
+                img_t = torch.from_numpy(img_arr.transpose(2, 0, 1))  # (3, H, W) 不带 batch
+                raw["observation.images.top"] = img_t
+            return _vla_pre(raw)
+        elif is_vla:
+            # VLA + preprocessor 加载失败的 fallback (没 normalize/没 tokenize, pi05 仍会缺 language.tokens)
             obs = {"observation.state": state_t}
             if use_vision:
                 img = cam_image or Image.new("RGB", (640, 480))
-                # VLA models expect PIL Image or raw uint8 tensor — not ImageNet-normalized
                 img_arr = np.array(img, dtype=np.float32) / 255.0
                 img_t = torch.from_numpy(img_arr.transpose(2, 0, 1)).unsqueeze(0)
                 if torch.cuda.is_available():
                     img_t = img_t.cuda()
-                # 用 _vision_key (model.config.image_features 的第一个 cam, 训练时 rename_map
-                # 的目标), 不是写死 'observation.images.top'. 其它 cam (如 pi05 base 的
-                # left_wrist_0_rgb/right_wrist_0_rgb) 会被 prepare_images 自动 -1 padding.
                 obs[_vision_key] = img_t
-            # VLA models need task/language prompt
             obs["task"] = task_description
         else:
             # ACT/Diffusion: manual MEAN_STD normalization. ACT from-scratch 训练时
@@ -1435,17 +1506,29 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     def _unnorm_action(action_tensor):
         """反归一化 action tensor → numpy [0,1].
 
-        ACT/Diffusion: manual un-normalization with saved mean/std
-        VLA: output is already in normalized [0,1] space (or close to it)
+        优先级:
+        1. VLA + _vla_post 加载成功 → 走 lerobot postprocessor (UnnormalizerProcessor +
+           AbsoluteActionsProcessor + DeviceProcessor)
+        2. ACT/Diffusion 有 manual stats → manual un-normalization
+        3. 兜底 → 直接 clamp (可能不准, 但不会崩)
         """
         at = action_tensor if isinstance(action_tensor, torch.Tensor) else action_tensor.get("action", list(action_tensor.values())[0])
-        if is_vla or not _has_manual_norm:
-            # VLA models output actions in the dataset's original space
-            # The policy's internal postprocessor already un-normalizes
+        if is_vla and _vla_post is not None:
+            # postprocessor: unnormalize → absolute (relative_actions 时) → cpu
+            unnorm = _vla_post(at)
+            if isinstance(unnorm, torch.Tensor):
+                return unnorm.clamp(0, 1).cpu().numpy()
+            # postprocessor 返回 dict 时 (RobotAction style), 取 action key
+            if isinstance(unnorm, dict):
+                act_t = unnorm.get("action", list(unnorm.values())[0])
+                return act_t.clamp(0, 1).cpu().numpy() if isinstance(act_t, torch.Tensor) else np.array(list(unnorm.values()))
             return at.clamp(0, 1).cpu().numpy()
-        else:
-            action_01 = at * _action_std + _action_mean
-            return action_01.clamp(0, 1).cpu().numpy()
+        if not _has_manual_norm:
+            # VLA fallback or 没有 manual stats — model 输出已在 [0,1] 附近
+            return at.clamp(0, 1).cpu().numpy()
+        # ACT/Diffusion manual unnormalize
+        action_01 = at * _action_std + _action_mean
+        return action_01.clamp(0, 1).cpu().numpy()
 
     def _ema_smooth(action_01):
         """跨 chunk 持续 EMA 低通滤波, 输入 1D 单帧或 2D (T, n_servos) 块."""
