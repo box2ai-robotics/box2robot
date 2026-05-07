@@ -23,7 +23,6 @@ REQUIRED_PACKAGES = [
 ]
 
 VRAM_NEED_GB = {
-    "mlp": 1.0,
     "act": 6.0,
     "diffusion": 8.0,
     "smolvla": 12.0,
@@ -80,7 +79,7 @@ def check_vram(model_type: str, batch_size: int, strict: bool = True) -> dict:
     free_gb = free_b / 1e9
     total_gb = total_b / 1e9
     base_need = VRAM_NEED_GB.get(model_type.lower(), 4.0)
-    if model_type.lower() in ("act", "diffusion", "mlp"):
+    if model_type.lower() in ("act", "diffusion"):
         need_gb = base_need + 0.05 * batch_size
     else:
         need_gb = base_need

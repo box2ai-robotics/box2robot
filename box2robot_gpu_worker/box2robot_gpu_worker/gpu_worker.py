@@ -358,7 +358,7 @@ class GPUWorker:
         """Main loop: activate → wait for bind → poll jobs → train."""
         # Step 0: 完整启动自检 — 依赖 + GPU + 磁盘 + 网络 + 写入权限
         # BLOCKED 项任意一个不通过 → 直接退出, 给出修复指令.
-        # WARNING 项 (如 VLA 依赖缺失) 仅警告, ACT/MLP 训练不受影响.
+        # WARNING 项 (如 VLA 依赖缺失) 仅警告, ACT/Diffusion 训练不受影响.
         if not _preflight(self.server_url, self.output_dir):
             sys.exit(1)
 

@@ -33,6 +33,17 @@ class TrainingWorker:
         self._should_stop = False
         self._should_pause = False
 
+    @staticmethod
+    def _ds_fingerprint(ids: list) -> str:
+        """统一的数据集指纹 — process_job 和 _train_lerobot 都用这个, 防止两端口径不一致.
+
+        ids: dataset_ids (来自 server job 元数据) 或 trajectory id 列表 — 内容相同.
+        正常情况下两者完全一致; 若 server 删了某条轨迹, 仍以 server 给的 dataset_ids
+        为准 (process_job 用 dataset_ids → 下载/校验缓存 → 把 fingerprint 透传给 _train_lerobot).
+        """
+        import hashlib
+        return hashlib.md5("_".join(sorted(ids)).encode()).hexdigest()[:12]
+
     def process_job(self, job_id: str, resume_from_step: int = None):
         """Download dataset, train, report progress, complete.
 
@@ -40,7 +51,6 @@ class TrainingWorker:
             resume_from_step: If set, resume training from this checkpoint step
                               (uses LeRobot --resume --checkpoint_path)
         """
-        import hashlib
         self._should_stop = False
         self._should_pause = False
         logger.info("Processing job: %s%s", job_id,
@@ -53,7 +63,7 @@ class TrainingWorker:
             self._report_status(job_id, "failed", error_msg="Failed to get job info")
             return
 
-        model_type = job_info.get("model_type", "mlp")
+        model_type = job_info.get("model_type", "act")
         train_steps = job_info.get("train_steps", 10000)
         batch_size = job_info.get("batch_size", 64)
         chunk_size = job_info.get("chunk_size", 1)
@@ -64,24 +74,37 @@ class TrainingWorker:
         if isinstance(dataset_ids, str):
             dataset_ids = json.loads(dataset_ids) if dataset_ids else []
 
-        # 2. 用 dataset_ids 算特征码, 检查本地缓存
-        ds_fingerprint = hashlib.md5("_".join(sorted(dataset_ids)).encode()).hexdigest()[:12]
+        # 2. 用 dataset_ids 算特征码, 强校验本地缓存完整性
+        ds_fingerprint = self._ds_fingerprint(dataset_ids)
         ds_cache_dir = Path(__file__).parent.parent / "cache" / f"ds_{ds_fingerprint}"
         ds_dir = ds_cache_dir / "dataset"
         img_base = ds_cache_dir / "images"
 
-        if (ds_dir / "traj_0000.json").exists():
-            # 缓存命中 — 跳过下载
-            logger.info("Dataset CACHED (fingerprint=%s), skip download!", ds_fingerprint)
-            has_any_images = img_base.is_dir() and any(img_base.iterdir())
-            # 从缓存加载轨迹 (训练需要)
+        # 完整性校验: 文件数 == len(dataset_ids), 防止上次中途崩溃留下的半截缓存被误命中
+        cached_jsons = sorted(ds_dir.glob("traj_*.json")) if ds_dir.is_dir() else []
+        cache_complete = (
+            len(dataset_ids) > 0
+            and len(cached_jsons) == len(dataset_ids)
+        )
+
+        if cache_complete:
+            logger.info("[CACHE HIT] fp=%s trajs=%d dir=%s",
+                         ds_fingerprint, len(cached_jsons), ds_cache_dir)
             trajectories = []
-            for f in sorted(ds_dir.glob("traj_*.json")):
+            for f in cached_jsons:
                 with open(f) as fh:
                     trajectories.append(json.load(fh))
+            has_any_images = img_base.is_dir() and any(img_base.iterdir())
+            if has_any_images:
+                n_img_dirs = sum(1 for d in img_base.iterdir() if d.is_dir())
+                logger.info("[CACHE HIT] images=%d dirs", n_img_dirs)
         else:
-            # 缓存未命中 — 下载完整数据集
-            logger.info("Downloading dataset (fingerprint=%s)...", ds_fingerprint)
+            # 缓存未命中或不完整 — 下载完整数据集
+            if ds_dir.is_dir() and cached_jsons:
+                logger.warning("[CACHE STALE] fp=%s have %d files, expect %d → 重新下载",
+                                ds_fingerprint, len(cached_jsons), len(dataset_ids))
+            else:
+                logger.info("[CACHE MISS] fp=%s → 下载数据集", ds_fingerprint)
             dataset = self._download_dataset(job_id)
             if not dataset:
                 self._report_status(job_id, "failed", error_msg="Failed to download dataset")
@@ -104,7 +127,7 @@ class TrainingWorker:
                         has_any_images = True
             logger.info("Dataset saved to %s", ds_cache_dir)
 
-        logger.info("Dataset: %d trajectories, model=%s, steps=%d (fingerprint=%s)",
+        logger.info("Dataset: %d trajectories, model=%s, steps=%d (fp=%s)",
                      len(trajectories), model_type, train_steps, ds_fingerprint)
 
         # 2. Preprocessing + Train
@@ -127,24 +150,14 @@ class TrainingWorker:
                 self._should_pause = True
 
         try:
-            if model_type == "mlp":
-                from box2robot_gpu_worker.mlp_policy import train_mlp
-                result = train_mlp(
-                    trajectories=trajectories,
-                    output_dir=model_dir,
-                    train_steps=train_steps,
-                    batch_size=batch_size,
-                    progress_callback=progress_cb,
-                    custom_params=custom_params,
-                )
-            else:
-                # For ACT and other models, use the LeRobot training pipeline
-                # First convert trajectories to LeRobot format, then train
-                result = self._train_lerobot(
-                    trajectories, model_type, model_dir,
-                    train_steps, batch_size, chunk_size, custom_params, progress_cb,
-                    resume_from_step=resume_from_step,
-                )
+            # 训练入口: 全部走 LeRobot pipeline (ACT/Diffusion/VLA).
+            # 先把 Box2Robot JSON 轨迹转成 LeRobot v3 dataset, 再调 lerobot-train subprocess.
+            result = self._train_lerobot(
+                trajectories, model_type, model_dir,
+                train_steps, batch_size, chunk_size, custom_params, progress_cb,
+                resume_from_step=resume_from_step,
+                ds_fingerprint=ds_fingerprint,
+            )
 
             if self._should_stop:
                 self._report_status(job_id, "cancelled")
@@ -179,6 +192,242 @@ class TrainingWorker:
     }
     # Box2Robot dataset 当前的图像 key (convert.py 写死了; 单相机)
     DATASET_VISION_KEY = "observation.images.top"
+
+    # 哪些模型 STATE/ACTION 默认用 QUANTILES normalization → 需要 dataset 有 q01/q99 stats.
+    # 这个集合从 lerobot 各 policy config 的 normalization_mapping 读取得来:
+    #   pi05/configuration_pi05.py: STATE/ACTION = QUANTILES
+    #   pi0/configuration_pi0.py:   STATE/ACTION = MEAN_STD
+    #   smolvla/configuration_smolvla.py: STATE/ACTION = MEAN_STD
+    QUANTILE_NORM_MODELS = {"pi05"}
+
+    # 前端 schema 扁平 key → 真实 lerobot policy config 字段名 别名映射.
+    # 大多数前端 key 跟 config 字段同名 (chunk_size, n_action_steps, kl_weight, ...),
+    # 这里只列名字不一致的.
+    PARAM_ALIASES = {
+        "lr": "optimizer_lr",
+        "weight_decay": "optimizer_weight_decay",
+        "grad_clip_norm": "optimizer_grad_clip_norm",
+    }
+
+    # 各 policy 实际暴露的 dataclass 字段集合 (从 lerobot/policies/<m>/configuration_<m>.py 抽出).
+    # 用作 CLI 参数白名单 — 前端 schema 通用字段 (如 GRAD_CLIP/SCHED_WARMUP) 在某些 model
+    # 不存在 (ACT/Diffusion/GR00T 没 grad_clip_norm; ACT/GR00T 没 scheduler_warmup_steps;
+    # SmolVLA/GR00T 没 dtype...). 不过滤就会撞 lerobot draccus "unrecognized arguments"
+    # 让训练 exit code 2.
+    POLICY_FIELDS = {
+        "act": {
+            "n_obs_steps", "chunk_size", "n_action_steps",
+            "vision_backbone", "pretrained_backbone_weights",
+            "replace_final_stride_with_dilation", "pre_norm",
+            "dim_model", "n_heads", "dim_feedforward", "feedforward_activation",
+            "n_encoder_layers", "n_decoder_layers",
+            "use_vae", "latent_dim", "n_vae_encoder_layers",
+            "temporal_ensemble_coeff", "dropout", "kl_weight",
+            "optimizer_lr", "optimizer_weight_decay", "optimizer_lr_backbone",
+        },
+        "diffusion": {
+            "n_obs_steps", "horizon", "n_action_steps", "drop_n_last_frames",
+            "vision_backbone", "resize_shape", "crop_ratio", "crop_shape", "crop_is_random",
+            "pretrained_backbone_weights", "use_group_norm",
+            "spatial_softmax_num_keypoints", "use_separate_rgb_encoder_per_camera",
+            "down_dims", "kernel_size", "n_groups",
+            "diffusion_step_embed_dim", "use_film_scale_modulation",
+            "noise_scheduler_type", "num_train_timesteps", "beta_schedule",
+            "beta_start", "beta_end", "prediction_type", "clip_sample", "clip_sample_range",
+            "num_inference_steps", "compile_model", "compile_mode", "do_mask_loss_for_padding",
+            "optimizer_lr", "optimizer_betas", "optimizer_eps", "optimizer_weight_decay",
+            "scheduler_name", "scheduler_warmup_steps",
+        },
+        "smolvla": {
+            "n_obs_steps", "chunk_size", "n_action_steps",
+            "max_state_dim", "max_action_dim",
+            "resize_imgs_with_padding", "empty_cameras",
+            "adapt_to_pi_aloha", "use_delta_joint_actions_aloha",
+            "tokenizer_max_length", "num_steps", "use_cache",
+            "freeze_vision_encoder", "train_expert_only", "train_state_proj",
+            "optimizer_lr", "optimizer_betas", "optimizer_eps",
+            "optimizer_weight_decay", "optimizer_grad_clip_norm",
+            "scheduler_warmup_steps", "scheduler_decay_steps", "scheduler_decay_lr",
+            "vlm_model_name", "load_vlm_weights", "add_image_special_tokens",
+            "attention_mode", "prefix_length", "pad_language_to",
+            "num_expert_layers", "num_vlm_layers", "self_attn_every_n_layers",
+            "expert_width_multiplier", "min_period", "max_period",
+            "compile_model", "compile_mode",
+        },
+        "pi0": {
+            "paligemma_variant", "action_expert_variant", "dtype",
+            "n_obs_steps", "chunk_size", "n_action_steps",
+            "max_state_dim", "max_action_dim",
+            "num_inference_steps",
+            "time_sampling_beta_alpha", "time_sampling_beta_beta",
+            "time_sampling_scale", "time_sampling_offset",
+            "min_period", "max_period",
+            "use_relative_actions", "relative_exclude_joints",
+            "image_resolution", "empty_cameras",
+            "gradient_checkpointing", "compile_model", "compile_mode",
+            "freeze_vision_encoder", "train_expert_only",
+            "optimizer_lr", "optimizer_betas", "optimizer_eps",
+            "optimizer_weight_decay", "optimizer_grad_clip_norm",
+            "scheduler_warmup_steps", "scheduler_decay_steps", "scheduler_decay_lr",
+            "tokenizer_max_length",
+        },
+        "groot": {
+            "n_obs_steps", "chunk_size", "n_action_steps",
+            "max_state_dim", "max_action_dim",
+            "image_size", "base_model_path", "tokenizer_assets_repo",
+            "embodiment_tag",
+            "tune_llm", "tune_visual", "tune_projector", "tune_diffusion_model",
+            "lora_rank", "lora_alpha", "lora_dropout", "lora_full_model",
+            "optimizer_lr", "optimizer_betas", "optimizer_eps", "optimizer_weight_decay",
+            "warmup_ratio",
+            "video_backend", "balance_dataset_weights", "balance_trajectory_weights",
+            "dataset_paths", "dataloader_num_workers",
+        },
+    }
+    # pi0_fast / pi05 字段集合跟 pi0 一致 (lerobot 上游设计如此, 都用 OpenPI 移植)
+    POLICY_FIELDS["pi0_fast"] = POLICY_FIELDS["pi0"]
+    POLICY_FIELDS["pi05"] = POLICY_FIELDS["pi0"]
+
+    @classmethod
+    def _add_policy_param(cls, cmd: list, model_type: str, key: str, value) -> bool:
+        """加 --policy.{key}={value} 到 cmd, 但只在该 model 实际支持时.
+
+        前端 schema 可能给所有模型加了通用字段 (grad_clip_norm/dtype/...), 但有些 model
+        config 没暴露这些字段 — 直接传会撞 draccus 'unrecognized arguments' 让训练 exit 2.
+        本函数:
+        1. 把前端 key 通过 PARAM_ALIASES 映射到真实 config 字段名 (如 lr→optimizer_lr)
+        2. 用 POLICY_FIELDS[model_type] 校验, 不在白名单的静默跳过 + warning
+        3. 通过则 append --policy.{真实字段}={value}
+
+        Returns True if added, False if skipped.
+        """
+        real_key = cls.PARAM_ALIASES.get(key, key)
+        fields = cls.POLICY_FIELDS.get(model_type)
+        if fields is None:
+            # 未知 model_type — 兜底放行, 让 lerobot 自己报错
+            cmd.append(f"--policy.{real_key}={value}")
+            return True
+        if real_key not in fields:
+            logger.warning(
+                "[%s] Skip param '%s' (→ '%s'): not in %s policy config (white-list)",
+                model_type.upper(), key, real_key, model_type,
+            )
+            return False
+        cmd.append(f"--policy.{real_key}={value}")
+        return True
+
+    def _ensure_quantile_stats(self, repo_id: str, datasets_root: Path, model_type: str):
+        """如果模型用 QUANTILES normalization, 给 dataset 补算 q01/q99 stats.
+
+        LeRobotDataset.create() 默认只算 mean/std/min/max, 不算 quantile.
+        Pi05 的 normalizer 加载时会找 q01/q99 → 找不到崩.
+
+        正解: 调上游 lerobot/scripts/augment_dataset_quantile_stats.py 的核心逻辑
+        给本地 dataset 补算 stats (跳过其中的 push_to_hub 步骤 — 我们不上传 HF).
+        如果 stats 已存在, has_quantile_stats() 短路跳过, 重复训练无开销.
+        """
+        if model_type not in self.QUANTILE_NORM_MODELS:
+            return
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
+            from lerobot.scripts.augment_dataset_quantile_stats import (
+                has_quantile_stats, compute_quantile_stats_for_dataset,
+            )
+            from lerobot.datasets import LeRobotDataset, write_stats
+
+            logger.info("[%s] Checking dataset quantile stats (required for QUANTILES normalization)...",
+                         model_type.upper())
+            ds = LeRobotDataset(repo_id=repo_id, root=datasets_root)
+            if has_quantile_stats(ds.meta.stats):
+                logger.info("Dataset already has quantile stats, skip.")
+                return
+
+            logger.info("Computing quantile stats (q01/q10/q50/q90/q99) for %d episodes...",
+                         ds.num_episodes)
+            new_stats = compute_quantile_stats_for_dataset(ds)
+            ds.meta.stats = new_stats
+            write_stats(new_stats, ds.meta.root)
+            logger.info("Quantile stats written to %s/meta/stats.json", ds.meta.root)
+        except Exception as e:
+            # 不让 quantile 计算失败阻塞训练 — 如果失败, 仍可继续 (lerobot 会在 normalizer
+            # 加载时给出明确报错, 用户能看到), 但记录 warning 让用户知道.
+            logger.warning("Failed to compute quantile stats for %s: %s. "
+                            "Pi05 训练可能崩 (找不到 q01/q99). "
+                            "可手动: python lerobot/src/lerobot/scripts/augment_dataset_quantile_stats.py "
+                            "--repo-id=%s --root=%s",
+                            repo_id, e, repo_id, datasets_root)
+
+    @staticmethod
+    def _diagnose_subprocess_error(returncode: int, tail_lines: list) -> str:
+        """根据 subprocess 退出码 + 最后几行 stdout 给出友好错误描述.
+
+        Linux 信号: -N (Python) 或 128+N (POSIX). 关键信号:
+          -9 / 137  = SIGKILL (大概率 OOM-killer 杀的, 也可能用户 kill -9)
+          -11 / 139 = SIGSEGV (内存越界, 通常是 CUDA 驱动/torch 不兼容)
+          -15 / 143 = SIGTERM (被外部 terminate)
+          1         = 通用错误 (Python 异常等)
+        """
+        # 1. 信号类错误优先判断
+        sig_msg = ""
+        if returncode in (-9, 137):
+            sig_msg = "训练子进程被 SIGKILL 终止"
+        elif returncode in (-11, 139):
+            sig_msg = "训练子进程段错误 (SIGSEGV)"
+        elif returncode in (-15, 143):
+            sig_msg = "训练子进程被 SIGTERM 终止 (外部 kill)"
+
+        # 2. 关键字扫描 (最后 80 行 stdout)
+        joined = "\n".join(tail_lines).lower()
+        kw_hint = ""
+        if "out of memory" in joined or "cuda out of memory" in joined:
+            kw_hint = (
+                "GPU 显存不足 (OOM). 解决方案:\n"
+                "  - 减小 batch_size (当前任务批大小过大)\n"
+                "  - VLA 模型加 --policy.gradient_checkpointing=true (默认已开)\n"
+                "  - VLA 加 --policy.train_expert_only=true 冻结 VLM 主干\n"
+                "  - 换更大显存的 GPU (pi05 推荐 16GB+)"
+            )
+        elif "modulenotfounderror" in joined or "importerror" in joined:
+            # 提取模块名
+            import re as _re
+            m = _re.search(r"(?:no module named|cannot import name)\s+'?([^'\s]+)'?", joined)
+            mod = m.group(1) if m else "依赖库"
+            kw_hint = (
+                f"缺少 Python 依赖: {mod}. 解决方案:\n"
+                f"  - 跑一遍体检: python scripts/check_gpu.py\n"
+                f"  - 重装 dataset 依赖: pip install \"lerobot[dataset] @ file:./lerobot\" --no-build-isolation\n"
+                f"  - 或重装 worker: cd box2robot_gpu_worker && pip install -e . --upgrade"
+            )
+        elif "filenotfounderror" in joined and "checkpoint" in joined:
+            kw_hint = "找不到 checkpoint 文件 — resume 路径可能错误, 或上次训练未保存任何 ckpt."
+        elif "huggingfacehub" in joined and ("timeout" in joined or "connection" in joined):
+            kw_hint = (
+                "HuggingFace Hub 下载失败 (网络问题). 解决方案:\n"
+                "  - 检查网络 / 代理\n"
+                "  - 国内可设 HF_ENDPOINT=https://hf-mirror.com 后重启 worker"
+            )
+        elif "all image features are missing" in joined:
+            kw_hint = (
+                "数据集图像 key 跟模型期望不一致. 应该被自动 rename_map 修复, "
+                "若仍报错请检查 worker 日志中 'VLA rename_map' 行."
+            )
+        elif "quantile" in joined:
+            kw_hint = (
+                "Quantile stats 缺失 (pi05 用 QUANTILES normalization). "
+                "应被自动 augment 修复, 若仍报错可手动跑: "
+                "python lerobot/src/lerobot/scripts/augment_dataset_quantile_stats.py "
+                "--repo-id=<repo> --root=<datasets_root>"
+            )
+
+        # 3. 拼最终信息: 信号描述 + 关键字提示 + 最后 5 行原始日志
+        parts = [f"训练失败 (exit code {returncode})"]
+        if sig_msg:
+            parts.append(sig_msg)
+        if kw_hint:
+            parts.append(kw_hint)
+        if tail_lines:
+            parts.append("最后日志:\n  " + "\n  ".join(tail_lines[-5:]))
+        return "\n".join(parts)
 
     @staticmethod
     def _get_base_visual_keys(pretrained_path: str) -> list:
@@ -217,7 +466,8 @@ class TrainingWorker:
 
     def _train_lerobot(self, trajectories, model_type, model_dir,
                        train_steps, batch_size, chunk_size, custom_params, progress_cb,
-                       resume_from_step: int = None):
+                       resume_from_step: int = None,
+                       ds_fingerprint: str = None):
         """Train using LeRobot (ACT/Diffusion/SmolVLA/Pi0/etc).
 
         Pipeline:
@@ -235,10 +485,10 @@ class TrainingWorker:
 
         is_vla = model_type in self.VLA_MODELS
 
-        # 复用 process_job 中已算好的特征码和缓存路径
-        import hashlib
-        traj_ids = sorted(t.get("id", "") for t in trajectories)
-        ds_fingerprint = hashlib.md5("_".join(traj_ids).encode()).hexdigest()[:12]
+        # 优先用 process_job 透传过来的指纹 (与 dataset_ids 同源, 防止 server 删轨迹后口径错位).
+        # 仅在 fingerprint 缺失 (旧调用路径) 时退回用 trajectories.id 现算.
+        if not ds_fingerprint:
+            ds_fingerprint = self._ds_fingerprint([t.get("id", "") for t in trajectories])
         ds_cache_dir = Path(__file__).parent.parent / "cache" / f"ds_{ds_fingerprint}"
         ds_dir = ds_cache_dir / "dataset"
         img_dir = ds_cache_dir / "images"
@@ -257,7 +507,7 @@ class TrainingWorker:
             )
 
         if dataset_marker.exists():
-            logger.info("LeRobot dataset already exists: %s (skipping conversion)", datasets_root)
+            logger.info("[CACHE HIT] LeRobot dataset %s 已存在, 跳过转换", repo_id)
             if progress_cb:
                 progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
         else:
@@ -273,28 +523,51 @@ class TrainingWorker:
                 root=datasets_root,
             )
         logger.info("LeRobot dataset ready: %s", datasets_root)
+
+        # Step 1.5: 模型特定的 dataset 后处理
+        # pi05 用 QUANTILES normalization, 需要 dataset 有 q01/q99 stats.
+        # LeRobotDataset.create() 默认只算 mean/std, 这里按需补算.
+        if model_type in self.QUANTILE_NORM_MODELS:
+            if progress_cb:
+                progress_cb(0, train_steps, {
+                    "phase": "augmenting",
+                    "message": f"为 {model_type.upper()} 补算 quantile stats (q01/q99)...",
+                })
+            self._ensure_quantile_stats(repo_id, datasets_root, model_type)
+
         if progress_cb:
             progress_cb(0, train_steps, {"loss": 0})
 
         # Step 2: Train via lerobot CLI
-        # 优先用 -m 模式 (pip install -e . 安装后，AutoDL 等云端环境)
-        # Fallback 到直接路径 (本地开发，lerobot 作为子目录)
+        # 启动方式优先级:
+        # 1. 本地 lerobot/src/.../lerobot_train.py 直接执行 — 最可靠, 不依赖 namespace
+        #    package 解析 (lerobot 上游 scripts/ 没有 __init__.py, "python -m
+        #    lerobot.scripts.lerobot_train" 会报 No module named)
+        # 2. pip 注册的 console script `lerobot-train` (pip install -e . 后生成)
+        # 3. fallback 到 python -m 模式 (理论上 namespace package 也支持, 但偶尔崩)
         lerobot_local = Path(__file__).parent.parent / "lerobot" / "src" / "lerobot" / "scripts" / "lerobot_train.py"
-        try:
-            import importlib.util
-            use_module_mode = importlib.util.find_spec("lerobot") is not None
-        except Exception:
-            use_module_mode = False
-
-        if use_module_mode:
-            cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
-        elif lerobot_local.exists():
+        use_module_mode = False
+        if lerobot_local.exists():
             cmd = [sys.executable, str(lerobot_local)]
         else:
-            raise FileNotFoundError(
-                "lerobot 未安装且本地子目录不存在。"
-                "请 pip install -e lerobot/ 或确保 lerobot/ 子目录完整。"
-            )
+            import shutil as _sh
+            console_bin = _sh.which("lerobot-train")
+            if console_bin:
+                cmd = [console_bin]
+            else:
+                try:
+                    import importlib.util
+                    if importlib.util.find_spec("lerobot") is not None:
+                        cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
+                        use_module_mode = True
+                    else:
+                        raise FileNotFoundError("lerobot 不可用")
+                except Exception:
+                    raise FileNotFoundError(
+                        "lerobot 未安装且本地子目录不存在。"
+                        "请 cd lerobot && pip install -e . --no-build-isolation, "
+                        "或确保 box2robot_gpu_worker/lerobot/ 子目录完整。"
+                    )
 
         cmd += [
             f"--dataset.repo_id={repo_id}",
@@ -351,47 +624,53 @@ class TrainingWorker:
                         pretrained_path,
                     )
 
-            # === Normalization 适配 ===
-            # pi05 默认 STATE/ACTION = QUANTILES, 但 LeRobotDataset.create() 默认只算
-            # mean/std, 不算 q01/q99 → normalizer 找不到 quantile stats 训练时崩.
-            # 文档 (pi05.mdx) 给出两种方案:
-            # 1. 数据集补算 quantile (augment_dataset_quantile_stats.py) — 额外步骤
-            # 2. 训练时切到 MEAN_STD — 一行 CLI, 我们采用这个
-            # 用户可通过 custom_params['normalization_mapping'] 显式覆盖.
-            if model_type == "pi05" and "normalization_mapping" not in custom_params:
-                norm_map = {"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}
-                cmd.append(f"--policy.normalization_mapping={json.dumps(norm_map)}")
-                logger.info("Pi05 normalization: %s (override default QUANTILES, "
-                             "dataset 没算 q01/q99 stats)", norm_map)
+            # 注: pi05 默认 normalization=QUANTILES (用 q01/q99 鲁棒缩放, 比 mean/std
+            # 抗异常值好). 这里我们 *不* 改模型 normalization, 而是在 dataset 准备阶段
+            # (_ensure_quantile_stats) 给 dataset 补算 quantile stats, 让 pi05 用它原生设计.
+            # 用户仍可通过 custom_params['normalization_mapping'] 显式覆盖.
 
-            # Memory optimization (VLA models are large)
-            dtype = custom_params.get("dtype", "bfloat16")
-            cmd.append(f"--policy.dtype={dtype}")
-            cmd.append(f"--policy.gradient_checkpointing={custom_params.get('gradient_checkpointing', 'true')}")
-            # SmolVLA: freeze vision, train expert only (default for fine-tune)
+            # 显存优化默认值 — 走白名单, 不支持的 model 静默跳过 (如 SmolVLA 没 dtype/
+            # gradient_checkpointing 字段, GR00T 也没 dtype)
+            self._add_policy_param(cmd, model_type, "dtype",
+                                    custom_params.get("dtype", "bfloat16"))
+            self._add_policy_param(cmd, model_type, "gradient_checkpointing",
+                                    custom_params.get("gradient_checkpointing", "true"))
+            # SmolVLA: freeze vision + train expert only 默认开 (省显存); 其它 VLA 默认关
             if model_type == "smolvla":
-                cmd.append(f"--policy.freeze_vision_encoder={custom_params.get('freeze_vision_encoder', 'true')}")
-                cmd.append(f"--policy.train_expert_only={custom_params.get('train_expert_only', 'true')}")
-                cmd.append(f"--policy.train_state_proj={custom_params.get('train_state_proj', 'true')}")
-            # Pi0: optional compile for speed
+                self._add_policy_param(cmd, model_type, "freeze_vision_encoder",
+                                        custom_params.get("freeze_vision_encoder", "true"))
+                self._add_policy_param(cmd, model_type, "train_expert_only",
+                                        custom_params.get("train_expert_only", "true"))
+                self._add_policy_param(cmd, model_type, "train_state_proj",
+                                        custom_params.get("train_state_proj", "true"))
+            # Pi0/Pi05: 可选 compile + expert-only
             elif model_type in ("pi0", "pi0_fast", "pi05"):
                 if custom_params.get("compile_model"):
-                    cmd.append(f"--policy.compile_model={custom_params['compile_model']}")
-                # Pi0 expert-only fine-tune (less VRAM)
+                    self._add_policy_param(cmd, model_type, "compile_model",
+                                            custom_params["compile_model"])
                 if custom_params.get("train_expert_only"):
-                    cmd.append(f"--policy.train_expert_only={custom_params['train_expert_only']}")
+                    self._add_policy_param(cmd, model_type, "train_expert_only",
+                                            custom_params["train_expert_only"])
             # VLA chunk_size/n_action_steps: use model defaults (50) unless explicitly overridden
             if chunk_size > 1 and custom_params.get("override_chunk_size"):
-                cmd.append(f"--policy.chunk_size={chunk_size}")
-                cmd.append(f"--policy.n_action_steps={chunk_size}")
+                self._add_policy_param(cmd, model_type, "chunk_size", chunk_size)
+                self._add_policy_param(cmd, model_type, "n_action_steps", chunk_size)
         else:
-            # ACT/Diffusion/etc: train from scratch
+            # ACT/Diffusion/GR00T 等: train from scratch
             cmd.append(f"--policy.type={model_type}")
             cmd.append(f"--policy.repo_id=box2robot/{repo_id}")
             if chunk_size > 1:
-                cmd.append(f"--policy.chunk_size={chunk_size}")
-                cmd.append("--policy.n_action_steps=1")
-                cmd.append("--policy.temporal_ensemble_coeff=0.01")
+                # Diffusion 用 horizon 不是 chunk_size; 其它走 chunk_size
+                if model_type == "diffusion":
+                    self._add_policy_param(cmd, model_type, "horizon", chunk_size)
+                else:
+                    self._add_policy_param(cmd, model_type, "chunk_size", chunk_size)
+                # n_action_steps=1 + temporal_ensemble 是 ACT 推荐用法 (每步推一次,
+                # EMA 平滑), 不适用于其它模型. GR00T 默认 50; Diffusion 用户通过
+                # advancedParams 自己设.
+                if model_type == "act":
+                    self._add_policy_param(cmd, model_type, "n_action_steps", 1)
+                    self._add_policy_param(cmd, model_type, "temporal_ensemble_coeff", 0.01)
 
         # Resume from checkpoint (暂停后恢复训练)
         if resume_from_step:
@@ -402,14 +681,20 @@ class TrainingWorker:
                 logger.info("Resuming from checkpoint: %s (step %d)", ckpt_path, resume_from_step)
             else:
                 logger.warning("Checkpoint %s not found, training from scratch", ckpt_path)
-        # Custom params as CLI args (skip keys already handled above)
+        # Custom params 透传 — 通过 _add_policy_param 走白名单 + 别名映射, 不支持的
+        # key 静默跳过 + warning, 避免某些字段在某些 model 不存在导致 lerobot CLI
+        # "unrecognized arguments" 让训练 exit code 2.
         _handled_keys = {"task", "pretrained_path", "dtype", "gradient_checkpointing",
                          "freeze_vision_encoder", "train_expert_only", "train_state_proj",
                          "compile_model", "override_chunk_size", "rename_map",
-                         "normalization_mapping"}
+                         "normalization_mapping",
+                         # chunk_size / n_action_steps / horizon 在主分支已处理 (传 server
+                         # 选定的统一值), 不再从 custom_params 透传以免重复
+                         "chunk_size", "n_action_steps", "horizon"}
         for k, v in custom_params.items():
-            if k not in _handled_keys:
-                cmd.append(f"--{k}={v}")
+            if k in _handled_keys:
+                continue
+            self._add_policy_param(cmd, model_type, k, v)
 
         logger.info("LeRobot train cmd: %s %s", model_type.upper(), " ".join(cmd[-6:]))
 
@@ -428,6 +713,9 @@ class TrainingWorker:
         last_report_step = 0
         last_report_time = 0
         last_ckpt_set: set = set()  # 已上报过的 checkpoint 集合
+        # 保留最后 N 行 stdout, 子进程崩时用于诊断 (OOM / ImportError / etc.)
+        from collections import deque
+        tail_lines: deque = deque(maxlen=80)
         import re
         # Match INFO log: "step:10 smpl:80 loss:41.394 grdn:627.730"
         metrics_re = re.compile(r'\bstep:(\d+)\b.*\bloss:([\d.e+-]+)\b')
@@ -438,6 +726,7 @@ class TrainingWorker:
             line = line.strip()
             if not line:
                 continue
+            tail_lines.append(line)
             is_tqdm = "Training:" in line and "%" in line
             print(f"  [lerobot] {line}")
 
@@ -499,7 +788,8 @@ class TrainingWorker:
 
         proc.wait()
         if proc.returncode != 0 and not self._should_stop and not self._should_pause:
-            raise RuntimeError(f"LeRobot training failed (exit code {proc.returncode})")
+            err_msg = self._diagnose_subprocess_error(proc.returncode, list(tail_lines))
+            raise RuntimeError(err_msg)
 
         # Find the pretrained model path
         ckpt_dir = Path(model_dir) / "checkpoints" / "last" / "pretrained_model"
@@ -663,8 +953,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
       GPU: read state+cam → predict chunk(20步) → send batch → predict next chunk...
       ARM: receive batch → PlaybackTask execute → request more → receive next batch...
 
-    MLP: 链式预测生成 chunk (state→a1→a2→...→aN)
-    ACT: 原生 chunk 输出 (chunk_size actions per inference)
+    ACT/Diffusion/VLA: lerobot policy 原生 chunk 输出 (chunk_size actions per inference)
     """
     import io
     import numpy as np
@@ -675,13 +964,13 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     config_path = Path(model_dir) / "b2r_config.json"
 
     use_vision = False
-    model_type = "mlp"
+    model_type = "act"
     if config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
         pos_max = config.get("pos_max", pos_max)
         use_vision = config.get("use_vision", False)
-        model_type = config.get("model_type", "mlp")
+        model_type = config.get("model_type", "act")
         chunk_size = config.get("chunk_size", chunk_size)
     else:
         config = {"n_servos": 6, "pos_max": pos_max}
@@ -690,56 +979,48 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     is_vla = config.get("is_vla", model_type in ("smolvla", "pi0", "pi0_fast", "pi05"))
     task_description = config.get("task_description", "manipulation task")
 
-    if model_type != "mlp":
-        # LeRobot policy — 必须指向 checkpoints/.../pretrained_model/ 目录
-        ckpt_path = config.get("lerobot_checkpoint", "")
-        if not ckpt_path or not Path(ckpt_path).exists():
-            ckpt_dirs = sorted(Path(model_dir).glob("checkpoints/*/pretrained_model"))
-            ckpt_path = str(ckpt_dirs[-1]) if ckpt_dirs else ""
-        if not ckpt_path or not (Path(ckpt_path) / "config.json").exists():
-            raise FileNotFoundError(f"No pretrained_model found in {model_dir}")
+    # LeRobot policy — 必须指向 checkpoints/.../pretrained_model/ 目录
+    ckpt_path = config.get("lerobot_checkpoint", "")
+    if not ckpt_path or not Path(ckpt_path).exists():
+        ckpt_dirs = sorted(Path(model_dir).glob("checkpoints/*/pretrained_model"))
+        ckpt_path = str(ckpt_dirs[-1]) if ckpt_dirs else ""
+    if not ckpt_path or not (Path(ckpt_path) / "config.json").exists():
+        raise FileNotFoundError(f"No pretrained_model found in {model_dir}")
 
-        logger.info("Loading LeRobot %s from %s", model_type.upper(), ckpt_path)
-        sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
-        from lerobot.policies.factory import get_policy_class
-        from safetensors.torch import load_file as _load_sf
+    logger.info("Loading LeRobot %s from %s", model_type.upper(), ckpt_path)
+    sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
+    from lerobot.policies.factory import get_policy_class
+    from safetensors.torch import load_file as _load_sf
 
-        policy_cls = get_policy_class(model_type)
-        model = policy_cls.from_pretrained(ckpt_path)
-        model.eval()
-        if torch.cuda.is_available():
-            model = model.cuda()
-        model.reset()
+    policy_cls = get_policy_class(model_type)
+    model = policy_cls.from_pretrained(ckpt_path)
+    model.eval()
+    if torch.cuda.is_available():
+        model = model.cuda()
+    model.reset()
 
-        # 加载 MEAN_STD 归一化参数
-        # VLA models handle normalization differently — check if preprocessor files exist
-        _ckpt = Path(ckpt_path)
-        _has_manual_norm = False
-        _state_mean = _state_std = _action_mean = _action_std = None
-        _pre_file = _ckpt / "policy_preprocessor_step_3_normalizer_processor.safetensors"
-        _post_file = _ckpt / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
-        if _pre_file.exists() and _post_file.exists():
-            _pre = _load_sf(str(_pre_file))
-            _post = _load_sf(str(_post_file))
-            if "observation.state.mean" in _pre and "action.mean" in _post:
-                _has_manual_norm = True
-                _state_mean = _pre["observation.state.mean"]
-                _state_std = _pre["observation.state.std"]
-                _action_mean = _post["action.mean"]
-                _action_std = _post["action.std"]
-                if torch.cuda.is_available():
-                    _state_mean, _state_std = _state_mean.cuda(), _state_std.cuda()
-                    _action_mean, _action_std = _action_mean.cuda(), _action_std.cuda()
+    # 加载 MEAN_STD 归一化参数
+    # VLA models handle normalization differently — check if preprocessor files exist
+    _ckpt = Path(ckpt_path)
+    _has_manual_norm = False
+    _state_mean = _state_std = _action_mean = _action_std = None
+    _pre_file = _ckpt / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+    _post_file = _ckpt / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+    if _pre_file.exists() and _post_file.exists():
+        _pre = _load_sf(str(_pre_file))
+        _post = _load_sf(str(_post_file))
+        if "observation.state.mean" in _pre and "action.mean" in _post:
+            _has_manual_norm = True
+            _state_mean = _pre["observation.state.mean"]
+            _state_std = _pre["observation.state.std"]
+            _action_mean = _post["action.mean"]
+            _action_std = _post["action.std"]
+            if torch.cuda.is_available():
+                _state_mean, _state_std = _state_mean.cuda(), _state_std.cuda()
+                _action_mean, _action_std = _action_mean.cuda(), _action_std.cuda()
 
-        logger.info("%s model loaded (chunk=%d, vision=%s, vla=%s, GPU=%s)",
-                     model_type.upper(), chunk_size, use_vision, is_vla, torch.cuda.is_available())
-    else:
-        is_vla = False
-        _has_manual_norm = False
-        _state_mean = _state_std = _action_mean = _action_std = None
-        from box2robot_gpu_worker.mlp_policy import load_mlp_model
-        model = load_mlp_model(model_dir)
-        logger.info("MLP model loaded: %d servos, pos_max=%d", config["n_servos"], pos_max)
+    logger.info("%s model loaded (chunk=%d, vision=%s, vla=%s, GPU=%s)",
+                 model_type.upper(), chunk_size, use_vision, is_vla, torch.cuda.is_available())
 
     client = httpx.Client(base_url=server_url, timeout=10,
                           headers={"Authorization": f"Bearer {token}"} if token else {})

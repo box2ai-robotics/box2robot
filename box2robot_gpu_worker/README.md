@@ -241,17 +241,36 @@ python scripts/check_gpu.py
 
 **症状**: 训练 pi05 (不影响 pi0 / smolvla), normalizer 加载阶段报错.
 
-**原因**: pi05 默认用 `QUANTILES` normalization 但 LeRobotDataset.create() 默认只算 mean/std,
-没算 q01/q99 stats.
+**原因**: pi05 设计上用 `QUANTILES` normalization (q01/q99 鲁棒缩放, 比 mean/std 抗机器人轨迹的
+边界值/校准异常值更好). 但 `LeRobotDataset.create()` 默认只算 mean/std, 不算 q01/q99 stats,
+两者不一致 → normalizer 加载时找不到 quantile 字段崩.
 
-**自动修复 (Worker v0.6.2+)**: worker 在 VLA 分支自动加
-`--policy.normalization_mapping={"ACTION":"MEAN_STD","STATE":"MEAN_STD","VISUAL":"IDENTITY"}`,
-切到 MEAN_STD 替代 QUANTILES.
+**自动修复 (Worker v0.6.2+)**: worker 在训练 pi05 之前自动调用
+`augment_dataset_with_quantile_stats()` 给 dataset 补算 q01/q10/q50/q90/q99 stats, 写回
+`datasets/<repo>/meta/stats.json`. 训练时 pi05 用它**原生设计的 QUANTILES**, 不改模型.
+已经算过的 dataset 会被 `has_quantile_stats()` 短路跳过, 重复训练无开销.
 
-如要追求和 base 训练分布一致, 可手动跑:
+**为什么不切换到 MEAN_STD?**
+
+切 MEAN_STD 能让训练跑起来, 但 base 模型是 QUANTILES 训的, fine-tune 改 normalizer
+等于让训练分布跟 base 权重的预期分布脱钩, 收敛慢效果差. 正确做法是按模型的最优数据格式
+准备 dataset, 而不是改模型迁就 dataset.
+
+**手动补算** (如果自动失败):
+
 ```bash
-python lerobot/src/lerobot/datasets/v30/augment_dataset_quantile_stats.py \
-    --repo-id box2robot-<fingerprint>
+python box2robot_gpu_worker/lerobot/src/lerobot/scripts/augment_dataset_quantile_stats.py \
+    --repo-id=box2robot-<fingerprint> \
+    --root=box2robot_gpu_worker/datasets/box2robot-<fingerprint>
+```
+
+**用户覆盖** (如果坚持用 MEAN_STD):
+
+```python
+# APP 提交训练时, custom_params 里填:
+custom_params = {
+    "normalization_mapping": '{"ACTION":"MEAN_STD","STATE":"MEAN_STD","VISUAL":"IDENTITY"}'
+}
 ```
 
 ## 常见问题: 训练时报 `All image features are missing from the batch`
@@ -353,6 +372,95 @@ b2r-gpu --server https://robot.box2ai.com
 | 查看训练进度、Loss 曲线 | APP 训练监控页 |
 | 选择 Checkpoint、部署推理 | APP 推理执行页 |
 | 停止训练 / 停止推理 | APP 对应页面 |
+
+## 开机自启 (可选)
+
+绑定成功后，建议把 Worker 注册成系统服务，机器重启后自动上线领任务。
+跨平台脚本: `scripts/install_autostart.py` (Linux 走 systemd, Windows 走 Task Scheduler)。
+
+> 运行前必须先 `conda activate b2r` (脚本从当前 Python 环境定位 `b2r-gpu` 绝对路径)。
+
+### Linux (systemd)
+
+```bash
+conda activate b2r
+cd box2robot_gpu_worker
+
+# 安装 (默认用户级, 不需 sudo)
+python scripts/install_autostart.py install --server https://robot.box2ai.com
+
+# 国内网络: 顺手注入 HF 镜像
+python scripts/install_autostart.py install \
+    --env HF_ENDPOINT=https://hf-mirror.com
+
+# 用户级服务在登出后会停, 让它常驻 (机器重启自动起):
+sudo loginctl enable-linger $USER
+
+# 或装系统级 (真正系统启动时拉起, 不依赖用户登录)
+python scripts/install_autostart.py install --system --server https://robot.box2ai.com
+```
+
+管理:
+
+```bash
+python scripts/install_autostart.py status     # 查看状态
+python scripts/install_autostart.py start      # 立即启动
+python scripts/install_autostart.py stop       # 停止
+python scripts/install_autostart.py uninstall  # 卸载
+
+# 实时日志
+journalctl --user -u box2robot-gpu-worker -f          # 用户级
+sudo journalctl -u box2robot-gpu-worker -f            # 系统级
+```
+
+unit 文件位置:
+- 用户级: `~/.config/systemd/user/box2robot-gpu-worker.service`
+- 系统级: `/etc/systemd/system/box2robot-gpu-worker.service`
+
+### Windows (Task Scheduler)
+
+```cmd
+conda activate b2r
+cd box2robot_gpu_worker
+
+REM 安装 (默认 ONLOGON: 当前用户登录时启动, 无需管理员)
+python scripts\install_autostart.py install --server https://robot.box2ai.com
+
+REM 国内网络: 注入 HF 镜像
+python scripts\install_autostart.py install ^
+    --env HF_ENDPOINT=https://hf-mirror.com
+
+REM 改成系统启动时触发 (需以管理员身份打开终端, 任务以 SYSTEM 账户运行)
+python scripts\install_autostart.py install --trigger boot
+```
+
+管理:
+
+```cmd
+python scripts\install_autostart.py status     REM 查看状态
+python scripts\install_autostart.py start      REM 立即触发
+python scripts\install_autostart.py stop       REM 停止
+python scripts\install_autostart.py uninstall  REM 卸载
+
+REM 实时日志 (PowerShell)
+Get-Content logs\gpu_worker_autostart.log -Wait -Tail 50
+```
+
+任务名: `Box2RobotGpuWorker`
+包装脚本: `scripts/_autostart_wrapper.bat` (脚本自动生成, 含崩溃自动重启循环)
+日志文件: `logs/gpu_worker_autostart.log`
+
+> Windows ONLOGON 触发不需要管理员, 适合个人工作站; ONSTART 以 SYSTEM 账户跑, 在某些 GPU 驱动下可能拿不到 CUDA 句柄, 不行就改回 ONLOGON 并开自动登录。
+
+### 常见问题
+
+| 现象 | 排查 |
+|------|------|
+| `[错误] 找不到 b2r-gpu` | 没在 `b2r` conda 环境里跑脚本, 先 `conda activate b2r` |
+| Linux 用户级服务重启后没起 | 没开 lingering: `sudo loginctl enable-linger $USER` |
+| Windows 任务能启动但看不到输出 | 看 `logs/gpu_worker_autostart.log`, 不是看终端 |
+| 自启 Worker 显示新的绑定码 | Worker 数据目录变了, 用 `--output` 指向之前 bind 时的目录 |
+| 想改 server / 参数 | 重新跑 `install --server <new>` 即可 (`/f` 强制覆盖旧任务) |
 
 ## 支持的模型
 
