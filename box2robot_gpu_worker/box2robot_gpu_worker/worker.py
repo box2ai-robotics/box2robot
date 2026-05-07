@@ -1324,6 +1324,28 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     logger.info("%s model loaded (chunk=%d, vision=%s, vla=%s, GPU=%s)",
                  model_type.upper(), chunk_size, use_vision, is_vla, torch.cuda.is_available())
 
+    # === 检查点 1: dump model.config.input_features (诊断 state/image shape 错配) ===
+    try:
+        cfg_input = getattr(model.config, "input_features", {}) or {}
+        logger.info("[CHECK-1] model.config.input_features (%d entries):", len(cfg_input))
+        for _k, _ft in cfg_input.items():
+            _t = getattr(_ft, "type", None)
+            _t = _t.value if hasattr(_t, "value") else str(_t)
+            _s = getattr(_ft, "shape", None)
+            logger.info("    %s = type=%s shape=%s", _k, _t, _s)
+        cfg_output = getattr(model.config, "output_features", {}) or {}
+        logger.info("[CHECK-1] model.config.output_features (%d entries):", len(cfg_output))
+        for _k, _ft in cfg_output.items():
+            _t = getattr(_ft, "type", None)
+            _t = _t.value if hasattr(_t, "value") else str(_t)
+            _s = getattr(_ft, "shape", None)
+            logger.info("    %s = type=%s shape=%s", _k, _t, _s)
+        logger.info("[CHECK-1] max_state_dim=%s, max_action_dim=%s",
+                     getattr(model.config, "max_state_dim", None),
+                     getattr(model.config, "max_action_dim", None))
+    except Exception as _e:
+        logger.warning("[CHECK-1] dump input_features failed: %s", _e)
+
     # === VLA 推理: 加载 lerobot 完整 preprocessor/postprocessor pipeline ===
     # VLA 模型 (pi0/pi05/smolvla) 推理需要的处理远不止 image key rename:
     #   1. RenameObservations  — top → 模型期望的 cam (base_0_rgb 等)
@@ -1345,6 +1367,27 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 pretrained_path=ckpt_path,
             )
             logger.info("VLA preprocessor/postprocessor loaded from %s", ckpt_path)
+            # === 检查点 2: dump preprocessor steps + normalizer stats shape ===
+            try:
+                _steps = getattr(_vla_pre, "steps", []) or []
+                logger.info("[CHECK-2] preprocessor pipeline %d steps:", len(_steps))
+                for _i, _st in enumerate(_steps):
+                    _name = getattr(_st, "name", _st.__class__.__name__)
+                    logger.info("    [%d] %s", _i, _name)
+                    # 重点 dump NormalizerProcessor 的 stats shape
+                    if "Normalizer" in _name or "normalizer" in str(_st.__class__.__name__).lower():
+                        _stats = getattr(_st, "stats", None) or {}
+                        for _fk, _fs in _stats.items():
+                            shapes = {kk: tuple(vv.shape) if hasattr(vv, "shape") else type(vv).__name__
+                                       for kk, vv in (_fs or {}).items()}
+                            logger.info("        [normalizer stats] %s: %s", _fk, shapes)
+                    # rename_map
+                    if "Rename" in _name:
+                        rmap = getattr(_st, "rename_map", None)
+                        if rmap:
+                            logger.info("        [rename_map] %s", rmap)
+            except Exception as _e:
+                logger.warning("[CHECK-2] preprocessor dump failed: %s", _e)
             # preprocessor 内部 RenameObservations 自动处理图像 key 映射, 不需要手动 _vision_key.
             # 但保留 _vision_key 作输入端 dataset key (preprocessor 期望我们用 dataset 时的 key).
         except Exception as e:
@@ -1472,7 +1515,37 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 img_arr = np.array(img, dtype=np.float32) / 255.0
                 img_t = torch.from_numpy(img_arr.transpose(2, 0, 1))  # (3, H, W) 不带 batch
                 raw["observation.images.top"] = img_t
-            return _vla_pre(raw)
+            # === 检查点 3: raw obs shape (preprocessor 输入) ===
+            if not getattr(_build_obs, "_logged_check3", False):
+                logger.info("[CHECK-3] raw obs (preprocessor 输入), 首次推理 dump:")
+                for _k, _v in raw.items():
+                    _info = (f"shape={tuple(_v.shape)} dtype={_v.dtype}"
+                              if hasattr(_v, "shape") else f"value={_v!r}")
+                    logger.info("    %s: %s", _k, _info)
+                _build_obs._logged_check3 = True
+            try:
+                processed = _vla_pre(raw)
+            except Exception as _e:
+                # 预处理失败时 dump 详细信息便于诊断
+                logger.error("[CHECK-3] preprocessor failed: %s", _e)
+                logger.error("    raw keys: %s", list(raw.keys()))
+                for _k, _v in raw.items():
+                    if hasattr(_v, "shape"):
+                        logger.error("    %s shape=%s dtype=%s", _k, tuple(_v.shape), _v.dtype)
+                raise
+            # === 检查点 4: 处理后 batch shape (model 输入) ===
+            if not getattr(_build_obs, "_logged_check4", False):
+                logger.info("[CHECK-4] processed batch (model 输入), 首次推理 dump:")
+                if isinstance(processed, dict):
+                    for _k, _v in processed.items():
+                        _info = (f"shape={tuple(_v.shape)} dtype={_v.dtype}"
+                                  if hasattr(_v, "shape") else f"type={type(_v).__name__}")
+                        logger.info("    %s: %s", _k, _info)
+                else:
+                    logger.info("    type=%s, attrs=%s", type(processed).__name__,
+                                 [a for a in dir(processed) if not a.startswith("_")][:8])
+                _build_obs._logged_check4 = True
+            return processed
         elif is_vla:
             # VLA + preprocessor 加载失败的 fallback (没 normalize/没 tokenize, pi05 仍会缺 language.tokens)
             obs = {"observation.state": state_t}
