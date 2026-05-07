@@ -483,6 +483,10 @@ Get-Content logs\gpu_worker_autostart.log -Wait -Tail 50
 | VLA 微调 | transformers, accelerate | VLA 必需 | `pip install -e .[vla]` 安装 |
 | 训练加速 (可选) | wandb, accelerate | 可选 | `pip install -e .[train]` |
 
+> **AutoDL 云端实例开关机相关功能已迁移到独立子项目 `box2robot_gpu_cloud_manager/`**
+> 那是一个云 GPU 资源调度管理节点，常驻在用户自己的常开机器上，代理一组 AutoDL
+> 实例做按需开关机。详见 [`../box2robot_gpu_cloud_manager/README.md`](../box2robot_gpu_cloud_manager/README.md)。
+
 完整依赖体检:
 
 ```bash

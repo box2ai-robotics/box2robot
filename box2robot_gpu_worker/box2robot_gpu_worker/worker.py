@@ -418,16 +418,24 @@ class TrainingWorker:
                 "  - 换更大显存的 GPU (pi05 推荐 16GB+)"
             )
         elif "modulenotfounderror" in joined or "importerror" in joined:
-            # 提取模块名
+            # 提取模块名 — peft 单独提示 (LoRA 微调依赖)
             import re as _re
             m = _re.search(r"(?:no module named|cannot import name)\s+'?([^'\s]+)'?", joined)
             mod = m.group(1) if m else "依赖库"
-            kw_hint = (
-                f"缺少 Python 依赖: {mod}. 解决方案:\n"
-                f"  - 跑一遍体检: python scripts/check_gpu.py\n"
-                f"  - 重装 dataset 依赖: pip install \"lerobot[dataset] @ file:./lerobot\" --no-build-isolation\n"
-                f"  - 或重装 worker: cd box2robot_gpu_worker && pip install -e . --upgrade"
-            )
+            if "peft" in mod.lower():
+                kw_hint = (
+                    "LoRA 微调缺 PEFT 库. 解决方案:\n"
+                    "  - pip install peft accelerate\n"
+                    "  - 或装 lerobot 全套: pip install \"lerobot[peft] @ file:./lerobot\" --no-build-isolation\n"
+                    "  - 不想用 LoRA: APP 训练页关闭 'LoRA 微调' 开关"
+                )
+            else:
+                kw_hint = (
+                    f"缺少 Python 依赖: {mod}. 解决方案:\n"
+                    f"  - 跑一遍体检: python scripts/check_gpu.py\n"
+                    f"  - 重装 dataset 依赖: pip install \"lerobot[dataset] @ file:./lerobot\" --no-build-isolation\n"
+                    f"  - 或重装 worker: cd box2robot_gpu_worker && pip install -e . --upgrade"
+                )
         elif "filenotfounderror" in joined and "checkpoint" in joined:
             kw_hint = "找不到 checkpoint 文件 — resume 路径可能错误, 或上次训练未保存任何 ckpt."
         elif "huggingfacehub" in joined and ("timeout" in joined or "connection" in joined):
@@ -447,6 +455,33 @@ class TrainingWorker:
                 "应被自动 augment 修复, 若仍报错可手动跑: "
                 "python lerobot/src/lerobot/scripts/augment_dataset_quantile_stats.py "
                 "--repo-id=<repo> --root=<datasets_root>"
+            )
+        # === LoRA / PEFT 相关报错 ===
+        elif "target modules" in joined and ("not found" in joined or "no modules" in joined):
+            kw_hint = (
+                "LoRA target_modules 配置错误 — 指定的层在 base 模型里不存在.\n"
+                "  - 留空 (peft_target_modules='') 让 lerobot 用 policy 默认\n"
+                "  - 或正则匹配真实层名后缀, 例: '.*\\.q_proj|.*\\.v_proj'\n"
+                "  - SmolVLA 默认: q_proj/v_proj of lm_expert + state/action proj"
+            )
+        elif "peftconfig" in joined or ("invalid" in joined and "peft" in joined):
+            kw_hint = (
+                "PEFT 配置错误. 解决方案:\n"
+                "  - peft_method_type 必须是 LORA (大写), 其它方法 (PREFIX_TUNING/IA3) 暂不支持\n"
+                "  - peft_r 必须是正整数 (4~256 之间)\n"
+                "  - 关 LoRA 试试: APP 训练页关闭 'LoRA 微调' 开关"
+            )
+        elif "lora" in joined and ("rank" in joined or "alpha" in joined) and "error" in joined:
+            kw_hint = (
+                "LoRA rank/alpha 参数异常.\n"
+                "  - peft_r 推荐 8/16/32/64 (8 的倍数), 当前值可能太大\n"
+                "  - 8GB GPU r ≤ 16; 24GB GPU r ≤ 64"
+            )
+        elif "adapter_config" in joined or ("loading" in joined and "adapter" in joined):
+            kw_hint = (
+                "PEFT adapter checkpoint 加载失败 (推理或 resume 时).\n"
+                "  - 检查 model_path 含 adapter_config.json 和 adapter_model.safetensors\n"
+                "  - LoRA fine-tune 的 ckpt 不能直接当 base 模型加载, 需要先 merge_and_unload"
             )
 
         # 3. 拼最终信息: 信号描述 + 关键字提示 + 最后 5 行原始日志
@@ -871,6 +906,30 @@ class TrainingWorker:
                 logger.info("Resuming from checkpoint: %s (step %d)", ckpt_path, resume_from_step)
             else:
                 logger.warning("Checkpoint %s not found, training from scratch", ckpt_path)
+        # === PEFT (LoRA) 处理 — 顶层 --peft.* 命名空间, 不是 --policy.* ===
+        # lerobot 的 PEFT 通过顶层 PeftConfig 配置 (lerobot/configs/default.py:PeftConfig).
+        # 默认 None (不启用); 一旦传任意 --peft.xxx 字段, lerobot 自动 wrap policy with PEFT.
+        # 仅 VLA (pi0/pi05/smolvla 等含 LM 的模型) 支持; ACT/Diffusion 不支持 (忽略警告).
+        # 安装依赖: pip install 'lerobot[peft]' (即 peft + accelerate)
+        peft_enable = str(custom_params.get("peft_enable", "")).lower() in (
+            "true", "1", "yes", "on",
+        )
+        if peft_enable and is_vla:
+            method = str(custom_params.get("peft_method_type", "LORA")).upper()
+            rank = int(custom_params.get("peft_r", 16))
+            cmd.append(f"--peft.method_type={method}")
+            cmd.append(f"--peft.r={rank}")
+            tm = custom_params.get("peft_target_modules")
+            if tm:
+                cmd.append(f"--peft.target_modules={tm}")
+            ftm = custom_params.get("peft_full_training_modules")
+            if ftm:
+                cmd.append(f"--peft.full_training_modules={ftm}")
+            logger.info("[%s] PEFT enabled: method=%s r=%d", model_type.upper(), method, rank)
+        elif peft_enable and not is_vla:
+            logger.warning("[%s] PEFT requested but only VLA models support it, ignored",
+                            model_type.upper())
+
         # Custom params 透传 — 通过 _add_policy_param 走白名单 + 别名映射, 不支持的
         # key 静默跳过 + warning, 避免某些字段在某些 model 不存在导致 lerobot CLI
         # "unrecognized arguments" 让训练 exit code 2.
@@ -880,7 +939,10 @@ class TrainingWorker:
                          "normalization_mapping",
                          # chunk_size / n_action_steps / horizon 在主分支已处理 (传 server
                          # 选定的统一值), 不再从 custom_params 透传以免重复
-                         "chunk_size", "n_action_steps", "horizon"}
+                         "chunk_size", "n_action_steps", "horizon",
+                         # peft_* 已在上面以顶层 --peft.* 形式处理, 不要再走 --policy.*
+                         "peft_enable", "peft_method_type", "peft_r",
+                         "peft_target_modules", "peft_full_training_modules"}
         for k, v in custom_params.items():
             if k in _handled_keys:
                 continue

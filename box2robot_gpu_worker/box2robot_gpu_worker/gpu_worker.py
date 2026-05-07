@@ -221,6 +221,10 @@ def _check_dependencies(issues: list):
          'pip install "lerobot[dataset] @ file:./lerobot" --no-build-isolation'),
         ("transformers", "transformers", False, "pip install transformers accelerate"),
         ("accelerate",   "accelerate",   False, "pip install accelerate"),
+        # peft: LoRA 微调依赖. 仅当用户在 APP 训练页开启 'LoRA 微调' 才需要;
+        # 不开启则不影响. 启动时只 WARNING 不 BLOCK.
+        ("peft",         "peft",         False,
+         'pip install peft accelerate    # 启用 LoRA 微调 (顶层 --peft.method_type=LORA)'),
     ]
     for import_name, pip_pkg, hard_fail, fix_hint in deps:
         try:
