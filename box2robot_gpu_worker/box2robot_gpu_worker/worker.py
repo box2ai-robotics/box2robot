@@ -1587,8 +1587,25 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
         """
         at = action_tensor if isinstance(action_tensor, torch.Tensor) else action_tensor.get("action", list(action_tensor.values())[0])
         if is_vla and _vla_post is not None:
+            # === 截断 padded action 到 dataset 实际维度 ===
+            # VLA model 输出 action 总是 padded 到 max_action_dim (base config, pi0/pi05 = 32).
+            # LoRA fine-tune 时 lerobot 不会更新 config.output_features.action.shape (仍是 32),
+            # 但保存的 normalizer/unnormalizer stats 是 dataset 实际维度 (n_servos, 例如 6).
+            # 推理时 _vla_post 的 UnnormalizerProcessor 用 6 维 stats 跟 32 维 action broadcast
+            # → "tensor a (32) vs b (6)" 报错. 这里先 truncate 再喂 postprocessor.
+            if hasattr(at, "shape") and at.dim() >= 1 and at.shape[-1] > n_servos:
+                if not getattr(_unnorm_action, "_logged_check5", False):
+                    logger.info("[CHECK-5] action truncate: model 输出 shape=%s → dataset 维度 %d",
+                                 tuple(at.shape), n_servos)
+                    _unnorm_action._logged_check5 = True
+                at = at[..., :n_servos]
             # postprocessor: unnormalize → absolute (relative_actions 时) → cpu
-            unnorm = _vla_post(at)
+            try:
+                unnorm = _vla_post(at)
+            except Exception as _e:
+                logger.error("[CHECK-5] _vla_post failed: %s; action shape=%s",
+                              _e, tuple(at.shape) if hasattr(at, "shape") else None)
+                raise
             if isinstance(unnorm, torch.Tensor):
                 return unnorm.clamp(0, 1).cpu().numpy()
             # postprocessor 返回 dict 时 (RobotAction style), 取 action key
@@ -1598,6 +1615,9 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             return at.clamp(0, 1).cpu().numpy()
         if not _has_manual_norm:
             # VLA fallback or 没有 manual stats — model 输出已在 [0,1] 附近
+            # 仍需 truncate 到 n_servos 防止 ESP32 收到额外 padded 值
+            if hasattr(at, "shape") and at.dim() >= 1 and at.shape[-1] > n_servos:
+                at = at[..., :n_servos]
             return at.clamp(0, 1).cpu().numpy()
         # ACT/Diffusion manual unnormalize
         action_01 = at * _action_std + _action_mean
