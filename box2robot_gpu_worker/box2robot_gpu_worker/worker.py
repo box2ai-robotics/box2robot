@@ -193,6 +193,36 @@ class TrainingWorker:
     # Box2Robot dataset 当前的图像 key (convert.py 写死了; 单相机)
     DATASET_VISION_KEY = "observation.images.top"
 
+    # 已知 VLA base 期望的相机 key (用于 _get_base_visual_keys 离线/网络失败兜底).
+    # 数据来源: 各 base 的 config.json input_features. 第一个 key 是主视角,
+    # rename_map 把我们的 'observation.images.top' 映射到这里; 其余 cam 会被
+    # modeling 自动 -1 填充 (siglip empty camera).
+    KNOWN_BASE_VISUAL_KEYS = {
+        "lerobot/pi05_base": [
+            "observation.images.base_0_rgb",
+            "observation.images.left_wrist_0_rgb",
+            "observation.images.right_wrist_0_rgb",
+        ],
+        "lerobot/pi05_droid": [
+            "observation.images.exterior_1_left",
+            "observation.images.exterior_2_left",
+            "observation.images.wrist_left",
+        ],
+        "lerobot/pi0_base": [
+            "observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        ],
+        "lerobot/pi0_fast_base": [
+            "observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        ],
+        "lerobot/smolvla_base": [
+            "observation.images.top",
+        ],
+    }
+
     # 哪些模型 STATE/ACTION 默认用 QUANTILES normalization → 需要 dataset 有 q01/q99 stats.
     # 这个集合从 lerobot 各 policy config 的 normalization_mapping 读取得来:
     #   pi05/configuration_pi05.py: STATE/ACTION = QUANTILES
@@ -429,40 +459,53 @@ class TrainingWorker:
             parts.append("最后日志:\n  " + "\n  ".join(tail_lines[-5:]))
         return "\n".join(parts)
 
-    @staticmethod
-    def _get_base_visual_keys(pretrained_path: str) -> list:
-        """下载 base 的 config.json, 提取 input_features 中所有 VISUAL 类型的 key.
+    @classmethod
+    def _get_base_visual_keys(cls, pretrained_path: str) -> list:
+        """获取 base 期望的相机 key 列表 (用于自动构造 --rename_map).
 
-        VLA base (pi05_base 用 droid 数据训练, pi0_base 用 aloha) 的相机 key 通常和我们
-        Box2Robot dataset 的 'observation.images.top' 不一样, 直接训会抛
-        "All image features are missing from the batch". 拿到 base 期望的 key 列表后,
-        外层用 --rename_map 把 dataset 的 top 映射到 base 第一个 cam, 其余 base cam
-        会被 modeling_pi0.prepare_images 自动用 -1 填充 (siglip empty camera).
+        优先级:
+        1. 本地路径 → 读 config.json
+        2. HF Hub 下载 config.json (在线节点)
+        3. KNOWN_BASE_VISUAL_KEYS 硬编码兜底 (离线节点 / HF 不可达)
 
-        Returns: list of visual key names, e.g.
-            ["observation.images.exterior_1_left", "observation.images.exterior_2_left",
-             "observation.images.wrist_left"]  (pi05_base / droid)
-        失败时返回 [], 调用方退化为不加 rename_map (旧行为).
+        VLA base 的相机 key 通常和我们 Box2Robot dataset 的 'observation.images.top'
+        不一样, 直接训会抛 "All image features are missing from the batch". 拿到 base
+        期望的 key 列表后, 外层用 --rename_map 把 dataset 的 top 映射到 base 第一个 cam,
+        其余 base cam 会被 modeling.prepare_images 自动用 -1 填充 (siglip empty camera).
+
+        Returns: list of visual key names. 全部失败才返回 [].
         """
         import os as _os
+        # 1+2: 文件 / HF 下载
         try:
             if _os.path.isdir(pretrained_path):
                 cfg_path = _os.path.join(pretrained_path, "config.json")
                 if not _os.path.isfile(cfg_path):
                     logger.warning("Local base path %s has no config.json", pretrained_path)
-                    return []
+                    cfg_path = None
             else:
                 # HF hub repo_id like "lerobot/pi05_base"
                 from huggingface_hub import hf_hub_download
                 cfg_path = hf_hub_download(repo_id=pretrained_path, filename="config.json")
-            with open(cfg_path, encoding="utf-8") as f:
-                base_cfg = json.load(f)
-            feats = base_cfg.get("input_features", {}) or {}
-            visual_keys = [k for k, v in feats.items() if (v or {}).get("type") == "VISUAL"]
-            return visual_keys
+            if cfg_path:
+                with open(cfg_path, encoding="utf-8") as f:
+                    base_cfg = json.load(f)
+                feats = base_cfg.get("input_features", {}) or {}
+                visual_keys = [k for k, v in feats.items() if (v or {}).get("type") == "VISUAL"]
+                if visual_keys:
+                    return visual_keys
         except Exception as e:
             logger.warning("Failed to read base visual keys from %s: %s", pretrained_path, e)
-            return []
+
+        # 3: 硬编码兜底 — 关键场景: 离线 GPU 节点拿不到 HF
+        fallback = cls.KNOWN_BASE_VISUAL_KEYS.get(pretrained_path)
+        if fallback:
+            logger.warning(
+                "Using hardcoded fallback visual keys for %s: %s",
+                pretrained_path, fallback,
+            )
+            return list(fallback)
+        return []
 
     def _train_lerobot(self, trajectories, model_type, model_dir,
                        train_steps, batch_size, chunk_size, custom_params, progress_cb,
