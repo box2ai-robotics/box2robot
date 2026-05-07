@@ -14,6 +14,12 @@
 
 set -e
 
+# AutoDL 实例的 conda 默认装在 /root/miniconda3，但 SSH 非交互式 shell 不读 ~/.bashrc，
+# 所以手动注入到 PATH。同时兜底 /opt/conda（部分镜像）和 /usr/local/bin。
+for d in /root/miniconda3/bin /opt/conda/bin /usr/local/bin; do
+  [[ -d "$d" && ":$PATH:" != *":$d:"* ]] && export PATH="$d:$PATH"
+done
+
 SERVER="https://robot.box2ai.com"
 CUDA="cu124"
 PROJECT_DIR="/root/box2robot_gpu_worker"
@@ -42,10 +48,17 @@ echo "  project : $PROJECT_DIR"
 phase "probe"
 echo "[$(date +%T)] [1/5] 环境检测"
 nvidia-smi -L 2>&1 | head -1 || { echo "[!] nvidia-smi 不可用"; phase "err"; exit 1; }
-PYTHON=python3
-which $PYTHON || PYTHON=python
-$PYTHON --version
-which pip || $PYTHON -m ensurepip || true
+# AutoDL 实例上 python 命令通常缺失，只有 python3。统一用 PY 变量
+if command -v python >/dev/null 2>&1; then
+  PY=python
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  echo "[!] 找不到 python/python3"; phase "err"; exit 1
+fi
+$PY --version
+PIP="$PY -m pip"
+$PIP --version >/dev/null 2>&1 || $PY -m ensurepip || true
 
 cd "$PROJECT_DIR"
 [[ -d lerobot ]] || {
@@ -63,26 +76,26 @@ export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
 # HuggingFace 镜像
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 
-if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+if ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
   echo "  → torch CUDA 版未装，开始安装"
-  pip install torch torchvision torchaudio \
+  $PIP install torch torchvision torchaudio \
       --index-url "https://download.pytorch.org/whl/${CUDA}" \
-      | tee -a "$LOG"
+      2>&1 | tee -a "$LOG"
 fi
-python -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
+$PY -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
 
 # LeRobot 基础 + dataset 扩展（pi0/smolvla 等 VLA 模型必需）
-if ! python -c "import lerobot" 2>/dev/null; then
+if ! $PY -c "import lerobot" 2>/dev/null; then
   echo "  → 装 lerobot 基础包"
-  (cd lerobot && pip install -e . --no-build-isolation) | tee -a "$LOG"
+  (cd lerobot && $PIP install -e . --no-build-isolation) 2>&1 | tee -a "$LOG"
   echo "  → 装 lerobot[dataset]"
-  pip install "lerobot[dataset] @ file:./lerobot" --no-build-isolation 2>&1 | tee -a "$LOG" || true
+  $PIP install "lerobot[dataset] @ file:./lerobot" --no-build-isolation 2>&1 | tee -a "$LOG" || true
 fi
 
 # ---- Phase 3: box2robot_gpu_worker ----
 phase "install"
 echo "[$(date +%T)] [3/5] 装 box2robot_gpu_worker"
-pip install -e . --no-build-isolation 2>&1 | tee -a "$LOG"
+$PIP install -e . --no-build-isolation 2>&1 | tee -a "$LOG"
 which b2r-worker || which b2r-gpu || { echo "[!] b2r-worker / b2r-gpu 入口缺失"; phase "err"; exit 1; }
 
 # ---- Phase 4: 启动 worker，拿绑定码 ----
@@ -109,7 +122,7 @@ for i in $(seq 1 90); do
   if grep -qE "绑定码|bind[_ ]code" "$WORKER_LOG" 2>/dev/null; then
     BIND_CODE=$(grep -oE "[0-9]{6}" "$WORKER_LOG" | head -1)
   fi
-  if grep -qE "已绑定|activated|status.*activated" "$WORKER_LOG" 2>/dev/null; then
+  if grep -qE "已绑定|activated|status.*activated|Already bound|GPU Worker 已就绪|Worker .* ready" "$WORKER_LOG" 2>/dev/null; then
     TOKEN="OK"
   fi
   [[ -n "$BIND_CODE" || -n "$TOKEN" ]] && break

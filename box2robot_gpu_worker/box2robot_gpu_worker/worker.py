@@ -959,6 +959,10 @@ class TrainingWorker:
         # Run with real-time stdout forwarding for progress
         import os as _os
         train_env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
+        # HF_HOME 由 gpu_worker.py 启动时设, subprocess 自动继承.
+        # base 模型 (pi05_base ~14GB) 只在 cache 第一次下载, 之后训练/推理共用.
+        _hf_home = train_env.get("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
+        logger.info("[HF_HOME] subprocess 继承: %s (base 模型缓存共享)", _hf_home)
         if lerobot_src.exists():
             # 本地子目录优先：把 lerobot/src 注入 PYTHONPATH, 让 -m 解析到本地包
             old_pp = train_env.get("PYTHONPATH", "")
@@ -1198,6 +1202,55 @@ class TrainingWorker:
                     logger.error("Status report FAILED after %d retries: %s", max_retries, e)
 
 
+def _resolve_hf_cache_path(repo_id: str) -> str | None:
+    """检查 HF cache 里是否已下载 repo_id 的 snapshot, 返回本地路径或 None.
+
+    HuggingFace cache 结构 (HF_HOME 指向 cache 根目录):
+        <HF_HOME>/hub/models--<org>--<name>/snapshots/<commit_sha>/<files...>
+        <HF_HOME>/hub/models--<org>--<name>/refs/main  (含最新 commit_sha)
+
+    例 lerobot/pi05_base + HF_HOME=/root/autodl-tmp/.cache:
+        /root/autodl-tmp/.cache/hub/models--lerobot--pi05_base/snapshots/9e55186.../
+
+    返回该路径让 from_pretrained(local_path) 跳过 hub API, 避免:
+    - 401 Unauthorized (xet server 鉴权偶发失败)
+    - 网络超时 (国内连 huggingface.co)
+    - 重复下载浪费带宽
+    """
+    import os as _os
+    if "/" not in repo_id or _os.path.isdir(repo_id):
+        return None  # 已是本地路径
+    hf_home = _os.environ.get("HF_HOME") or _os.path.expanduser("~/.cache/huggingface")
+    org, name = repo_id.split("/", 1)
+    repo_dir = Path(hf_home) / "hub" / f"models--{org}--{name}"
+    if not repo_dir.is_dir():
+        return None
+    # 找 refs/main 指向的 commit
+    ref_file = repo_dir / "refs" / "main"
+    snapshot_dir = None
+    if ref_file.is_file():
+        commit = ref_file.read_text().strip()
+        candidate = repo_dir / "snapshots" / commit
+        if candidate.is_dir():
+            snapshot_dir = candidate
+    if snapshot_dir is None:
+        # refs/main 不存在或 commit 目录缺失, 拿最新 snapshot 兜底
+        snapshots_root = repo_dir / "snapshots"
+        if snapshots_root.is_dir():
+            snaps = [d for d in snapshots_root.iterdir() if d.is_dir()]
+            if snaps:
+                snapshot_dir = sorted(snaps, key=lambda p: p.stat().st_mtime)[-1]
+    if snapshot_dir is None:
+        return None
+    # 验证关键文件存在 (config.json + 至少一个 safetensors)
+    if not (snapshot_dir / "config.json").is_file():
+        return None
+    has_weights = any(snapshot_dir.glob("*.safetensors")) or any(snapshot_dir.glob("*.bin"))
+    if not has_weights:
+        return None
+    return str(snapshot_dir)
+
+
 def run_inference_server(model_dir: str, server_url: str, device_id: str,
                          token: str = "", pos_max: int = 4095, fps: int = 20,
                          camera_id: str = "", chunk_size: int = 20,
@@ -1281,7 +1334,19 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             }
             base_path = VLA_BASE_FALLBACK.get(model_type, f"lerobot/{model_type}_base")
             logger.warning("adapter_config 没记录 base_model_name_or_path, 用 fallback: %s", base_path)
-        logger.info("Loading PEFT base model: %s", base_path)
+        # === 优先从本地 HF cache 加载, 避免每次都走网络 401/慢下载 ===
+        # HF_HOME (gpu_worker.py 启动时设) 指向 cache 根目录, 实际 ckpt 落在
+        # <HF_HOME>/hub/models--<org>--<name>/snapshots/<commit>/. 我们检测它,
+        # 命中就用本地路径加载 (skip hub API 调用).
+        local_base = _resolve_hf_cache_path(base_path)
+        if local_base:
+            logger.info("Loading PEFT base from local HF cache: %s", local_base)
+            base_path = local_base
+        else:
+            import os as _os
+            logger.info("Loading PEFT base from HuggingFace Hub: %s "
+                         "(下载到 %s, 训练/推理共享 cache)",
+                         base_path, _os.environ.get("HF_HOME", "~/.cache/huggingface"))
         model = policy_cls.from_pretrained(base_path)
         logger.info("Applying LoRA adapter from %s", ckpt_path)
         model = PeftModel.from_pretrained(model, str(ckpt_path))

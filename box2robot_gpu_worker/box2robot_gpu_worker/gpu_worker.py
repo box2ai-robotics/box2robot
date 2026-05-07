@@ -803,13 +803,76 @@ class GPUWorker:
             pass
 
 
+def _setup_hf_cache(hf_cache_arg: str | None = None):
+    """统一 HuggingFace cache 路径到项目内 base_model/, 训练/推理共享.
+
+    pi05_base 约 14GB, smolvla_base 约 2GB, pi0_base 约 6GB. 不指定 cache 默认在
+    `~/.cache/huggingface` (家目录), AutoDL 系统盘小易满, 且 worker 跨设备/重装时
+    cache 散落各处. 统一放在项目内 box2robot_gpu_worker/base_model/ 后:
+    - 训练 subprocess + 推理 共用一份 base ckpt
+    - 重装环境/迁移设备时 base_model/ 跟代码一起带走 (或单独管理)
+    - 第一次下载后, 后续训练/推理秒加载
+
+    优先级:
+    1. CLI --hf-cache 显式指定 → 用它
+    2. 已设 HF_HOME 环境变量 → 不覆盖 (尊重用户)
+    3. 默认: 项目内 box2robot_gpu_worker/base_model/
+
+    HuggingFace cache 实际结构: <HF_HOME>/hub/models--<org>--<name>/snapshots/<sha>/
+    例 base_model 下找 pi05_base ckpt:
+       box2robot_gpu_worker/base_model/hub/models--lerobot--pi05_base/snapshots/<sha>/
+    """
+    import os
+    if hf_cache_arg:
+        os.environ["HF_HOME"] = os.path.expanduser(hf_cache_arg)
+        logger.info("[HF_HOME] CLI override: %s", os.environ["HF_HOME"])
+        return
+    if os.environ.get("HF_HOME"):
+        logger.info("[HF_HOME] already set: %s (用户配置, 不覆盖)", os.environ["HF_HOME"])
+        return
+    # 默认: 项目内 box2robot_gpu_worker/base_model/
+    # gpu_worker.py 在 box2robot_gpu_worker/box2robot_gpu_worker/gpu_worker.py,
+    # 上 2 级是项目根 box2robot_gpu_worker/.
+    pkg_dir = Path(__file__).resolve().parent
+    project_root = pkg_dir.parent
+    base_model_dir = project_root / "base_model"
+    try:
+        base_model_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning("[HF_HOME] cannot create %s: %s, falling back to ~/.cache/huggingface",
+                        base_model_dir, e)
+        return
+    os.environ["HF_HOME"] = str(base_model_dir)
+    logger.info("[HF_HOME] 设为项目内 base_model 目录: %s", base_model_dir)
+    logger.info("    (训练/推理共享 base ckpt, 第一次下载后秒加载)")
+    # 检测老 cache 提示用户迁移
+    legacy_caches = [
+        os.path.expanduser("~/.cache/huggingface/hub"),
+        "/root/autodl-tmp/.cache/hub",
+    ]
+    target_hub = base_model_dir / "hub"
+    for legacy in legacy_caches:
+        if os.path.isdir(legacy) and not target_hub.exists():
+            logger.info("[HF_HOME] 检测到老 cache: %s", legacy)
+            logger.info("    建议迁移避免重复下载: ln -sfn %s %s", legacy, target_hub)
+            logger.info("    或拷贝 (占空间): cp -r %s %s", legacy, target_hub)
+            break
+
+
 def main():
     parser = argparse.ArgumentParser(description="Box2Robot GPU Worker")
     parser.add_argument("--server", "-s", type=str, default="https://robot.box2ai.com",
                         help="Server URL (default: https://robot.box2ai.com)")
     parser.add_argument("--output", "-o", type=str, default="outputs",
                         help="Output directory for models")
+    parser.add_argument("--hf-cache", type=str, default=None,
+                        help="HuggingFace cache 目录 (例: /root/autodl-tmp/.cache). "
+                             "默认自动检测 AutoDL 数据盘, 否则用 ~/.cache/huggingface. "
+                             "训练 + 推理共享同一份 base 模型, 避免重复下载.")
     args = parser.parse_args()
+
+    # 启动早期就设 HF_HOME, 后续 import torch / lerobot / transformers 才能读到
+    _setup_hf_cache(args.hf_cache)
 
     worker = GPUWorker(args.server, args.output)
     worker.run()
