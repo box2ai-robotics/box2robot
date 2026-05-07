@@ -15,7 +15,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="box2robot-gpu-worker",
-    version="0.6.2",
+    version="0.6.3",
     packages=find_packages(),
     python_requires=">=3.12",
     install_requires=[

@@ -140,42 +140,52 @@ else
   exit 1
 fi
 
-# ---- Phase 5: 注册 systemd 自启动 ----
+# ---- Phase 5: 系统级 systemd 自启动（实例重启自动起 worker）----
 phase "autostart"
-echo "[$(date +%T)] [5/5] 注册 systemd 用户级自启动"
-mkdir -p /root/.config/systemd/user
-cat > /root/.config/systemd/user/box2robot-worker.service <<EOF
+echo "[$(date +%T)] [5/5] 注册系统级 systemd 自启动"
+PY_BIN=$(dirname "$ENTRY")
+cat > /etc/systemd/system/box2robot-worker.service <<EOF
 [Unit]
 Description=Box2Robot GPU Worker
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 WorkingDirectory=/root/box2robot_gpu_worker
-ExecStart=$ENTRY --server $SERVER
+Environment=PATH=$PY_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HF_ENDPOINT=$HF_ENDPOINT
+Environment=PIP_INDEX_URL=$PIP_INDEX_URL
+ExecStart=$ENTRY --server $SERVER
 Restart=always
 RestartSec=10
 StandardOutput=append:/root/b2r_worker.log
 StandardError=append:/root/b2r_worker.log
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
-# AutoDL 实例没 user systemd, 用 nohup + bashrc 兜底
-if ! systemctl --user daemon-reload 2>/dev/null; then
-  echo "  ⓘ user systemd 不可用，用 ~/.bashrc 自启动"
+
+# AutoDL 实例的 systemd 通常可用；如果不可用退化到 ~/.bashrc
+if systemctl daemon-reload 2>/dev/null; then
+  systemctl enable box2robot-worker 2>&1 | head -3
+  # 如果之前 nohup 起了 worker，先 kill 掉避免 systemd 起冲突
+  pkill -f "$(basename $ENTRY)" 2>/dev/null || true
+  sleep 1
+  systemctl restart box2robot-worker 2>&1 | head -3
+  echo "  ✓ systemd 系统级自启动已配置 (开机自动起)"
+  systemctl is-active box2robot-worker || true
+else
+  echo "  ⚠ systemd 不可用，回退到 ~/.bashrc 自启（仅 SSH 登录时触发）"
   if ! grep -q "b2r-worker" /root/.bashrc 2>/dev/null; then
     cat >> /root/.bashrc <<EOF
-
-# Box2Robot GPU Worker auto-start
+# Box2Robot GPU Worker auto-start (fallback)
 if ! pgrep -f "$(basename $ENTRY)" > /dev/null; then
     nohup $ENTRY --server $SERVER > /root/b2r_worker.log 2>&1 &
 fi
 EOF
   fi
-else
-  systemctl --user enable box2robot-worker 2>/dev/null || true
 fi
 
 phase "done"

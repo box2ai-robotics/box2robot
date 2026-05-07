@@ -21,6 +21,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 logger = logging.getLogger("box2robot.worker")
 
 
+# === Multi-slot race protection (v0.6.3+) ===
+# 多个 GPU slot 并发跑同一 dataset 时, 数据下载 / LeRobot convert / quantile augment
+# 三个阶段都会写共享磁盘路径 (cache/ds_<fp>, datasets/<repo>, stats.json), 不加锁
+# 会撞文件冲突 / 重复下载. 这里用 dict<key, Lock> per-fingerprint 串行数据准备,
+# 准备完之后训练 subprocess 各自跑, dataset 文件 read-only 安全.
+import threading as _threading
+_FILE_LOCKS_LOCK = _threading.Lock()
+_FILE_LOCKS: dict = {}
+
+def _get_file_lock(key: str) -> "_threading.Lock":
+    """获取或创建一把 per-key 锁. key 可以是 fingerprint, repo_id 等."""
+    with _FILE_LOCKS_LOCK:
+        if key not in _FILE_LOCKS:
+            _FILE_LOCKS[key] = _threading.Lock()
+        return _FILE_LOCKS[key]
+
+
 class TrainingWorker:
     """Connects to Box2Robot server, trains models, reports progress."""
 
@@ -80,52 +97,56 @@ class TrainingWorker:
         ds_dir = ds_cache_dir / "dataset"
         img_base = ds_cache_dir / "images"
 
-        # 完整性校验: 文件数 == len(dataset_ids), 防止上次中途崩溃留下的半截缓存被误命中
-        cached_jsons = sorted(ds_dir.glob("traj_*.json")) if ds_dir.is_dir() else []
-        cache_complete = (
-            len(dataset_ids) > 0
-            and len(cached_jsons) == len(dataset_ids)
-        )
+        # === Multi-slot race protection: 同 fingerprint 多 thread 串行下载 ===
+        # 不加锁两个 slot 都看 cache 不完整 → 都下载 → 互相覆盖 traj_*.json.
+        # 加锁后第一个进入的下载完, 第二个看 cache 已 complete 直接 hit.
+        with _get_file_lock(f"download_{ds_fingerprint}"):
+            # 完整性校验 (锁内重新检查): 文件数 == len(dataset_ids), 防止上次中途崩溃留下的半截缓存被误命中
+            cached_jsons = sorted(ds_dir.glob("traj_*.json")) if ds_dir.is_dir() else []
+            cache_complete = (
+                len(dataset_ids) > 0
+                and len(cached_jsons) == len(dataset_ids)
+            )
 
-        if cache_complete:
-            logger.info("[CACHE HIT] fp=%s trajs=%d dir=%s",
-                         ds_fingerprint, len(cached_jsons), ds_cache_dir)
-            trajectories = []
-            for f in cached_jsons:
-                with open(f) as fh:
-                    trajectories.append(json.load(fh))
-            has_any_images = img_base.is_dir() and any(img_base.iterdir())
-            if has_any_images:
-                n_img_dirs = sum(1 for d in img_base.iterdir() if d.is_dir())
-                logger.info("[CACHE HIT] images=%d dirs", n_img_dirs)
-        else:
-            # 缓存未命中或不完整 — 下载完整数据集
-            if ds_dir.is_dir() and cached_jsons:
-                logger.warning("[CACHE STALE] fp=%s have %d files, expect %d → 重新下载",
-                                ds_fingerprint, len(cached_jsons), len(dataset_ids))
+            if cache_complete:
+                logger.info("[CACHE HIT] fp=%s trajs=%d dir=%s",
+                             ds_fingerprint, len(cached_jsons), ds_cache_dir)
+                trajectories = []
+                for f in cached_jsons:
+                    with open(f) as fh:
+                        trajectories.append(json.load(fh))
+                has_any_images = img_base.is_dir() and any(img_base.iterdir())
+                if has_any_images:
+                    n_img_dirs = sum(1 for d in img_base.iterdir() if d.is_dir())
+                    logger.info("[CACHE HIT] images=%d dirs", n_img_dirs)
             else:
-                logger.info("[CACHE MISS] fp=%s → 下载数据集", ds_fingerprint)
-            dataset = self._download_dataset(job_id)
-            if not dataset:
-                self._report_status(job_id, "failed", error_msg="Failed to download dataset")
-                return
-            trajectories = dataset.get("trajectories", [])
-            if not trajectories:
-                self._report_status(job_id, "failed", error_msg="No trajectories in dataset")
-                return
-            # 保存到缓存
-            ds_dir.mkdir(parents=True, exist_ok=True)
-            has_any_images = False
-            for i, traj in enumerate(trajectories):
-                with open(ds_dir / f"traj_{i:04d}.json", "w") as f:
-                    json.dump(traj, f)
-                img_url = traj.get("image_download_url")
-                if img_url:
-                    traj_id = traj.get("id", f"traj_{i:04d}")
-                    img_dir = img_base / traj_id
-                    if self._download_images(img_url, img_dir):
-                        has_any_images = True
-            logger.info("Dataset saved to %s", ds_cache_dir)
+                # 缓存未命中或不完整 — 下载完整数据集
+                if ds_dir.is_dir() and cached_jsons:
+                    logger.warning("[CACHE STALE] fp=%s have %d files, expect %d → 重新下载",
+                                    ds_fingerprint, len(cached_jsons), len(dataset_ids))
+                else:
+                    logger.info("[CACHE MISS] fp=%s → 下载数据集", ds_fingerprint)
+                dataset = self._download_dataset(job_id)
+                if not dataset:
+                    self._report_status(job_id, "failed", error_msg="Failed to download dataset")
+                    return
+                trajectories = dataset.get("trajectories", [])
+                if not trajectories:
+                    self._report_status(job_id, "failed", error_msg="No trajectories in dataset")
+                    return
+                # 保存到缓存
+                ds_dir.mkdir(parents=True, exist_ok=True)
+                has_any_images = False
+                for i, traj in enumerate(trajectories):
+                    with open(ds_dir / f"traj_{i:04d}.json", "w") as f:
+                        json.dump(traj, f)
+                    img_url = traj.get("image_download_url")
+                    if img_url:
+                        traj_id = traj.get("id", f"traj_{i:04d}")
+                        img_dir = img_base / traj_id
+                        if self._download_images(img_url, img_dir):
+                            has_any_images = True
+                logger.info("Dataset saved to %s", ds_cache_dir)
 
         logger.info("Dataset: %d trajectories, model=%s, steps=%d (fp=%s)",
                      len(trajectories), model_type, train_steps, ds_fingerprint)
@@ -392,21 +413,35 @@ class TrainingWorker:
         """根据 subprocess 退出码 + 最后几行 stdout 给出友好错误描述.
 
         Linux 信号: -N (Python) 或 128+N (POSIX). 关键信号:
-          -9 / 137  = SIGKILL (大概率 OOM-killer 杀的, 也可能用户 kill -9)
+          -2  / 130 = SIGINT  (Ctrl+C 或父进程转发的中断)
+          -9  / 137 = SIGKILL (大概率 OOM-killer 杀的, 也可能用户 kill -9)
           -11 / 139 = SIGSEGV (内存越界, 通常是 CUDA 驱动/torch 不兼容)
           -15 / 143 = SIGTERM (被外部 terminate)
           1         = 通用错误 (Python 异常等)
         """
-        # 1. 信号类错误优先判断
-        sig_msg = ""
+        # 1. 信号类错误 — 直接返回, 不再走关键字扫描.
+        # 原因: 进程被强杀时 Python traceback 末尾常出现 "lerobot.datasets" / "datasets is required"
+        # 这种字符串, 会被关键字扫描误判成"缺 av/datasets 库", 给用户错误的修复建议.
+        # 信号类终止本质是外部干预, 不是依赖问题, 直接返回明确的描述.
+        if returncode in (-2, 130):
+            return (f"训练失败 (exit code {returncode})\n"
+                    "训练子进程被 SIGINT 终止 (Ctrl+C)\n"
+                    "通常是 Worker 进程被用户手动中断 (Ctrl+C / kill -2 / 关闭终端).")
         if returncode in (-9, 137):
-            sig_msg = "训练子进程被 SIGKILL 终止"
-        elif returncode in (-11, 139):
-            sig_msg = "训练子进程段错误 (SIGSEGV)"
-        elif returncode in (-15, 143):
-            sig_msg = "训练子进程被 SIGTERM 终止 (外部 kill)"
+            return (f"训练失败 (exit code {returncode})\n"
+                    "训练子进程被 SIGKILL 终止\n"
+                    "可能原因: OOM-killer (系统内存不足) / 用户 kill -9 / 容器被强制回收.")
+        if returncode in (-11, 139):
+            return (f"训练失败 (exit code {returncode})\n"
+                    "训练子进程段错误 (SIGSEGV)\n"
+                    "通常是 CUDA 驱动 / torch 版本不兼容, 或 GPU 硬件异常.")
+        if returncode in (-15, 143):
+            return (f"训练失败 (exit code {returncode})\n"
+                    "训练子进程被 SIGTERM 终止 (外部 kill)\n"
+                    "通常是 Worker 进程被关闭 / 系统重启 / kill 命令.")
 
-        # 2. 关键字扫描 (最后 80 行 stdout)
+        # 2. 关键字扫描 (最后 80 行 stdout) — 仅在非信号类终止时进行
+        sig_msg = ""
         joined = "\n".join(tail_lines).lower()
         kw_hint = ""
         if "out of memory" in joined or "cuda out of memory" in joined:
@@ -418,16 +453,30 @@ class TrainingWorker:
                 "  - 换更大显存的 GPU (pi05 推荐 16GB+)"
             )
         elif "modulenotfounderror" in joined or "importerror" in joined:
-            # 提取模块名 — peft 单独提示 (LoRA 微调依赖)
+            # 提取模块名 — peft / lerobot.datasets / 其它分别给针对性指令
             import re as _re
             m = _re.search(r"(?:no module named|cannot import name)\s+'?([^'\s]+)'?", joined)
             mod = m.group(1) if m else "依赖库"
-            if "peft" in mod.lower():
+            mod_lower = mod.lower()
+            if "peft" in mod_lower:
                 kw_hint = (
                     "LoRA 微调缺 PEFT 库. 解决方案:\n"
                     "  - pip install peft accelerate\n"
                     "  - 或装 lerobot 全套: pip install \"lerobot[peft] @ file:./lerobot\" --no-build-isolation\n"
                     "  - 不想用 LoRA: APP 训练页关闭 'LoRA 微调' 开关"
+                )
+            elif "lerobot.datasets" in mod_lower or ("'datasets' is required" in joined):
+                # lerobot/src/lerobot/datasets/__init__.py 顶部 require_package("datasets")
+                # require_package("av"), 缺 datasets 或 av 都会让 lerobot.datasets import 失败.
+                kw_hint = (
+                    "lerobot.datasets 加载失败 — 缺 HuggingFace datasets 库或 av (PyAV).\n"
+                    "  - pip install datasets av\n"
+                    "  - 或装全套: pip install \"lerobot[dataset] @ file:./lerobot\" --no-build-isolation\n"
+                    "  - 验证: python -c \"import datasets, av; print(datasets.__version__, av.__version__)\""
+                )
+            elif "av" == mod_lower or "'av' is required" in joined:
+                kw_hint = (
+                    "缺 PyAV (视频解码). 解决: pip install \"av>=15.0.0,<16.0.0\""
                 )
             else:
                 kw_hint = (
@@ -484,10 +533,9 @@ class TrainingWorker:
                 "  - LoRA fine-tune 的 ckpt 不能直接当 base 模型加载, 需要先 merge_and_unload"
             )
 
-        # 3. 拼最终信息: 信号描述 + 关键字提示 + 最后 5 行原始日志
+        # 3. 拼最终信息: 关键字提示 + 最后 5 行原始日志
+        # (信号类终止已在第 1 步直接 return, 这里 sig_msg 必空, 不再拼接)
         parts = [f"训练失败 (exit code {returncode})"]
-        if sig_msg:
-            parts.append(sig_msg)
         if kw_hint:
             parts.append(kw_hint)
         if tail_lines:
@@ -676,12 +724,19 @@ class TrainingWorker:
         # 仅在 fingerprint 缺失 (旧调用路径) 时退回用 trajectories.id 现算.
         if not ds_fingerprint:
             ds_fingerprint = self._ds_fingerprint([t.get("id", "") for t in trajectories])
+        # === 下载 cache 共享 (按 fp), LeRobot dataset 每 job 独立 ===
+        # 共享: cache/ds_<fp>/  -- 同 fp 多 job 共享原始下载 (节流量, multi-slot lock 串行下载)
+        # 独立: datasets/<repo>/ -- 每 job 一份转换好的 dataset, 同数据集跑不同 model 互不影响
+        #       stats.json (pi05 quantile augment 不污染另一 job)
         ds_cache_dir = Path(__file__).parent.parent / "cache" / f"ds_{ds_fingerprint}"
         ds_dir = ds_cache_dir / "dataset"
         img_dir = ds_cache_dir / "images"
-        repo_id = f"box2robot-{ds_fingerprint}"
+        # job_id 从 model_dir 解析 (model_dir = outputs/<job_id>/model)
+        job_id_for_ds = Path(model_dir).parent.name
+        # repo_id 含 job_id 前缀 + fp 后缀, 既可读又确保 multi-slot 同 fp 不冲突
+        repo_id = f"box2robot-{job_id_for_ds}-{ds_fingerprint[:8]}"
 
-        # Step 1: Convert to LeRobot format (缓存到 datasets/ 目录, 避免重复转换)
+        # Step 1: Convert to LeRobot format (per-job 目录, 同 dataset 多 job 各保一份)
         has_images = img_dir.is_dir() and any(img_dir.iterdir())
         datasets_root = Path(__file__).parent.parent / "datasets" / repo_id
         dataset_marker = datasets_root / "meta" / "info.json"
@@ -693,34 +748,40 @@ class TrainingWorker:
                 f"请使用带图像的数据集，或改用 ACT/Diffusion 等纯状态模型。"
             )
 
-        if dataset_marker.exists():
-            logger.info("[CACHE HIT] LeRobot dataset %s 已存在, 跳过转换", repo_id)
-            if progress_cb:
-                progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
-        else:
-            logger.info("Converting to LeRobot format (vision=%s)...", has_images)
-            if progress_cb:
-                progress_cb(0, train_steps, {"phase": "converting", "message": "转换为 LeRobot 数据集格式..."})
-            convert(
-                input_path=ds_dir,
-                repo_id=repo_id,
-                task_description=custom_params.get("task", "manipulation task"),
-                fps=20,
-                images_dir=img_dir if has_images else None,
-                root=datasets_root,
-            )
-        logger.info("LeRobot dataset ready: %s", datasets_root)
+        # === Multi-slot race protection: 同 repo_id 多 thread 串行 convert + augment ===
+        # 不加锁两个 slot 都看 dataset_marker 不存在 → 都调 LeRobotDataset.create →
+        # 写 parquet 互相覆盖. 加锁后第一个进入的转完, 第二个看 marker 存在直接 hit.
+        # 同样保护 quantile augment (写 stats.json) 不被同时改.
+        with _get_file_lock(f"convert_{repo_id}"):
+            # 锁内重新检查 marker — 第一个 thread 转完后第二个进锁会看到已存在
+            if dataset_marker.exists():
+                logger.info("[CACHE HIT] LeRobot dataset %s 已存在, 跳过转换", repo_id)
+                if progress_cb:
+                    progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
+            else:
+                logger.info("Converting to LeRobot format (vision=%s)...", has_images)
+                if progress_cb:
+                    progress_cb(0, train_steps, {"phase": "converting", "message": "转换为 LeRobot 数据集格式..."})
+                convert(
+                    input_path=ds_dir,
+                    repo_id=repo_id,
+                    task_description=custom_params.get("task", "manipulation task"),
+                    fps=20,
+                    images_dir=img_dir if has_images else None,
+                    root=datasets_root,
+                )
+            logger.info("LeRobot dataset ready: %s", datasets_root)
 
-        # Step 1.5: 模型特定的 dataset 后处理
-        # pi05 用 QUANTILES normalization, 需要 dataset 有 q01/q99 stats.
-        # LeRobotDataset.create() 默认只算 mean/std, 这里按需补算.
-        if model_type in self.QUANTILE_NORM_MODELS:
-            if progress_cb:
-                progress_cb(0, train_steps, {
-                    "phase": "augmenting",
-                    "message": f"为 {model_type.upper()} 补算 quantile stats (q01/q99)...",
-                })
-            self._ensure_quantile_stats(repo_id, datasets_root, model_type)
+            # Step 1.5: 模型特定的 dataset 后处理
+            # pi05 用 QUANTILES normalization, 需要 dataset 有 q01/q99 stats.
+            # 在同一锁内做 augment, 避免 stats.json 写冲突.
+            if model_type in self.QUANTILE_NORM_MODELS:
+                if progress_cb:
+                    progress_cb(0, train_steps, {
+                        "phase": "augmenting",
+                        "message": f"为 {model_type.upper()} 补算 quantile stats (q01/q99)...",
+                    })
+                self._ensure_quantile_stats(repo_id, datasets_root, model_type)
 
         if progress_cb:
             progress_cb(0, train_steps, {"loss": 0})

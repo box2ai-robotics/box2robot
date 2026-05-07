@@ -216,9 +216,12 @@ def _check_dependencies(issues: list):
          "cd lerobot && pip install -e . --no-build-isolation"),
         ("av",           "av",           True,
          'pip install "av>=15.0.0,<16.0.0"   # 或 pip install "lerobot[dataset] @ file:./lerobot"'),
+        # datasets: lerobot.datasets/__init__.py 顶部强制 require_package("datasets"),
+        # 缺它 import lerobot.datasets 就抛 "No module named 'lerobot.datasets'".
+        # ACT/Diffusion 也用 lerobot.datasets 加载训练数据 → 升级到 BLOCKED 级.
+        ("datasets",     "datasets",     True,
+         'pip install datasets    # 或 pip install "lerobot[dataset] @ file:./lerobot"'),
         # VLA-only, 仅 warning
-        ("datasets",     "datasets",     False,
-         'pip install "lerobot[dataset] @ file:./lerobot" --no-build-isolation'),
         ("transformers", "transformers", False, "pip install transformers accelerate"),
         ("accelerate",   "accelerate",   False, "pip install accelerate"),
         # peft: LoRA 微调依赖. 仅当用户在 APP 训练页开启 'LoRA 微调' 才需要;
@@ -354,8 +357,22 @@ class GPUWorker:
         self.device_id = ""
         self.token = ""
         self.hw_info = get_hw_info()
-        # 当前正在处理的训练/推理 job_id, 心跳时上报给 server 作为 worker liveness
-        # (覆盖训练子进程下载大模型 / 慢 GPU 单步等长阻塞期, server 才不会误判卡死)
+
+        # === Multi-slot 并发支持 (v0.6.3+) ===
+        # _slots: job_id → {"thread": Thread, "job": dict, "action": str, "started_at": ts,
+        #                   "estimated_vram_gb": float}
+        # 显存允许时多个 slot 同时跑训练 + 推理, server 看到一个 device 多个 active job.
+        # 资源上限 (_max_vram_gb / _max_ram_gb): 用户在 APP GPU 配置页设, 默认 90%/50%,
+        # 既保护系统留余量, 也让 worker 不超出用户预算 (即使物理 free 还多).
+        import threading as _t
+        self._slots: dict = {}
+        self._slots_lock = _t.Lock()
+        self._max_concurrent: int = 1
+        self._max_vram_gb: float = 0.0   # 0 = 走物理上限 (兼容老 server 没下发)
+        self._max_ram_gb: float = 0.0
+
+        # 兼容: 旧字段 _active_job_id 不再使用 (心跳改上报 active_job_ids list).
+        # 保留 attribute 以防 _process_job 等老代码引用; 实际逻辑迁移到 _slots.
         self._active_job_id: str = ""
 
     def run(self):
@@ -473,42 +490,358 @@ class GPUWorker:
         return False
 
     def _main_loop(self):
-        """Heartbeat + poll for jobs + check upgrades."""
-        heartbeat_interval = 10  # seconds
-        poll_interval = 5  # seconds
-        upgrade_interval = 60  # seconds
+        """Multi-slot 并发主循环.
+
+        v0.6.3+: 一个 worker 进程同时跑 max_concurrent 个 job (训练 / 推理混跑).
+        从 server /api/gpu/config 拉 max_concurrent (用户在 APP GPU 配置页设),
+        每空一个 slot 就 poll 一次, 在显存允许范围内并发处理.
+
+        线程模型:
+        - 主循环 (本函数): 心跳 / poll / 收割已完成 slot
+        - 每个 job 一个 daemon thread (_slot_runner) 跑 _process_job
+        - _slots dict 用 _slots_lock 保护
+        - 心跳带 active_job_ids 列表, server 逐个刷 liveness
+        """
+        heartbeat_interval = 10
+        poll_interval = 5
+        upgrade_interval = 60
+        config_refresh_interval = 30   # 用户改 max_concurrent 后 30s 内生效
         last_heartbeat = 0
         last_upgrade_check = 0
+        last_config_refresh = 0
+
+        # 启动时拉一次配置 (得到 max_concurrent 默认值)
+        self._refresh_concurrent_config()
 
         try:
             while True:
                 now = time.time()
 
-                # Heartbeat
                 if now - last_heartbeat >= heartbeat_interval:
                     self._heartbeat()
                     last_heartbeat = now
-
-                # Check upgrade
                 if now - last_upgrade_check >= upgrade_interval:
                     self._check_upgrade()
                     last_upgrade_check = now
+                if now - last_config_refresh >= config_refresh_interval:
+                    self._refresh_concurrent_config()
+                    last_config_refresh = now
 
-                # Poll for jobs
-                job, action, resume_step = self._poll_job()
-                if job:
-                    self._process_job(job, action, resume_step)
-                else:
-                    time.sleep(poll_interval)
+                # 收割已完成的 slot (slot_runner finally 已 pop, 这里兜底清残留)
+                self._reap_finished_slots()
+
+                # 检查空槽位 + 领取任务: 每个空槽 poll 一次, server 端 atomic claim 防重
+                with self._slots_lock:
+                    free_slots = max(0, self._max_concurrent - len(self._slots))
+                claimed = 0
+                vram_blocked = False
+                for _ in range(free_slots):
+                    job, action, resume_step = self._poll_job()
+                    if not job:
+                        break  # 没任务可领, 后续空 slot 也无意义
+                    # === VRAM 决策: 物理 free + 用户 budget 双限制 ===
+                    need_gb = self._estimate_job_vram(job, action)
+                    ok, vinfo = self._has_enough_vram(need_gb)
+                    if not ok:
+                        # 区分被哪一边卡住, 给用户精准提示 (会写到 job.error_msg)
+                        if vinfo["blocker"] == "budget":
+                            reason = (
+                                f"超出 max_vram_gb 预算 — 模型估算 {need_gb:.1f}GB + "
+                                f"冗余 {self.VRAM_RESERVE_GB:.1f}GB, 用户预算 "
+                                f"{vinfo['max_vram_gb']:.1f}GB 已承诺给 {len(self._slots)} 个 slot "
+                                f"({vinfo['slots_committed_gb']:.1f}GB), 剩 "
+                                f"{vinfo['budget_remaining_gb']:.1f}GB. "
+                                f"建议: APP GPU 配置页调大 max_vram_gb, 或减小 batch_size, "
+                                f"或开 LoRA / gradient_checkpointing."
+                            )
+                        else:
+                            reason = (
+                                f"GPU 物理显存不够 — 估算 {need_gb:.1f}GB + 冗余 "
+                                f"{self.VRAM_RESERVE_GB:.1f}GB > 实际空闲 "
+                                f"{vinfo['physical_free_gb']:.1f}GB / 总 "
+                                f"{vinfo['physical_total_gb']:.1f}GB. "
+                                f"建议: 等当前 slot 跑完, 或终止其它占用进程."
+                            )
+                        logger.warning("[VRAM] %s 拒绝 job %s (model=%s batch=%s)",
+                                        vinfo["blocker"].upper(),
+                                        job["id"], job.get("model_type"),
+                                        job.get("batch_size"))
+                        logger.warning("    %s", reason)
+                        self._release_job_to_pending(job["id"], reason)
+                        vram_blocked = True
+                        break  # 等 slot 释放再试, 不再 poll 下一个
+                    self._spawn_slot(job, action, resume_step,
+                                      estimated_vram_gb=need_gb)
+                    claimed += 1
+                # 没领到任务 (server 没活 / vram 不够) → 慢轮询, 别空转
+                if not claimed:
+                    time.sleep(poll_interval if not vram_blocked else poll_interval * 2)
 
         except KeyboardInterrupt:
-            print("\nWorker stopped.")
+            print("\nWorker stopped. 等待 active job 退出...")
+            self._wait_slots_exit(timeout=30)
+
+    # =========== 显存预估 + 决策 (v0.6.3+) ============
+    # 拿到 job 后, 基于 model_type / batch_size / 训练参数 (LoRA / expert_only /
+    # gradient_checkpointing) 估算它跑起来的显存峰值, 跟当前 GPU 空闲显存比较, 留 2GB 冗余.
+    # 装不下就主动 release 回 server (status downloading → pending), 等 slot 释放再领.
+
+    VRAM_RESERVE_GB = 2.0   # 必留冗余 (PyTorch 内部 allocator 抖动 / cuda kernel 占用)
+
+    # 训练静态 base 显存 (GB) — 模型参数 + 优化器 state, 不含 batch
+    _VRAM_BASE_TRAIN = {
+        "act": 2.0, "diffusion": 3.0,
+        "smolvla": 6.0,
+        "pi0": 14.0, "pi0_fast": 14.0, "pi05": 14.0,
+        "groot": 10.0,
+    }
+    # 每个 batch sample 的额外显存 (GB) — activations + gradients
+    _VRAM_PER_BATCH_TRAIN = {
+        "act": 0.05, "diffusion": 0.05,
+        "smolvla": 0.10,
+        "pi0": 0.50, "pi0_fast": 0.50, "pi05": 0.50,
+        "groot": 0.20,
+    }
+    # 推理静态显存 — base 加载好就 ok, 没有 gradient
+    _VRAM_BASE_INFER = {
+        "act": 2.0, "diffusion": 3.0,
+        "smolvla": 4.0,
+        "pi0": 8.0, "pi0_fast": 8.0, "pi05": 8.0,
+        "groot": 6.0,
+    }
+
+    @classmethod
+    def _estimate_job_vram(cls, job: dict, action: str) -> float:
+        """估算 job 跑起来的显存峰值 (GB).
+
+        粗略表 (实际跟 image resolution / num_workers / chunk_size 相关), 但已经够
+        给"能不能加塞"做决策. 推理走 _VRAM_BASE_INFER (无训练增量); 训练走
+        base + per_batch * batch_size, 然后乘上 LoRA / expert_only / grad_ckpt 的折扣.
+        """
+        model_type = (job.get("model_type") or "act").lower()
+        batch_size = int(job.get("batch_size") or 32)
+        custom = job.get("custom_params") or {}
+        if isinstance(custom, str):
+            try:
+                import json as _j
+                custom = _j.loads(custom)
+            except Exception:
+                custom = {}
+
+        if action == "inference":
+            return cls._VRAM_BASE_INFER.get(model_type, 4.0)
+
+        base = cls._VRAM_BASE_TRAIN.get(model_type, 4.0)
+        per_batch = cls._VRAM_PER_BATCH_TRAIN.get(model_type, 0.05)
+
+        def _flag(key, default="false"):
+            v = str(custom.get(key, default)).lower()
+            return v in ("true", "1", "yes", "on")
+
+        # LoRA 微调: 只训 adapter, base 权重 frozen, 显存约 50%
+        if _flag("peft_enable"):
+            base *= 0.5
+            per_batch *= 0.5
+        # expert_only (pi0/pi05): 冻结 VLM, 显存约 70%
+        elif model_type in ("pi0", "pi0_fast", "pi05") and _flag("train_expert_only"):
+            base *= 0.7
+            per_batch *= 0.7
+        # SmolVLA 默认就 train_expert_only=true (config 默认), 已经是低显存版本
+
+        # gradient checkpointing: VLA 默认开, 用计算时间换显存约 30%
+        gc_default = "true" if model_type in ("pi0", "pi0_fast", "pi05", "smolvla") else "false"
+        if _flag("gradient_checkpointing", gc_default):
+            per_batch *= 0.7
+
+        return base + per_batch * batch_size
+
+    def _has_enough_vram(self, need_gb: float) -> tuple[bool, dict]:
+        """检查显存是否够装 need_gb 的新 job.
+
+        双层判断 (取严格):
+        1. 物理空闲 (torch.cuda.mem_get_info): GPU 真实剩余, 受外部进程占用影响
+        2. 用户预算 (max_vram_gb - 已分配给现有 slot 的总和): 用户在 APP 设的上限,
+           即使物理还有更多空闲也不超出. 默认 max_vram_gb = 物理 vram * 0.9.
+
+        返回 (是否够, info dict 含决策细节). info 用于报错日志和 release reason.
+        """
+        info = {
+            "need_gb": need_gb,
+            "reserve_gb": self.VRAM_RESERVE_GB,
+            "physical_free_gb": 0.0,
+            "physical_total_gb": 0.0,
+            "max_vram_gb": self._max_vram_gb,
+            "slots_committed_gb": 0.0,
+            "budget_remaining_gb": 0.0,
+            "blocker": "",   # 'physical' / 'budget' / '' (ok)
+        }
+        # 已承诺给现有 slot 的预算 (estimated_vram 总和)
+        with self._slots_lock:
+            info["slots_committed_gb"] = sum(
+                float(s.get("estimated_vram_gb", 0)) for s in self._slots.values()
+            )
+        # 物理实测
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info()
+                info["physical_free_gb"] = free_b / (1024 ** 3)
+                info["physical_total_gb"] = total_b / (1024 ** 3)
+        except Exception as e:
+            logger.warning("[VRAM] mem_get_info failed: %s", e)
+            info["physical_free_gb"] = float("inf")  # 检测不了就放行
+        # 用户预算上限 (max_vram_gb=0 表示无限制)
+        if self._max_vram_gb > 0:
+            info["budget_remaining_gb"] = max(0.0, self._max_vram_gb - info["slots_committed_gb"])
+        else:
+            info["budget_remaining_gb"] = float("inf")
+        # 必须同时满足两个限制
+        usable = min(info["physical_free_gb"], info["budget_remaining_gb"]) - self.VRAM_RESERVE_GB
+        ok = need_gb <= usable
+        if not ok:
+            if info["budget_remaining_gb"] <= info["physical_free_gb"]:
+                info["blocker"] = "budget"
+            else:
+                info["blocker"] = "physical"
+        return ok, info
+
+    def _release_job_to_pending(self, job_id: str, reason: str):
+        """显存装不下时, 把 claim 的 job (status=downloading) 推回 pending.
+
+        走 server 的 update_status 接口 (downloading → pending 已加进状态机).
+        失败时 worker 这边会跳过这个 job 等下次循环, server 那边 stale check
+        180s 后会自动判定 GPU 离线挂起 interrupted.
+        """
+        try:
+            r = self.client.post(
+                f"{self.server_url}/api/training/jobs/{job_id}/status",
+                json={"status": "pending", "error_msg": f"VRAM-defer: {reason}",
+                      "key": ""},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                logger.info("[VRAM] released job %s back to pending: %s", job_id, reason)
+            else:
+                logger.warning("[VRAM] release %s failed: HTTP %d %s",
+                                job_id, r.status_code, r.text[:200])
+        except Exception as e:
+            logger.warning("[VRAM] release %s exception: %s", job_id, e)
+
+    # =========== Multi-slot 并发: slot 管理 ============
+
+    def _refresh_concurrent_config(self):
+        """从 server 拉运行时配置 (max_concurrent + 资源上限). 30s 一次, 用户改完 30s 内生效."""
+        try:
+            r = self.client.get(
+                f"{self.server_url}/api/gpu/config",
+                params={"device_id": self.device_id, "token": self.token},
+                timeout=5,
+            )
+            r.raise_for_status()
+            self._apply_config(r.json(), source="poll")
+        except Exception:
+            pass
+
+    def _apply_config(self, cfg: dict, source: str = "?"):
+        """应用 server 下发的 config (max_concurrent / max_vram_gb / max_ram_gb).
+
+        来源 source: 'poll' = 30s 主动拉; 'heartbeat' = 心跳响应 (10s, 更快).
+        改动只在变化时打 log, 同源重复 cfg 不刷屏.
+        """
+        if not isinstance(cfg, dict):
+            return
+        new_mc = cfg.get("max_concurrent")
+        if new_mc is not None:
+            new_mc = max(1, int(new_mc))
+            if new_mc != self._max_concurrent:
+                logger.info("[SLOT] max_concurrent: %d → %d (来源: %s)",
+                             self._max_concurrent, new_mc, source)
+                self._max_concurrent = new_mc
+        new_vram = cfg.get("max_vram_gb")
+        if new_vram is not None:
+            new_vram = float(new_vram)
+            if new_vram > 0 and abs(new_vram - self._max_vram_gb) > 0.05:
+                logger.info("[SLOT] max_vram_gb: %.1f → %.1f GB (来源: %s)",
+                             self._max_vram_gb, new_vram, source)
+                self._max_vram_gb = new_vram
+        new_ram = cfg.get("max_ram_gb")
+        if new_ram is not None:
+            new_ram = float(new_ram)
+            if new_ram > 0 and abs(new_ram - self._max_ram_gb) > 0.05:
+                logger.info("[SLOT] max_ram_gb: %.1f → %.1f GB (来源: %s)",
+                             self._max_ram_gb, new_ram, source)
+                self._max_ram_gb = new_ram
+
+    def _spawn_slot(self, job: dict, action: str, resume_step, estimated_vram_gb: float = 0):
+        """启动一个 daemon thread 跑 job, 加进 _slots (含 vram 估算用于后续决策)."""
+        import threading as _t
+        job_id = job["id"]
+        with self._slots_lock:
+            if job_id in self._slots:
+                logger.warning("[SLOT] job %s already in slot, skip", job_id)
+                return
+            thread = _t.Thread(
+                target=self._slot_runner,
+                args=(job, action, resume_step),
+                daemon=True,
+                name=f"slot-{job_id}",
+            )
+            self._slots[job_id] = {
+                "thread": thread,
+                "job": job,
+                "action": action,
+                "started_at": time.time(),
+                "estimated_vram_gb": estimated_vram_gb,
+            }
+            active = len(self._slots)
+            committed = sum(float(s.get("estimated_vram_gb", 0)) for s in self._slots.values())
+        thread.start()
+        logger.info("[SLOT] started job=%s action=%s vram_est=%.1fGB (active %d/%d, "
+                     "committed %.1f/%.1fGB)",
+                     job_id, action, estimated_vram_gb, active, self._max_concurrent,
+                     committed, self._max_vram_gb or self.hw_info.get("vram_gb", 0))
+
+    def _slot_runner(self, job: dict, action: str, resume_step):
+        """单 slot 入口, 复用现有 _process_job. 完成 / 异常都从 _slots 移除."""
+        job_id = job["id"]
+        try:
+            self._process_job(job, action, resume_step)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error("[SLOT] job %s failed in slot: %s", job_id, e, exc_info=True)
+        finally:
+            with self._slots_lock:
+                self._slots.pop(job_id, None)
+                active = len(self._slots)
+            logger.info("[SLOT] finished job=%s (active %d/%d)",
+                         job_id, active, self._max_concurrent)
+
+    def _reap_finished_slots(self):
+        """兜底清理已经死掉但还在 _slots 里的条目."""
+        with self._slots_lock:
+            dead = [jid for jid, info in self._slots.items()
+                     if not info["thread"].is_alive()]
+            for jid in dead:
+                self._slots.pop(jid, None)
+
+    def _wait_slots_exit(self, timeout: int = 30):
+        """KeyboardInterrupt 时等所有 slot 优雅退出."""
+        import time as _time
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            with self._slots_lock:
+                if not self._slots:
+                    return
+                remain = list(self._slots.keys())
+            logger.info("等待 %d 个 slot 退出: %s", len(remain), remain)
+            _time.sleep(2)
 
     def _heartbeat(self):
-        """Send heartbeat with updated hw info + real-time usage.
+        """Send heartbeat with updated hw info + real-time usage + active job ids.
 
-        如果当前正在跑某个训练/推理 job, 会带上 active_job_id —
-        Server 据此刷新该 job 的 updated_at, 避免长下载 / 慢 step 误判卡死.
+        v0.6.3+: 上报 active_job_ids 列表 (multi-slot). 旧字段 active_job_id (单个)
+        保留 兼容老 server, 取列表第一个.
         """
         usage = get_usage_stats()
         # Update disk_free in hw_info
@@ -522,11 +855,24 @@ class GPUWorker:
             "gpu_info": self.hw_info,
             "usage": usage,
         }
-        if self._active_job_id:
-            payload["active_job_id"] = self._active_job_id
+        # 上报当前活跃 job_ids list (multi-slot). 旧 server 还会看 active_job_id 单字段,
+        # 取第一个兼容. 没活跃 slot 则两个都不传.
+        with self._slots_lock:
+            active_ids = list(self._slots.keys())
+        if active_ids:
+            payload["active_job_ids"] = active_ids
+            payload["active_job_id"] = active_ids[0]
 
         try:
-            self.client.post(f"{self.server_url}/api/gpu/heartbeat", json=payload)
+            r = self.client.post(f"{self.server_url}/api/gpu/heartbeat", json=payload)
+            # 心跳响应里可能带 server 下发的 config (用户在 APP 改完, 1 心跳周期生效)
+            if r.status_code == 200:
+                try:
+                    body = r.json()
+                    if isinstance(body, dict) and "config" in body:
+                        self._apply_config(body["config"], source="heartbeat")
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("Heartbeat failed: %s", e)
 
@@ -592,7 +938,9 @@ class GPUWorker:
                             capture_output=True, text=True,
                         )
                         if result.returncode == 0:
-                            logger.info("升级安装成功! 请重启 Worker 生效 (v%s)", info.get("version"))
+                            installed_ver = info.get("version", "?")
+                            logger.info("升级安装成功 (v%s)", installed_ver)
+                            self._maybe_restart_after_upgrade(new_ver=installed_ver)
                         else:
                             logger.error("升级安装失败: %s", result.stderr[:200])
                         break
@@ -602,6 +950,37 @@ class GPUWorker:
             logger.info("=" * 40)
         except Exception as e:
             logger.error("升级失败: %s", e)
+
+    def _maybe_restart_after_upgrade(self, new_ver: str = "?"):
+        """升级后尝试自动重启 worker. 有活跃任务时跳过, 等任务结束后人工重启.
+
+        Linux/macOS/Windows 都用 os.execv 替换当前进程, 子训练进程会随父死亡 (Linux 默认行为).
+        所以必须确保当前没有活跃训练任务, 否则训练会被中断 (虽然 server 端 600s 后会标 interrupted
+        让 worker 重新领取从 ckpt 续训, 但仍然浪费时间).
+        """
+        import os
+        try:
+            with self._slots_lock:
+                n_slots = len(self._slots)
+        except Exception:
+            n_slots = 0
+        if n_slots > 0:
+            logger.warning(
+                "升级到 v%s 已就位, 但有 %d 个活跃训练任务 — 暂不自动重启. "
+                "任务结束后请手动重启 worker (`pkill -f b2r-gpu` 然后重启), "
+                "或下次 worker 空闲时心跳检测会再次触发自动重启.",
+                new_ver, n_slots)
+            self._pending_restart = True  # 留个 flag, 主循环空闲时检查
+            return
+        logger.info("=" * 40)
+        logger.info(">>> Worker 即将自动重启加载新版本 v%s ...", new_ver)
+        logger.info("=" * 40)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            logger.error("自动重启失败: %s. 请手动重启 worker.", e)
 
     def _poll_job(self) -> tuple:
         """Check for pending training or inference jobs. Returns (job, action, resume_from_step)."""
@@ -614,35 +993,20 @@ class GPUWorker:
         except Exception:
             return None, "train", None
 
-    def _start_bg_heartbeat(self):
-        """Start background heartbeat thread (keeps GPU device online during blocking tasks)."""
-        import threading
-        self._bg_heartbeat_stop = False
-        def _hb_loop():
-            while not self._bg_heartbeat_stop:
-                self._heartbeat()
-                for _ in range(100):  # 10s = 100 * 0.1s (check stop flag frequently)
-                    if self._bg_heartbeat_stop:
-                        break
-                    time.sleep(0.1)
-        self._bg_heartbeat_thread = threading.Thread(target=_hb_loop, daemon=True)
-        self._bg_heartbeat_thread.start()
-
-    def _stop_bg_heartbeat(self):
-        """Stop background heartbeat thread."""
-        self._bg_heartbeat_stop = True
-        if hasattr(self, '_bg_heartbeat_thread'):
-            self._bg_heartbeat_thread.join(timeout=2)
+    # _start_bg_heartbeat / _stop_bg_heartbeat 已废弃 (v0.6.3+):
+    # 多 slot 模式下主循环已经 10s 一次心跳并上报 active_job_ids list,
+    # 每个 slot 不再需要独立 heartbeat thread (避免 N 个线程重复刷 + 竞争).
+    # 删除以避免误用.
 
     def _process_job(self, job: dict, action: str = "train", resume_from_step: int = None):
-        """Route to training or inference based on action."""
+        """Route to training or inference based on action.
+
+        v0.6.3+ multi-slot: 这个函数现在跑在 _slot_runner thread 内, _slots dict 已记录
+        active job. 主循环 _main_loop 10s 一次心跳已上报 active_job_ids list, 不再需要
+        per-slot 的 bg_heartbeat (多 slot 会开 N 个 thread 重复刷, 浪费).
+        """
         job_id = job["id"]
         logger.info("=" * 40)
-
-        # 标记当前活跃 job — 心跳带上, server 据此刷新 updated_at 避免误判
-        self._active_job_id = job_id
-        # Start background heartbeat (keeps GPU online during blocking training)
-        self._start_bg_heartbeat()
 
         try:
             if action == "inference":
@@ -679,9 +1043,8 @@ class GPUWorker:
                                 error_msg=f"Worker 手动停止 (已保存 {len(ckpts)} 个 checkpoint)" if ckpts else "Worker 手动停止",
                                 model_path=model_dir if ckpts else None)
             raise  # 继续向上传播，退出 worker
-        finally:
-            self._stop_bg_heartbeat()
-            self._active_job_id = ""
+        # _slot_runner finally 已 pop 掉 _slots 里的条目 + 主循环心跳已上报新 list,
+        # 不需要在这里管 _active_job_id / bg_heartbeat.
 
         logger.info("任务完成: %s", job_id)
         logger.info("=" * 40)
@@ -859,8 +1222,54 @@ def _setup_hf_cache(hf_cache_arg: str | None = None):
             break
 
 
+def _cmd_check_version(_args):
+    from box2robot_gpu_worker.ota import print_check_version
+    return print_check_version()
+
+
+def _cmd_check_deps(_args):
+    from box2robot_gpu_worker.ota import print_check_deps
+    return print_check_deps()
+
+
+def _cmd_upgrade(args):
+    from box2robot_gpu_worker.ota import print_upgrade, DEFAULT_SERVER_URL
+    return print_upgrade(
+        force=getattr(args, "force", False),
+        auto_restart=not getattr(args, "no_restart", False),
+        server_url=getattr(args, "server", None) or DEFAULT_SERVER_URL,
+    )
+
+
+def _passive_version_check():
+    """Worker 启动时被动跑一次版本检查 (失败/慢都不阻塞主流程).
+
+    仅打印日志; 用户在 stdout 看到提示即可, 不主动升级.
+    """
+    try:
+        from box2robot_gpu_worker.ota import check_version
+        info = check_version(timeout=3.0)
+    except Exception as e:
+        logger.debug("[OTA] passive check skipped: %s", e)
+        return
+    if info.get("status") == "older":
+        logger.warning(
+            "=" * 60 + "\n"
+            "  ⚠ Box2Robot GPU Worker 有新版本可用!\n"
+            f"  本地: v{info['local']}    GitHub: v{info['remote']}\n"
+            f"  升级: b2r-gpu upgrade   (一键 git pull + pip install -e .)\n"
+            f"  仓库: {info['repo_url']}\n"
+            + "=" * 60
+        )
+    elif info.get("status") == "current":
+        logger.info("[OTA] 已是最新版本 v%s", info["local"])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Box2Robot GPU Worker")
+    sub = parser.add_subparsers(dest="cmd")
+
+    # 默认 (无子命令) 跑 daemon — 保持原行为, 向下兼容
     parser.add_argument("--server", "-s", type=str, default="https://robot.box2ai.com",
                         help="Server URL (default: https://robot.box2ai.com)")
     parser.add_argument("--output", "-o", type=str, default="outputs",
@@ -869,10 +1278,37 @@ def main():
                         help="HuggingFace cache 目录 (例: /root/autodl-tmp/.cache). "
                              "默认自动检测 AutoDL 数据盘, 否则用 ~/.cache/huggingface. "
                              "训练 + 推理共享同一份 base 模型, 避免重复下载.")
+    parser.add_argument("--no-version-check", action="store_true",
+                        help="启动时跳过 GitHub 版本检查 (离线环境)")
+
+    # 子命令: check-version / check-deps / upgrade
+    p_cv = sub.add_parser("check-version", help="检查 GitHub 上是否有新版本")
+    p_cv.set_defaults(func=_cmd_check_version)
+
+    p_cd = sub.add_parser("check-deps", help="检测核心 + 可选依赖完整性 (含 pip check)")
+    p_cd.set_defaults(func=_cmd_check_deps)
+
+    p_up = sub.add_parser("upgrade",
+        help="一键升级: 优先 server zip, fallback git pull. 默认完成后自动重启.")
+    p_up.add_argument("--force", action="store_true",
+                      help="即使版本相同也强制跑 (hotfix 同版本号场景)")
+    p_up.add_argument("--no-restart", action="store_true",
+                      help="升级完成后不自动重启 (默认会 os.execv 替换当前进程)")
+    p_up.set_defaults(func=_cmd_upgrade)
+
     args = parser.parse_args()
 
+    # 子命令分发
+    if args.cmd:
+        return args.func(args)
+
+    # 默认: 跑 daemon
     # 启动早期就设 HF_HOME, 后续 import torch / lerobot / transformers 才能读到
     _setup_hf_cache(args.hf_cache)
+
+    # 被动版本检查 (失败不阻塞)
+    if not args.no_version_check:
+        _passive_version_check()
 
     worker = GPUWorker(args.server, args.output)
     worker.run()
