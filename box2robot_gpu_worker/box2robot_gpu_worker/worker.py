@@ -540,34 +540,26 @@ class TrainingWorker:
 
         # Step 2: Train via lerobot CLI
         # 启动方式优先级:
-        # 1. 本地 lerobot/src/.../lerobot_train.py 直接执行 — 最可靠, 不依赖 namespace
-        #    package 解析 (lerobot 上游 scripts/ 没有 __init__.py, "python -m
-        #    lerobot.scripts.lerobot_train" 会报 No module named)
+        # 1. python -m lerobot.scripts.lerobot_train — 首选, 保留 package 上下文,
+        #    relative import 才能解析 (直接 python lerobot_train.py 会
+        #    "attempted relative import with no known parent package")
         # 2. pip 注册的 console script `lerobot-train` (pip install -e . 后生成)
-        # 3. fallback 到 python -m 模式 (理论上 namespace package 也支持, 但偶尔崩)
-        lerobot_local = Path(__file__).parent.parent / "lerobot" / "src" / "lerobot" / "scripts" / "lerobot_train.py"
-        use_module_mode = False
-        if lerobot_local.exists():
-            cmd = [sys.executable, str(lerobot_local)]
+        # 本地 lerobot/src 存在时, 通过 PYTHONPATH 让 -m 找到包 (见下方 train_env)
+        lerobot_src = Path(__file__).parent.parent / "lerobot" / "src"
+        import importlib.util
+        import shutil as _sh
+        if importlib.util.find_spec("lerobot") is not None or lerobot_src.exists():
+            cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
         else:
-            import shutil as _sh
             console_bin = _sh.which("lerobot-train")
             if console_bin:
                 cmd = [console_bin]
             else:
-                try:
-                    import importlib.util
-                    if importlib.util.find_spec("lerobot") is not None:
-                        cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
-                        use_module_mode = True
-                    else:
-                        raise FileNotFoundError("lerobot 不可用")
-                except Exception:
-                    raise FileNotFoundError(
-                        "lerobot 未安装且本地子目录不存在。"
-                        "请 cd lerobot && pip install -e . --no-build-isolation, "
-                        "或确保 box2robot_gpu_worker/lerobot/ 子目录完整。"
-                    )
+                raise FileNotFoundError(
+                    "lerobot 未安装且本地子目录不存在。"
+                    "请 cd lerobot && pip install -e . --no-build-isolation, "
+                    "或确保 box2robot_gpu_worker/lerobot/ 子目录完整。"
+                )
 
         cmd += [
             f"--dataset.repo_id={repo_id}",
@@ -701,9 +693,13 @@ class TrainingWorker:
         # Run with real-time stdout forwarding for progress
         import os as _os
         train_env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
-        if not use_module_mode:
-            # 本地子目录模式：手动设 PYTHONPATH 让子进程能 import lerobot
-            train_env["PYTHONPATH"] = str(Path(__file__).parent.parent / "lerobot" / "src")
+        if lerobot_src.exists():
+            # 本地子目录优先：把 lerobot/src 注入 PYTHONPATH, 让 -m 解析到本地包
+            old_pp = train_env.get("PYTHONPATH", "")
+            sep = ";" if _os.name == "nt" else ":"
+            train_env["PYTHONPATH"] = (
+                f"{lerobot_src}{sep}{old_pp}" if old_pp else str(lerobot_src)
+            )
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=str(Path(__file__).parent.parent),
