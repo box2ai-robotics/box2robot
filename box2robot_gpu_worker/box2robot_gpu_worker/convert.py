@@ -150,6 +150,8 @@ def convert(
     fps: int = 20,
     images_dir: Path | None = None,
     image_size: tuple = (480, 640),
+    use_videos: bool = False,
+    video_codec: str = "h264",
 ):
     """Convert Box2Robot trajectories to LeRobot dataset.
 
@@ -186,9 +188,11 @@ def convert(
     n_servos = len(servo_ids)
     servo_names = [f"joint_{i}" for i in servo_ids]
     pos_max = _detect_pos_max(first_traj["frames"])
+    use_video_storage = use_vision and use_videos
 
     print(f"Detected {n_servos} servos (IDs: {servo_ids}), range 0~{pos_max}")
     print(f"Vision mode: {'ON' if use_vision else 'OFF'}, target FPS: {fps}")
+    print(f"Visual storage: {'video' if use_video_storage else 'image/parquet'}")
     print(f"Converting {len(traj_files)} trajectories -> {repo_id}")
 
     # Define features
@@ -206,7 +210,7 @@ def convert(
     }
     if use_vision:
         features["observation.images.top"] = {
-            "dtype": "image",
+            "dtype": "video" if use_video_storage else "image",
             "shape": (image_size[0], image_size[1], 3),
             "names": ["height", "width", "channels"],
         }
@@ -217,7 +221,8 @@ def convert(
         features=features,
         root=root,
         robot_type="box2robot_arm",
-        use_videos=False,
+        use_videos=use_video_storage,
+        vcodec=video_codec,
     )
 
     total_frames = 0
@@ -518,10 +523,24 @@ def main():
                         help="Image directory (e.g. ./images/)")
     parser.add_argument("--image-size", type=str, default="480x640",
                         help="Image size HxW (default: 480x640)")
+    parser.add_argument("--use-videos", action="store_true",
+                        help="Store visual observations as videos instead of image parquet")
+    parser.add_argument("--video-codec", type=str, default="h264",
+                        help="Video codec for --use-videos (default: h264)")
     args = parser.parse_args()
 
     h, w = map(int, args.image_size.split("x"))
-    convert(args.input, args.output, args.task, args.root, args.fps, args.images, (h, w))
+    convert(
+        args.input,
+        args.output,
+        args.task,
+        args.root,
+        args.fps,
+        args.images,
+        (h, w),
+        args.use_videos,
+        args.video_codec,
+    )
 
 
 if __name__ == "__main__":
