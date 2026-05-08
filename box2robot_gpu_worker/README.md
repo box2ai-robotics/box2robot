@@ -375,92 +375,13 @@ b2r-gpu --server https://robot.box2ai.com
 
 ## 开机自启 (可选)
 
-绑定成功后，建议把 Worker 注册成系统服务，机器重启后自动上线领任务。
-跨平台脚本: `scripts/install_autostart.py` (Linux 走 systemd, Windows 走 Task Scheduler)。
+按部署环境选脚本：
 
-> 运行前必须先 `conda activate b2r` (脚本从当前 Python 环境定位 `b2r-gpu` 绝对路径)。
-
-### Linux (systemd)
-
-```bash
-conda activate b2r
-cd box2robot_gpu_worker
-
-# 安装 (默认用户级, 不需 sudo)
-python scripts/install_autostart.py install --server https://robot.box2ai.com
-
-# 国内网络: 顺手注入 HF 镜像
-python scripts/install_autostart.py install \
-    --env HF_ENDPOINT=https://hf-mirror.com
-
-# 用户级服务在登出后会停, 让它常驻 (机器重启自动起):
-sudo loginctl enable-linger $USER
-
-# 或装系统级 (真正系统启动时拉起, 不依赖用户登录)
-python scripts/install_autostart.py install --system --server https://robot.box2ai.com
-```
-
-管理:
-
-```bash
-python scripts/install_autostart.py status     # 查看状态
-python scripts/install_autostart.py start      # 立即启动
-python scripts/install_autostart.py stop       # 停止
-python scripts/install_autostart.py uninstall  # 卸载
-
-# 实时日志
-journalctl --user -u box2robot-gpu-worker -f          # 用户级
-sudo journalctl -u box2robot-gpu-worker -f            # 系统级
-```
-
-unit 文件位置:
-- 用户级: `~/.config/systemd/user/box2robot-gpu-worker.service`
-- 系统级: `/etc/systemd/system/box2robot-gpu-worker.service`
-
-### Windows (Task Scheduler)
-
-```cmd
-conda activate b2r
-cd box2robot_gpu_worker
-
-REM 安装 (默认 ONLOGON: 当前用户登录时启动, 无需管理员)
-python scripts\install_autostart.py install --server https://robot.box2ai.com
-
-REM 国内网络: 注入 HF 镜像
-python scripts\install_autostart.py install ^
-    --env HF_ENDPOINT=https://hf-mirror.com
-
-REM 改成系统启动时触发 (需以管理员身份打开终端, 任务以 SYSTEM 账户运行)
-python scripts\install_autostart.py install --trigger boot
-```
-
-管理:
-
-```cmd
-python scripts\install_autostart.py status     REM 查看状态
-python scripts\install_autostart.py start      REM 立即触发
-python scripts\install_autostart.py stop       REM 停止
-python scripts\install_autostart.py uninstall  REM 卸载
-
-REM 实时日志 (PowerShell)
-Get-Content logs\gpu_worker_autostart.log -Wait -Tail 50
-```
-
-任务名: `Box2RobotGpuWorker`
-包装脚本: `scripts/_autostart_wrapper.bat` (脚本自动生成, 含崩溃自动重启循环)
-日志文件: `logs/gpu_worker_autostart.log`
-
-> Windows ONLOGON 触发不需要管理员, 适合个人工作站; ONSTART 以 SYSTEM 账户跑, 在某些 GPU 驱动下可能拿不到 CUDA 句柄, 不行就改回 ONLOGON 并开自动登录。
-
-### 常见问题
-
-| 现象 | 排查 |
-|------|------|
-| `[错误] 找不到 b2r-gpu` | 没在 `b2r` conda 环境里跑脚本, 先 `conda activate b2r` |
-| Linux 用户级服务重启后没起 | 没开 lingering: `sudo loginctl enable-linger $USER` |
-| Windows 任务能启动但看不到输出 | 看 `logs/gpu_worker_autostart.log`, 不是看终端 |
-| 自启 Worker 显示新的绑定码 | Worker 数据目录变了, 用 `--output` 指向之前 bind 时的目录 |
-| 想改 server / 参数 | 重新跑 `install --server <new>` 即可 (`/f` 强制覆盖旧任务) |
+| 场景 | 脚本 |
+|---|---|
+| **AutoDL GPU 实例** | `scripts/autodl_onstart.sh` + 控制台 "开机执行命令" — 详见 [AUTODL_AUTOSTART.md](scripts/AUTODL_AUTOSTART.md) |
+| **自建 Ubuntu 服务器** | `sudo bash scripts/install_on_ubuntu.sh` — systemd 服务, 开机自启 + 崩溃重启 |
+| **Windows 个人工作站** | 直接 `conda activate b2r && b2r-gpu` 即可, 不建议服务化 (CUDA 在 SYSTEM 账户下常异常) |
 
 ## 支持的模型
 
