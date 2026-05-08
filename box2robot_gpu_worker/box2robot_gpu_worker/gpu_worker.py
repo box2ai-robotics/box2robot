@@ -912,6 +912,14 @@ class GPUWorker:
                     body = r.json()
                     if isinstance(body, dict) and "config" in body:
                         self._apply_config(body["config"], source="heartbeat")
+                    # 用户在前端点了"立即升级"按钮 → server 心跳响应带 should_check_upgrade
+                    # → worker 立即跑一次 _check_upgrade, 不等下一个 60s 周期.
+                    if isinstance(body, dict) and body.get("should_check_upgrade"):
+                        logger.info("[OTA] 收到立即升级触发, 开始检查...")
+                        try:
+                            self._check_upgrade()
+                        except Exception as e:
+                            logger.warning("[OTA] 立即升级触发后 _check_upgrade 失败: %s", e)
                     # Hardening H: server 对账下发"该停的 job 列表".
                     # 实际停止信号仍走 progress→409 (worker.py progress_cb 已处理).
                     # 这里维护一个 stop set, 一是日志/告警, 二是清理已经死掉的 slot 占位.
