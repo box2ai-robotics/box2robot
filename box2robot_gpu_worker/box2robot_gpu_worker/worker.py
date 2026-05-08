@@ -160,9 +160,33 @@ class TrainingWorker:
         # 用绝对路径，避免 worker 重启 / cwd 变化后 Path(model_path).exists() 失败
         model_dir = str((self.output_dir / job_id / "model").resolve())
 
+        # 每次 progress 上报都让 server 知道 model_dir + 当前 checkpoint 列表,
+        # 这样训练中途任何时刻断电/崩溃, server 都已经记下"这个 job 的模型在哪、有哪些可用 ckpt".
+        # 不依赖 cancel/pause/done 路径才上报, 防止 OOM / 突然 kill 时来不及汇报.
+        _last_reported_ckpts: list = []
+
         def progress_cb(step, total, metrics):
             if self._should_stop or self._should_pause:
                 return
+            # 顺带带上当前 checkpoints + model_path. 只在 ckpt 列表变化时塞进去,
+            # 避免每条 progress 都重复 IO.
+            try:
+                ckpts_now = self._scan_checkpoints(model_dir)
+            except Exception:
+                ckpts_now = []
+            nonlocal _last_reported_ckpts
+            if ckpts_now and ckpts_now != _last_reported_ckpts:
+                metrics = dict(metrics or {})
+                metrics["checkpoints"] = ckpts_now
+                metrics["model_path"] = model_dir  # 仅作为元数据; server 写 DB 主要在 status 通道
+                _last_reported_ckpts = ckpts_now
+                # 顺手用 status 通道写一次 model_path, 让 DB model_path 即使中途异常也有值
+                try:
+                    self._report_status(job_id, "training",
+                                        model_path=model_dir,
+                                        checkpoints=ckpts_now)
+                except Exception:
+                    pass
             resp = self._report_progress(job_id, step, total, metrics)
             if resp and resp.get("should_stop"):
                 logger.warning("Server requested stop")
@@ -1475,7 +1499,16 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     from PIL import Image
 
     logger.info("Loading model from %s", model_dir)
+    # b2r_config.json 总是落在顶层 model_dir/ 下 (worker 训练时写). 但 model_dir 实参
+    # 可能是深路径 .../checkpoints/000200/pretrained_model — 向上回溯到包含 b2r_config.json
+    # 的目录, 避免误用 default config 把 pos_max 等关键参数走到默认值.
     config_path = Path(model_dir) / "b2r_config.json"
+    if not config_path.exists():
+        for p in Path(model_dir).resolve().parents:
+            cand = p / "b2r_config.json"
+            if cand.exists():
+                config_path = cand
+                break
 
     use_vision = False
     model_type = "act"
@@ -1493,11 +1526,24 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     is_vla = config.get("is_vla", model_type in ("smolvla", "pi0", "pi0_fast", "pi05"))
     task_description = config.get("task_description", "manipulation task")
 
-    # LeRobot policy — 必须指向 checkpoints/.../pretrained_model/ 目录
+    # LeRobot policy — 解析 model_dir 到具体的 pretrained_model 目录.
+    # model_dir 可能传进来三种形态:
+    #   (a) 顶层 model_dir, 内含 checkpoints/<step>/pretrained_model/  → glob 找 last
+    #   (b) 直接是 pretrained_model 目录 (gpu_worker 指定 checkpoint_step 时)
+    #   (c) checkpoints/<step>/ 但少 pretrained_model 后缀 → 补上
     ckpt_path = config.get("lerobot_checkpoint", "")
     if not ckpt_path or not Path(ckpt_path).exists():
-        ckpt_dirs = sorted(Path(model_dir).glob("checkpoints/*/pretrained_model"))
-        ckpt_path = str(ckpt_dirs[-1]) if ckpt_dirs else ""
+        m = Path(model_dir)
+        if (m / "config.json").exists():
+            # 形态 (b): model_dir 自己就是 pretrained_model
+            ckpt_path = str(m)
+        elif (m / "pretrained_model" / "config.json").exists():
+            # 形态 (c): model_dir 是 checkpoints/<step>/, 加一层
+            ckpt_path = str(m / "pretrained_model")
+        else:
+            # 形态 (a): 顶层 model_dir, glob 找最新 checkpoint
+            ckpt_dirs = sorted(m.glob("checkpoints/*/pretrained_model"))
+            ckpt_path = str(ckpt_dirs[-1]) if ckpt_dirs else ""
     if not ckpt_path or not (Path(ckpt_path) / "config.json").exists():
         raise FileNotFoundError(f"No pretrained_model found in {model_dir}")
 
