@@ -1,5 +1,5 @@
 """Box2Robot GPU Worker — LeRobot integration layer for Box2Robot platform."""
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 
 # Servo normalization constants
 STS_POS_MAX = 4095  # STS3215 encoder range

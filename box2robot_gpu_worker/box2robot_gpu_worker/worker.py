@@ -157,7 +157,8 @@ class TrainingWorker:
             "message": f"数据集下载完成: {len(trajectories)} 条轨迹" + (f", {sum(1 for d in img_base.iterdir() if d.is_dir())} 组图像" if has_any_images else ""),
         })
         self._report_status(job_id, "training")
-        model_dir = str(self.output_dir / job_id / "model")
+        # 用绝对路径，避免 worker 重启 / cwd 变化后 Path(model_path).exists() 失败
+        model_dir = str((self.output_dir / job_id / "model").resolve())
 
         def progress_cb(step, total, metrics):
             if self._should_stop or self._should_pause:
@@ -181,15 +182,20 @@ class TrainingWorker:
             )
 
             if self._should_stop:
-                self._report_status(job_id, "cancelled")
+                # 取消前先扫描已保存的 checkpoint 并随 status 一起上报
+                # （progress 通道在 status=cancelled 时会被 409 拒收，必须走 status）
+                ckpts = self._scan_checkpoints(model_dir)
+                self._report_status(job_id, "cancelled",
+                                    model_path=model_dir if ckpts else None,
+                                    checkpoints=ckpts or None)
+                logger.info("Training cancelled. Checkpoints: %s", ckpts)
                 return
 
             if self._should_pause:
-                # 暂停: 上报 checkpoint 列表，保持 paused 状态 (server 已设为 paused)
                 ckpts = self._scan_checkpoints(model_dir)
-                if ckpts:
-                    self._report_progress(job_id, ckpts[-1], train_steps,
-                                          {"checkpoints": ckpts, "log": f"训练已暂停 (step {ckpts[-1]})，已保存 {len(ckpts)} 个 checkpoint"})
+                self._report_status(job_id, "paused",
+                                    model_path=model_dir if ckpts else None,
+                                    checkpoints=ckpts or None)
                 logger.info("Training paused at checkpoint. Checkpoints: %s", ckpts)
                 return
 
@@ -197,10 +203,23 @@ class TrainingWorker:
             self._report_status(job_id, "completed", model_path=model_dir)
             logger.info("Training complete: %s", model_dir)
             logger.info("Results: %s", json.dumps(result, indent=2))
+            # Hardening E: 把训练好的模型 tar.gz 推到 server, 哪怕 worker 实例销毁
+            # (AutoDL 关机) 也能在另一台机器上下载来跑推理.
+            try:
+                self._upload_model_artifact(job_id, model_dir)
+            except Exception as e:
+                logger.warning("[E] Model upload failed (训练已完成不影响 status): %s", e)
 
         except Exception as e:
             logger.error("Training failed: %s", e, exc_info=True)
-            self._report_status(job_id, "failed", error_msg=str(e))
+            # 异常前也扫一次，部分 checkpoint 已落盘则保留可推理能力
+            try:
+                ckpts = self._scan_checkpoints(model_dir)
+            except Exception:
+                ckpts = []
+            self._report_status(job_id, "failed", error_msg=str(e),
+                                model_path=model_dir if ckpts else None,
+                                checkpoints=ckpts or None)
 
     # VLA models that fine-tune from pretrained base (vision-language-action)
     VLA_MODELS = {"smolvla", "pi0", "pi0_fast", "pi05"}
@@ -1228,6 +1247,9 @@ class TrainingWorker:
                         return {"should_pause": True}
                     return {"should_stop": True}
                 r.raise_for_status()
+                # Hardening F: 上报成功 → 顺便 flush 之前积压的 checkpoint 报告
+                if has_checkpoint:
+                    self._flush_pending_checkpoint_reports(job_id)
                 return r.json()
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -1235,16 +1257,65 @@ class TrainingWorker:
                     time.sleep(3)
                 else:
                     logger.warning("Progress report failed: %s", e)
+        # Hardening F: 重要报告 (含 checkpoints 列表) 全部重试失败 → 落盘, 等下次成功上报时再 flush.
+        if has_checkpoint:
+            self._persist_pending_report(job_id, payload)
         return {}
 
+    def _pending_dir(self) -> "Path":
+        from pathlib import Path
+        d = self.output_dir / "_pending_reports"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _persist_pending_report(self, job_id: str, payload: dict):
+        """Hardening F: progress 重试用尽后, 把 checkpoint 报告存到磁盘,
+        下次同一 job 的 progress 成功上报时一并 flush. 防止网络抖动让
+        cancel/pause 的 checkpoint 列表永久丢失.
+        """
+        try:
+            import uuid
+            f = self._pending_dir() / f"{job_id}__{int(time.time())}__{uuid.uuid4().hex[:6]}.json"
+            with open(f, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp)
+            logger.warning("[F] Persisted pending progress to %s", f)
+        except Exception as e:
+            logger.warning("[F] Persist pending failed: %s", e)
+
+    def _flush_pending_checkpoint_reports(self, job_id: str):
+        """Hardening F: 见 _persist_pending_report. 在下次成功 progress 时尝试重发."""
+        try:
+            d = self._pending_dir()
+            files = sorted(d.glob(f"{job_id}__*.json"))
+            for f in files:
+                try:
+                    with open(f, "r", encoding="utf-8") as fp:
+                        payload = json.load(fp)
+                    url = f"{self.server_url}/api/training/jobs/{job_id}/progress"
+                    r = self.client.post(url, json=payload)
+                    if r.status_code in (200, 409):
+                        f.unlink()
+                        logger.info("[F] Flushed pending report %s (status=%d)", f.name, r.status_code)
+                    else:
+                        logger.warning("[F] Flush returned %d, keeping %s", r.status_code, f.name)
+                except Exception as e:
+                    logger.warning("[F] Flush failed for %s: %s", f, e)
+        except Exception as e:
+            logger.debug("[F] Flush sweep error: %s", e)
+
     def _report_status(self, job_id: str, status: str,
-                       error_msg: str = None, model_path: str = None):
+                       error_msg: str = None, model_path: str = None,
+                       checkpoints: list = None):
         url = f"{self.server_url}/api/training/jobs/{job_id}/status"
         data = {"status": status, "key": self.pairing_key}
         if error_msg:
             data["error_msg"] = error_msg
         if model_path:
             data["model_path"] = model_path
+        if checkpoints:
+            # 通过 status 通道随状态一起持久化 checkpoint 列表
+            # （progress 通道在 cancelled/paused 时会被 server 409 拒收）
+            data["checkpoints"] = checkpoints
         # 关键状态 (completed/failed/cancelled) 失败时重试
         is_terminal = status in ("completed", "failed", "cancelled")
         max_retries = 5 if is_terminal else 1
@@ -1261,6 +1332,66 @@ class TrainingWorker:
                     time.sleep(wait)
                 else:
                     logger.error("Status report FAILED after %d retries: %s", max_retries, e)
+
+    def _upload_model_artifact(self, job_id: str, model_dir: str):
+        """Hardening E: 训练完成后把模型 tar.gz 推到 server.
+
+        打包 model_dir/checkpoints/last/pretrained_model/ (LeRobot 标准产物);
+        若不存在则退化为整个 model_dir. 计算 sha256, 通过 multipart 上传到
+        /api/training/jobs/{job_id}/upload-model. 失败仅警告 (训练已完成 status
+        已 commit, 不影响主流程).
+        """
+        import hashlib
+        import tarfile
+        import tempfile
+        from pathlib import Path
+
+        m = Path(model_dir)
+        if not m.exists():
+            logger.warning("[E] model_dir 不存在, 跳过上传: %s", model_dir)
+            return
+        # LeRobot 标准产物目录
+        canonical = m / "checkpoints" / "last" / "pretrained_model"
+        target = canonical if canonical.exists() else m
+
+        # 打包到临时文件
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with tarfile.open(tmp_path, "w:gz") as tar:
+                tar.add(str(target), arcname="model")
+            size = Path(tmp_path).stat().st_size
+            # sha256
+            h = hashlib.sha256()
+            with open(tmp_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            sha = h.hexdigest()
+            logger.info("[E] Model packed: %s → %.1f MB sha=%s",
+                        target, size / 1024 / 1024, sha[:12])
+
+            # multipart 上传
+            url = f"{self.server_url}/api/training/jobs/{job_id}/upload-model"
+            with open(tmp_path, "rb") as f:
+                files = {"file": (f"{job_id}.tar.gz", f, "application/gzip")}
+                fields = {"sha256": sha}
+                # httpx 支持 data + files
+                r = self.client.post(
+                    url,
+                    files=files,
+                    data=fields,
+                    headers={"X-Pairing-Key": self.pairing_key or ""},
+                    timeout=600.0,  # 大模型可能上传几分钟
+                )
+            if r.status_code == 200:
+                logger.info("[E] Model uploaded to server: job=%s size=%d", job_id, size)
+            else:
+                logger.warning("[E] Upload returned %d: %s", r.status_code, r.text[:200])
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
 
 
 def _resolve_hf_cache_path(repo_id: str) -> str | None:
@@ -1577,13 +1708,19 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             r = client.get(f"/api/training/jobs/{job_id}/check-inference")
             if r.status_code == 200:
                 data = r.json()
-                if not data.get("running", True):
-                    logger.info("推理已被 Server 停止")
-                    return True
-                # 检查机械臂是否离线
-                if not data.get("arm_online", True):
-                    logger.warning("机械臂离线，自动停止推理")
-                    return True
+                # v1.0+ 单源信号 should_stop + stop_reason; 老 server 没这字段时回退到 running/arm_online
+                if "should_stop" in data:
+                    if data.get("should_stop"):
+                        logger.info("推理停止 (reason=%s)", data.get("stop_reason") or "unknown")
+                        return True
+                else:
+                    # 旧 server 兼容路径
+                    if not data.get("running", True):
+                        logger.info("推理已被 Server 停止")
+                        return True
+                    if not data.get("arm_online", True):
+                        logger.warning("机械臂离线，自动停止推理")
+                        return True
         except Exception:
             pass
         return False

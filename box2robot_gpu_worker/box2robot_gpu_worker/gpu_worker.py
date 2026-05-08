@@ -375,6 +375,10 @@ class GPUWorker:
         # 保留 attribute 以防 _process_job 等老代码引用; 实际逻辑迁移到 _slots.
         self._active_job_id: str = ""
 
+        # Hardening H: 心跳里 server 下发的 should_stop_jobs (set of job_id 字符串).
+        # 由 _heartbeat 维护; 当前主要做日志/调试用 (实际 stop 走 progress→409 通道).
+        self._h_stop_set: set = set()
+
     def run(self):
         """Main loop: activate → wait for bind → poll jobs → train."""
         # Step 0: 完整启动自检 — 依赖 + GPU + 磁盘 + 网络 + 写入权限
@@ -459,7 +463,8 @@ class GPUWorker:
 
     def _activate(self) -> dict:
         try:
-            payload = {**self.hw_info, "fw_version": WORKER_VERSION}
+            from box2robot_gpu_worker.protocol import API_VERSION as _API_VERSION
+            payload = {**self.hw_info, "fw_version": WORKER_VERSION, "api_version": _API_VERSION}
             r = self.client.post(f"{self.server_url}/api/gpu/activate", json=payload)
             r.raise_for_status()
             return r.json()
@@ -848,7 +853,10 @@ class GPUWorker:
         if "disk_free_gb" in usage:
             self.hw_info["disk_free_gb"] = usage.pop("disk_free_gb")
 
+        # api_version: v1.0+ 协议版本声明 (见 protocol.py); 老 server 会忽略
+        from box2robot_gpu_worker.protocol import API_VERSION as _API_VERSION
         payload = {
+            "api_version": _API_VERSION,
             "device_id": self.device_id,
             "token": self.token,
             "fw_version": WORKER_VERSION,
@@ -871,6 +879,29 @@ class GPUWorker:
                     body = r.json()
                     if isinstance(body, dict) and "config" in body:
                         self._apply_config(body["config"], source="heartbeat")
+                    # Hardening H: server 对账下发"该停的 job 列表".
+                    # 实际停止信号仍走 progress→409 (worker.py progress_cb 已处理).
+                    # 这里维护一个 stop set, 一是日志/告警, 二是清理已经死掉的 slot 占位.
+                    stop_list = body.get("should_stop_jobs") if isinstance(body, dict) else None
+                    if isinstance(stop_list, list) and stop_list:
+                        stop_ids = {item.get("job_id", "") for item in stop_list
+                                    if isinstance(item, dict)}
+                        self._h_stop_set = stop_ids  # 公开给其他模块/调试用
+                        with self._slots_lock:
+                            for jid in list(self._slots.keys()):
+                                if jid not in stop_ids:
+                                    continue
+                                slot = self._slots.get(jid)
+                                thread = slot.get("thread") if isinstance(slot, dict) else None
+                                if thread is not None and not thread.is_alive():
+                                    # 线程已死但 slot 没清 → 直接清掉, 释放 vram 配额
+                                    self._slots.pop(jid, None)
+                                    logger.warning("[H-RECONCILE] Cleaned dead slot for job=%s "
+                                                   "(server says terminal, thread dead)", jid)
+                                else:
+                                    # 线程还活着: progress 通道已经会让它停, 这里只告警
+                                    logger.warning("[H-RECONCILE] Server says job=%s is terminal, "
+                                                   "waiting for slot thread to exit via progress 409", jid)
                 except Exception:
                     pass
         except Exception as e:
@@ -1031,17 +1062,15 @@ class GPUWorker:
                 worker.process_job(job_id, resume_from_step=resume_from_step)
         except KeyboardInterrupt:
             logger.info("训练被手动中断 (Ctrl+C): %s", job_id)
-            # 扫描已保存的 checkpoints，上报给 server
-            model_dir = str(self.output_dir / job_id / "model")
+            # 扫描已保存的 checkpoints，上报给 server (用绝对路径)
+            model_dir = str((self.output_dir / job_id / "model").resolve())
             from box2robot_gpu_worker.worker import TrainingWorker
             ckpts = TrainingWorker._scan_checkpoints(model_dir)
-            if ckpts:
-                # 上报 checkpoint 列表
-                self._report_progress(job_id, ckpts[-1], job.get("train_steps", 0),
-                                      {"checkpoints": ckpts, "log": f"训练中断，已保存 {len(ckpts)} 个 checkpoint"})
+            # 通过 status 通道一并上报 checkpoint 列表 (progress 通道在 cancelled 后会 409)
             self._report_status(job_id, "cancelled",
                                 error_msg=f"Worker 手动停止 (已保存 {len(ckpts)} 个 checkpoint)" if ckpts else "Worker 手动停止",
-                                model_path=model_dir if ckpts else None)
+                                model_path=model_dir if ckpts else None,
+                                checkpoints=ckpts or None)
             raise  # 继续向上传播，退出 worker
         # _slot_runner finally 已 pop 掉 _slots 里的条目 + 主循环心跳已上报新 list,
         # 不需要在这里管 _active_job_id / bg_heartbeat.
@@ -1057,7 +1086,15 @@ class GPUWorker:
 
         model_path = job.get("model_path", "")
         if not model_path:
-            model_path = str(self.output_dir / job["id"] / "model")
+            model_path = str((self.output_dir / job["id"] / "model").resolve())
+
+        # 路径不存在时的兜底: DB 里可能存的是相对路径 (老 worker 写入)，或者来自其他 worker。
+        # 用本机 output_dir 重建一次绝对路径，能救回本机已训好的模型。
+        if not Path(model_path).exists():
+            fallback = (self.output_dir / job["id"] / "model").resolve()
+            if fallback.exists():
+                logger.warning("model_path 不存在 (%s)，回退到本机 output_dir: %s", model_path, fallback)
+                model_path = str(fallback)
 
         # 如果指定了 checkpoint_step, 定位到具体的 checkpoint 目录
         if checkpoint_step is not None:
@@ -1069,7 +1106,8 @@ class GPUWorker:
                 logger.warning("Checkpoint %d 不存在, 使用默认模型路径", checkpoint_step)
 
         if not Path(model_path).exists():
-            logger.error("模型不存在: %s", model_path)
+            logger.error("模型不存在: %s (job=%s, output_dir=%s)",
+                         model_path, job["id"], self.output_dir.resolve())
             # 推理部署阶段模型缺失 → 训练成果完好, 仅本次部署失败
             # 必须用 "completed" 而非 "failed", 否则训练任务会被永久标记为失败
             self._report_status(job["id"], "completed",
@@ -1147,13 +1185,16 @@ class GPUWorker:
             except Exception:
                 pass
 
-    def _report_status(self, job_id: str, status: str, error_msg: str = None, model_path: str = None):
+    def _report_status(self, job_id: str, status: str, error_msg: str = None,
+                       model_path: str = None, checkpoints: list = None):
         try:
             data = {"status": status, "key": ""}
             if error_msg:
                 data["error_msg"] = error_msg
             if model_path:
                 data["model_path"] = model_path
+            if checkpoints:
+                data["checkpoints"] = checkpoints
             self.client.post(f"{self.server_url}/api/training/jobs/{job_id}/status", json=data)
         except Exception:
             pass
