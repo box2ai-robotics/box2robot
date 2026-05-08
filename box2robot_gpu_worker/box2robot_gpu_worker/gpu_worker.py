@@ -1350,8 +1350,10 @@ def main():
     # 默认 (无子命令) 跑 daemon — 保持原行为, 向下兼容
     parser.add_argument("--server", "-s", type=str, default="https://robot.box2ai.com",
                         help="Server URL (default: https://robot.box2ai.com)")
-    parser.add_argument("--output", "-o", type=str, default="outputs",
-                        help="Output directory for models")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="Output directory for models. 默认自动选: 若 /root/autodl-fs "
+                             "(共享网盘) 存在就用它的 box2robot-outputs/pool-default/, "
+                             "否则用 cwd 下 outputs/. 共享盘的好处是跨 worker 部署推理也能找到模型.")
     parser.add_argument("--hf-cache", type=str, default=None,
                         help="HuggingFace cache 目录 (例: /root/autodl-tmp/.cache). "
                              "默认自动检测 AutoDL 数据盘, 否则用 ~/.cache/huggingface. "
@@ -1388,7 +1390,26 @@ def main():
     if not args.no_version_check:
         _passive_version_check()
 
-    worker = GPUWorker(args.server, args.output)
+    # 自动选择 output_dir: 优先共享网盘 (autodl-fs / 类似挂载点), 否则 cwd outputs/.
+    # 共享盘 = 同一 AutoDL 账号的多台实例共享, 跨机器推理部署也能读到模型.
+    output_dir = args.output
+    if not output_dir:
+        SHARED_CANDIDATES = [
+            "/root/autodl-fs/box2robot-outputs/pool-default",  # AutoDL 共享盘 (主流)
+            "/mnt/box2robot-outputs/pool-default",             # 通用 NFS 挂载点
+        ]
+        for cand in SHARED_CANDIDATES:
+            parent = Path(cand).parent
+            if parent.exists() and parent.is_dir():
+                output_dir = cand
+                logger.info("[OUTPUT] 自动选择共享盘: %s", output_dir)
+                break
+        if not output_dir:
+            output_dir = "outputs"
+            logger.warning("[OUTPUT] 未检测到共享盘, 用 cwd-相对 outputs/. "
+                           "跨 worker 推理可能找不到模型. 推荐显式 --output 到共享路径.")
+
+    worker = GPUWorker(args.server, output_dir)
     worker.run()
 
 
