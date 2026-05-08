@@ -408,6 +408,10 @@ class GPUWorker:
         # 由 _heartbeat 维护; 当前主要做日志/调试用 (实际 stop 走 progress→409 通道).
         self._h_stop_set: set = set()
 
+        # OTA: 防 60s 一次重复下载升级包. 进程内 WORKER_VERSION 是导入时常量,
+        # pip install 后不会变 → 用 _installed_version 跟踪本进程"已经安装过的最新版本".
+        self._installed_version: str = WORKER_VERSION
+
     def run(self):
         """Main loop: activate → wait for bind → poll jobs → train."""
         # Step 0: 完整启动自检 — 依赖 + GPU + 磁盘 + 网络 + 写入权限
@@ -937,27 +941,56 @@ class GPUWorker:
             logger.warning("Heartbeat failed: %s", e)
 
     def _check_upgrade(self):
-        """Check server for new Worker version."""
+        """Check server for new Worker version.
+
+        防重复升级: pip install 之后 WORKER_VERSION 常量在当前进程不变 (没 reload),
+        每 60s 心跳都会被 server 判定"新版本可用"并重复 download+install. 我们额外:
+          - 维护 self._installed_version (本进程已 pip install 过的版本)
+          - 检查 site-packages 里 box2robot_gpu_worker/__init__.py 的 __version__
+        两条任一已等于服务器最新版 → 跳过, 仅等待 os.execv 重启加载.
+        """
         try:
+            # 优先用上次安装记录的版本号判断
+            current = getattr(self, "_installed_version", None) or WORKER_VERSION
             r = self.client.get(f"{self.server_url}/api/gpu/upgrade/check", params={
-                "current_version": WORKER_VERSION,
+                "current_version": current,
                 "device_id": self.device_id,
                 "token": self.token,
             })
             r.raise_for_status()
             data = r.json()
-            if data.get("available"):
-                new_ver = data.get("version", "?")
-                changelog = data.get("changelog", "")
-                size = data.get("size", 0)
-                logger.info("=" * 40)
-                logger.info("发现新版本: v%s → v%s (%d KB)",
-                             WORKER_VERSION, new_ver, size // 1024)
-                if changelog:
-                    logger.info("更新日志: %s", changelog)
-                self._apply_upgrade(data)
+            if not data.get("available"):
+                return
+            new_ver = data.get("version", "?")
+            # 二次防御: 读 site-packages 里实际装的版本, 跟 server 最新对比
+            installed_on_disk = self._read_installed_version_on_disk()
+            if installed_on_disk == new_ver:
+                self._installed_version = installed_on_disk
+                logger.debug("[OTA] 磁盘已是 v%s, 等待空闲重启加载, 跳过下载.", new_ver)
+                self._maybe_restart_after_upgrade(new_ver=new_ver)  # 空闲就 execv, 有活跃任务就 noop
+                return
+            changelog = data.get("changelog", "")
+            size = data.get("size", 0)
+            logger.info("=" * 40)
+            logger.info("发现新版本: v%s → v%s (%d KB)",
+                         current, new_ver, size // 1024)
+            if changelog:
+                logger.info("更新日志: %s", changelog)
+            self._apply_upgrade(data)
         except Exception:
             pass  # Silently skip if server unreachable
+
+    def _read_installed_version_on_disk(self) -> str:
+        """读 site-packages 里 __init__.py 的 __version__, 不 import 不 reload."""
+        try:
+            import box2robot_gpu_worker as _pkg
+            init_file = Path(_pkg.__file__).resolve()
+            text = init_file.read_text(encoding="utf-8")
+            import re
+            m = re.search(r'__version__\s*=\s*["\']([\d.]+)["\']', text)
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
 
     def _apply_upgrade(self, info: dict):
         """Download and apply upgrade package."""
@@ -1000,6 +1033,8 @@ class GPUWorker:
                         if result.returncode == 0:
                             installed_ver = info.get("version", "?")
                             logger.info("升级安装成功 (v%s)", installed_ver)
+                            # 记下来, 让 _check_upgrade 下次心跳判 "已经装过这个版本" 不再重复下载
+                            self._installed_version = installed_ver
                             self._maybe_restart_after_upgrade(new_ver=installed_ver)
                         else:
                             logger.error("升级安装失败: %s", result.stderr[:200])
