@@ -614,6 +614,9 @@ class TrainingWorker:
             "print('[PREFLIGHT-DRACCUS] cfg.rename_map =', json.dumps(cfg.rename_map))",
         ])
         env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        env.setdefault("HF_DATASETS_OFFLINE", "1")
         if lerobot_src.exists():
             old_pp = env.get("PYTHONPATH", "")
             sep = ";" if _os.name == "nt" else ":"
@@ -758,7 +761,10 @@ class TrainingWorker:
         - bfloat16 dtype + gradient checkpointing for memory efficiency
         - Frozen vision encoder + expert-only training (configurable)
         """
+        import hashlib as _hashlib
+        import os as _os
         import subprocess
+        import shutil as _shutil
         from box2robot_gpu_worker.convert import convert
 
         is_vla = model_type in self.VLA_MODELS
@@ -767,22 +773,108 @@ class TrainingWorker:
         # 仅在 fingerprint 缺失 (旧调用路径) 时退回用 trajectories.id 现算.
         if not ds_fingerprint:
             ds_fingerprint = self._ds_fingerprint([t.get("id", "") for t in trajectories])
-        # === 下载 cache 共享 (按 fp), LeRobot dataset 每 job 独立 ===
-        # 共享: cache/ds_<fp>/  -- 同 fp 多 job 共享原始下载 (节流量, multi-slot lock 串行下载)
-        # 独立: datasets/<repo>/ -- 每 job 一份转换好的 dataset, 同数据集跑不同 model 互不影响
-        #       stats.json (pi05 quantile augment 不污染另一 job)
+        # === 下载 cache 共享 (按 fp), LeRobot dataset 按稳定变体共享 ===
+        # 原始下载缓存: cache/ds_<fp>/
+        # 转换后 dataset: datasets/box2robot-<fp>-<storage>-f<fps>-t<task_hash>/
+        # 注意 task 会写入 LeRobot dataset, 所以 task 不同必须分开缓存.
         ds_cache_dir = Path(__file__).parent.parent / "cache" / f"ds_{ds_fingerprint}"
         ds_dir = ds_cache_dir / "dataset"
         img_dir = ds_cache_dir / "images"
-        # job_id 从 model_dir 解析 (model_dir = outputs/<job_id>/model)
-        job_id_for_ds = Path(model_dir).parent.name
-        # repo_id 含 job_id 前缀 + fp 后缀, 既可读又确保 multi-slot 同 fp 不冲突
-        repo_id = f"box2robot-{job_id_for_ds}-{ds_fingerprint[:8]}"
 
-        # Step 1: Convert to LeRobot format (per-job 目录, 同 dataset 多 job 各保一份)
+        # Step 1: Convert to LeRobot format
         has_images = img_dir.is_dir() and any(img_dir.iterdir())
+        task_description = str(custom_params.get("task") or "manipulation task")
+
+        def _bool_data_param(*keys: str, default: str = "false") -> bool:
+            for key in keys:
+                value = custom_params.get(key)
+                if value not in (None, ""):
+                    return str(value).lower() in ("true", "1", "yes", "on")
+            return str(default).lower() in ("true", "1", "yes", "on")
+
+        use_videos = has_images and _bool_data_param(
+            "use_videos",
+            "dataset_use_videos",
+            default=_os.environ.get("B2R_USE_VIDEOS", "true"),
+        )
+        video_codec = str(
+            custom_params.get("video_codec")
+            or custom_params.get("dataset_video_codec")
+            or _os.environ.get("B2R_VIDEO_CODEC", "h264")
+        )
+        video_backend = (
+            custom_params.get("video_backend")
+            or custom_params.get("dataset_video_backend")
+            or _os.environ.get("B2R_VIDEO_BACKEND")
+            or ("pyav" if use_videos else "")
+        )
+        video_backend = str(video_backend) if video_backend else None
+        fps = 20
+        storage_key = f"video-{video_codec.lower()}" if use_videos else "image"
+        storage_key = "".join(c if c.isalnum() else "-" for c in storage_key).strip("-")
+        task_hash = _hashlib.md5(task_description.encode("utf-8")).hexdigest()[:8]
+        repo_id = f"box2robot-{ds_fingerprint[:8]}-{storage_key}-f{fps}-t{task_hash}"
         datasets_root = Path(__file__).parent.parent / "datasets" / repo_id
         dataset_marker = datasets_root / "meta" / "info.json"
+
+        def _compatible_legacy_dataset(candidate: Path) -> bool:
+            info_path = candidate / "meta" / "info.json"
+            if not info_path.is_file():
+                return False
+            try:
+                with open(info_path) as f:
+                    info = json.load(f)
+                if int(info.get("fps", fps)) != fps:
+                    return False
+                visual = (info.get("features") or {}).get(self.DATASET_VISION_KEY)
+                if has_images:
+                    if not visual:
+                        return False
+                    if use_videos:
+                        vinfo = visual.get("info") or {}
+                        if visual.get("dtype") != "video":
+                            return False
+                        if str(vinfo.get("video.codec", "")).lower() != video_codec.lower():
+                            return False
+                    elif visual.get("dtype") != "image":
+                        return False
+                tasks_path = candidate / "meta" / "tasks.parquet"
+                if tasks_path.is_file():
+                    import pandas as _pd
+                    tasks = _pd.read_parquet(tasks_path)
+                    task_values = {str(x) for x in list(tasks.index)}
+                    if "task" in tasks.columns:
+                        task_values.update(str(x) for x in tasks["task"].dropna().tolist())
+                    if task_description not in task_values:
+                        return False
+                return True
+            except Exception as e:
+                logger.warning("[CACHE] legacy dataset compatibility check failed for %s: %s", candidate, e)
+                return False
+
+        def _link_compatible_legacy_dataset() -> bool:
+            datasets_parent = datasets_root.parent
+            # 兼容旧命名: box2robot-<job_id>-<fp8>
+            legacy_pattern = f"box2robot-*-{ds_fingerprint[:8]}"
+            for candidate in sorted(datasets_parent.glob(legacy_pattern),
+                                    key=lambda p: p.stat().st_mtime,
+                                    reverse=True):
+                if candidate == datasets_root or not candidate.is_dir():
+                    continue
+                if not _compatible_legacy_dataset(candidate):
+                    continue
+                if datasets_root.exists() or datasets_root.is_symlink():
+                    return dataset_marker.exists()
+                try:
+                    datasets_root.symlink_to(candidate, target_is_directory=True)
+                    logger.info("[CACHE MIGRATE] linked stable dataset %s -> %s", datasets_root, candidate)
+                except Exception as e:
+                    logger.warning("[CACHE MIGRATE] symlink failed (%s), copying %s -> %s",
+                                   e, candidate, datasets_root)
+                    _shutil.copytree(candidate, datasets_root, symlinks=True)
+                    logger.info("[CACHE MIGRATE] copied stable dataset %s from %s", datasets_root, candidate)
+                return dataset_marker.exists()
+            return False
 
         # VLA models require camera images
         if is_vla and not has_images:
@@ -801,17 +893,28 @@ class TrainingWorker:
                 logger.info("[CACHE HIT] LeRobot dataset %s 已存在, 跳过转换", repo_id)
                 if progress_cb:
                     progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
+            elif _link_compatible_legacy_dataset():
+                logger.info("[CACHE HIT] LeRobot dataset %s 由旧缓存迁移命中, 跳过转换", repo_id)
+                if progress_cb:
+                    progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
             else:
-                logger.info("Converting to LeRobot format (vision=%s)...", has_images)
+                logger.info(
+                    "Converting to LeRobot format (vision=%s, videos=%s, codec=%s)...",
+                    has_images,
+                    use_videos,
+                    video_codec,
+                )
                 if progress_cb:
                     progress_cb(0, train_steps, {"phase": "converting", "message": "转换为 LeRobot 数据集格式..."})
                 convert(
                     input_path=ds_dir,
                     repo_id=repo_id,
-                    task_description=custom_params.get("task", "manipulation task"),
-                    fps=20,
+                    task_description=task_description,
+                    fps=fps,
                     images_dir=img_dir if has_images else None,
                     root=datasets_root,
+                    use_videos=use_videos,
+                    video_codec=video_codec,
                 )
             logger.info("LeRobot dataset ready: %s", datasets_root)
 
@@ -852,18 +955,46 @@ class TrainingWorker:
                     "或确保 box2robot_gpu_worker/lerobot/ 子目录完整。"
                 )
 
+        def _int_train_param(*keys: str, default: int) -> int:
+            for key in keys:
+                value = custom_params.get(key)
+                if value not in (None, ""):
+                    return int(value)
+            return int(default)
+
+        num_workers = _int_train_param(
+            "num_workers",
+            "dataloader_num_workers",
+            default=int(_os.environ.get("B2R_NUM_WORKERS", "4")),
+        )
+        num_workers = max(0, num_workers)
+        prefetch_factor = _int_train_param("prefetch_factor", default=4)
+        persistent_workers = str(custom_params.get("persistent_workers", "true")).lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        )
+
         cmd += [
             f"--dataset.repo_id={repo_id}",
             f"--dataset.root={datasets_root}",
             f"--steps={train_steps}",
             f"--batch_size={batch_size}",
-            f"--num_workers=0",
+            f"--num_workers={num_workers}",
             f"--output_dir={model_dir}",
             "--policy.push_to_hub=false",
             "--wandb.enable=false",
             f"--save_freq={max(100, min(5000, train_steps // 5))}",
             "--log_freq=1",
         ]
+        if use_videos and video_backend:
+            cmd.append(f"--dataset.video_backend={video_backend}")
+        if num_workers > 0:
+            cmd += [
+                f"--prefetch_factor={prefetch_factor}",
+                f"--persistent_workers={str(persistent_workers).lower()}",
+            ]
 
         if is_vla:
             # VLA: fine-tune from pretrained base
@@ -1048,6 +1179,10 @@ class TrainingWorker:
                          "freeze_vision_encoder", "train_expert_only", "train_state_proj",
                          "compile_model", "override_chunk_size", "rename_map",
                          "normalization_mapping",
+                         "num_workers", "dataloader_num_workers", "prefetch_factor",
+                         "persistent_workers",
+                         "use_videos", "dataset_use_videos", "video_codec",
+                         "dataset_video_codec", "video_backend", "dataset_video_backend",
                          # chunk_size / n_action_steps / horizon 在主分支已处理 (传 server
                          # 选定的统一值), 不再从 custom_params 透传以免重复
                          "chunk_size", "n_action_steps", "horizon",
@@ -1074,6 +1209,17 @@ class TrainingWorker:
         # base 模型 (pi05_base ~14GB) 只在 cache 第一次下载, 之后训练/推理共用.
         _hf_home = train_env.get("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
         logger.info("[HF_HOME] subprocess 继承: %s (base 模型缓存共享)", _hf_home)
+        # 只设置 HF_HOME 不等于离线: transformers/huggingface_hub 仍可能为了
+        # tokenizer metadata 调 model_info(). GPU 节点无外网时必须让子进程硬走本地缓存.
+        train_env.setdefault("HF_HUB_OFFLINE", "1")
+        train_env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        train_env.setdefault("HF_DATASETS_OFFLINE", "1")
+        logger.info(
+            "[HF_OFFLINE] HF_HUB_OFFLINE=%s TRANSFORMERS_OFFLINE=%s HF_DATASETS_OFFLINE=%s",
+            train_env.get("HF_HUB_OFFLINE"),
+            train_env.get("TRANSFORMERS_OFFLINE"),
+            train_env.get("HF_DATASETS_OFFLINE"),
+        )
         if lerobot_src.exists():
             # 本地子目录优先：把 lerobot/src 注入 PYTHONPATH, 让 -m 解析到本地包
             old_pp = train_env.get("PYTHONPATH", "")
@@ -1194,7 +1340,7 @@ class TrainingWorker:
             "lerobot_checkpoint": str(ckpt_dir),
             "chunk_size": chunk_size,
             "n_servos": len(trajectories[0]["frames"][0]["positions"]) if trajectories else 6,
-            "task_description": custom_params.get("task", "manipulation task"),
+            "task_description": task_description,
         }
         with open(config_path, "w") as f:
             _json.dump(inference_config, f, indent=2)
@@ -1474,6 +1620,42 @@ def _resolve_hf_cache_path(repo_id: str) -> str | None:
     return str(snapshot_dir)
 
 
+def _resolve_hf_snapshot_path(repo_id: str, required_files: tuple[str, ...] = ()) -> str | None:
+    """返回 HF cache snapshot 路径，不要求权重文件，用于 tokenizer/processor 等轻量资源."""
+    import os as _os
+    if "/" not in repo_id:
+        return str(repo_id) if _os.path.isdir(repo_id) else None
+    if _os.path.isdir(repo_id):
+        path = Path(repo_id)
+        if all((path / f).is_file() for f in required_files):
+            return str(path)
+        return None
+
+    hf_home = _os.environ.get("HF_HOME") or _os.path.expanduser("~/.cache/huggingface")
+    org, name = repo_id.split("/", 1)
+    repo_dir = Path(hf_home) / "hub" / f"models--{org}--{name}"
+    if not repo_dir.is_dir():
+        return None
+
+    ref_file = repo_dir / "refs" / "main"
+    snapshot_dir = None
+    if ref_file.is_file():
+        candidate = repo_dir / "snapshots" / ref_file.read_text().strip()
+        if candidate.is_dir():
+            snapshot_dir = candidate
+    if snapshot_dir is None:
+        snapshots_root = repo_dir / "snapshots"
+        if snapshots_root.is_dir():
+            snaps = [d for d in snapshots_root.iterdir() if d.is_dir()]
+            if snaps:
+                snapshot_dir = sorted(snaps, key=lambda p: p.stat().st_mtime)[-1]
+    if snapshot_dir is None:
+        return None
+    if required_files and not all((snapshot_dir / f).is_file() for f in required_files):
+        return None
+    return str(snapshot_dir)
+
+
 def run_inference_server(model_dir: str, server_url: str, device_id: str,
                          token: str = "", pos_max: int = 4095, fps: int = 20,
                          camera_id: str = "", chunk_size: int = 20,
@@ -1493,10 +1675,25 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
 
     ACT/Diffusion/VLA: lerobot policy 原生 chunk 输出 (chunk_size actions per inference)
     """
+    import os as _os
     import io
     import numpy as np
     import torch
     from PIL import Image
+
+    # 推理路径在 worker 主进程内加载 VLA processor/tokenizer, 不经过训练 subprocess.
+    # 只设置 HF_HOME 不会阻止 transformers/huggingface_hub 查 model_info(), 离线节点会炸.
+    _hf_home = _os.environ.get("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    _os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    logger.info(
+        "[HF_OFFLINE] inference HF_HOME=%s HF_HUB_OFFLINE=%s TRANSFORMERS_OFFLINE=%s HF_DATASETS_OFFLINE=%s",
+        _hf_home,
+        _os.environ.get("HF_HUB_OFFLINE"),
+        _os.environ.get("TRANSFORMERS_OFFLINE"),
+        _os.environ.get("HF_DATASETS_OFFLINE"),
+    )
 
     logger.info("Loading model from %s", model_dir)
     # b2r_config.json 总是落在顶层 model_dir/ 下 (worker 训练时写). 但 model_dir 实参
@@ -1672,9 +1869,24 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     if is_vla:
         try:
             from lerobot.policies import make_pre_post_processors
+            preprocessor_overrides = {}
+            local_tokenizer = _resolve_hf_snapshot_path(
+                "google/paligemma-3b-pt-224",
+                required_files=("tokenizer.json", "tokenizer_config.json"),
+            )
+            if local_tokenizer:
+                preprocessor_overrides["tokenizer_processor"] = {
+                    "tokenizer_name": local_tokenizer,
+                }
+                logger.info("VLA tokenizer resolved from local HF cache: %s", local_tokenizer)
+            else:
+                logger.warning(
+                    "VLA tokenizer local cache not found; tokenizer_processor will use its saved tokenizer_name"
+                )
             _vla_pre, _vla_post = make_pre_post_processors(
                 policy_cfg=model.config,
                 pretrained_path=ckpt_path,
+                preprocessor_overrides=preprocessor_overrides,
             )
             logger.info("VLA preprocessor/postprocessor loaded from %s", ckpt_path)
             # === 检查点 2: dump preprocessor steps + normalizer stats shape ===
