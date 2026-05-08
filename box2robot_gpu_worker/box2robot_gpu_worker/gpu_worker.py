@@ -29,6 +29,35 @@ logging.getLogger("lerobot.datasets.video_utils").setLevel(logging.WARNING)  # t
 logger = logging.getLogger("b2r-gpu")
 
 
+def _setup_file_logging() -> None:
+    """无论交互式启动还是 nohup, 都把 b2r-gpu 日志落到 ~/.b2r-gpu/worker.log
+    (10MB × 5 滚转), 方便事后通过 cloud manager SSH 查看. 不影响 stdout."""
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_dir = Path.home() / ".b2r-gpu"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "worker.log"
+        handler = RotatingFileHandler(
+            str(log_file), maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
+        # 加到 root, 这样所有子 logger (b2r-gpu / b2r / lerobot 等) 都会写入
+        root = logging.getLogger()
+        # 防止重复添加 (b2r-gpu 进程被 reload 时)
+        already = any(getattr(h, "_b2r_file_log", False) for h in root.handlers)
+        if not already:
+            handler._b2r_file_log = True  # type: ignore[attr-defined]
+            root.addHandler(handler)
+            logger.info("[LOG] file logging → %s", log_file)
+    except Exception as e:
+        # 文件 log 失败不影响主流程, 只是少了一个排错手段
+        logger.warning("[LOG] file logging setup failed: %s", e)
+
+
+_setup_file_logging()
+
+
 def get_hw_info() -> dict:
     """Collect local hardware information (static specs)."""
     info = {
@@ -1097,13 +1126,21 @@ class GPUWorker:
                 model_path = str(fallback)
 
         # 如果指定了 checkpoint_step, 定位到具体的 checkpoint 目录
+        # LeRobot v3 用 6 位零填充目录名 (e.g. checkpoints/000200/), 老格式是 str(step).
+        # 两种都试一遍, 兼容历史数据.
         if checkpoint_step is not None:
-            ckpt_subdir = Path(model_path) / "checkpoints" / str(checkpoint_step) / "pretrained_model"
-            if ckpt_subdir.exists():
+            ckpt_root = Path(model_path) / "checkpoints"
+            candidates = [
+                ckpt_root / f"{int(checkpoint_step):06d}" / "pretrained_model",
+                ckpt_root / str(checkpoint_step) / "pretrained_model",
+            ]
+            ckpt_subdir = next((c for c in candidates if c.exists()), None)
+            if ckpt_subdir is not None:
                 logger.info("使用 checkpoint step %d: %s", checkpoint_step, ckpt_subdir)
                 model_path = str(ckpt_subdir)
             else:
-                logger.warning("Checkpoint %d 不存在, 使用默认模型路径", checkpoint_step)
+                logger.warning("Checkpoint %d 不存在 (试过 %s), 使用默认模型路径",
+                               checkpoint_step, [str(c) for c in candidates])
 
         if not Path(model_path).exists():
             logger.error("模型不存在: %s (job=%s, output_dir=%s)",

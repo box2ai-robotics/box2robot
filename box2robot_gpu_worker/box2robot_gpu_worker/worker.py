@@ -978,14 +978,21 @@ class TrainingWorker:
                     self._add_policy_param(cmd, model_type, "temporal_ensemble_coeff", 0.01)
 
         # Resume from checkpoint (暂停后恢复训练)
+        # LeRobot v3 用 6 位零填充目录名 (000200), 老格式是 str(step). 两种都试.
         if resume_from_step:
-            ckpt_path = Path(model_dir) / "checkpoints" / str(resume_from_step)
-            if ckpt_path.exists():
+            ckpt_root = Path(model_dir) / "checkpoints"
+            candidates = [
+                ckpt_root / f"{int(resume_from_step):06d}",
+                ckpt_root / str(resume_from_step),
+            ]
+            ckpt_path = next((c for c in candidates if c.exists()), None)
+            if ckpt_path is not None:
                 cmd.append("--resume=true")
                 cmd.append(f"--checkpoint_path={ckpt_path}")
                 logger.info("Resuming from checkpoint: %s (step %d)", ckpt_path, resume_from_step)
             else:
-                logger.warning("Checkpoint %s not found, training from scratch", ckpt_path)
+                logger.warning("Checkpoint step %d not found in %s, training from scratch",
+                               resume_from_step, ckpt_root)
         # === PEFT (LoRA) 处理 — 顶层 --peft.* 命名空间, 不是 --policy.* ===
         # lerobot 的 PEFT 通过顶层 PeftConfig 配置 (lerobot/configs/default.py:PeftConfig).
         # 默认 None (不启用); 一旦传任意 --peft.xxx 字段, lerobot 自动 wrap policy with PEFT.
