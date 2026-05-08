@@ -761,8 +761,10 @@ class TrainingWorker:
         - bfloat16 dtype + gradient checkpointing for memory efficiency
         - Frozen vision encoder + expert-only training (configurable)
         """
+        import hashlib as _hashlib
         import os as _os
         import subprocess
+        import shutil as _shutil
         from box2robot_gpu_worker.convert import convert
 
         is_vla = model_type in self.VLA_MODELS
@@ -771,22 +773,17 @@ class TrainingWorker:
         # 仅在 fingerprint 缺失 (旧调用路径) 时退回用 trajectories.id 现算.
         if not ds_fingerprint:
             ds_fingerprint = self._ds_fingerprint([t.get("id", "") for t in trajectories])
-        # === 下载 cache 共享 (按 fp), LeRobot dataset 每 job 独立 ===
-        # 共享: cache/ds_<fp>/  -- 同 fp 多 job 共享原始下载 (节流量, multi-slot lock 串行下载)
-        # 独立: datasets/<repo>/ -- 每 job 一份转换好的 dataset, 同数据集跑不同 model 互不影响
-        #       stats.json (pi05 quantile augment 不污染另一 job)
+        # === 下载 cache 共享 (按 fp), LeRobot dataset 按稳定变体共享 ===
+        # 原始下载缓存: cache/ds_<fp>/
+        # 转换后 dataset: datasets/box2robot-<fp>-<storage>-f<fps>-t<task_hash>/
+        # 注意 task 会写入 LeRobot dataset, 所以 task 不同必须分开缓存.
         ds_cache_dir = Path(__file__).parent.parent / "cache" / f"ds_{ds_fingerprint}"
         ds_dir = ds_cache_dir / "dataset"
         img_dir = ds_cache_dir / "images"
-        # job_id 从 model_dir 解析 (model_dir = outputs/<job_id>/model)
-        job_id_for_ds = Path(model_dir).parent.name
-        # repo_id 含 job_id 前缀 + fp 后缀, 既可读又确保 multi-slot 同 fp 不冲突
-        repo_id = f"box2robot-{job_id_for_ds}-{ds_fingerprint[:8]}"
 
-        # Step 1: Convert to LeRobot format (per-job 目录, 同 dataset 多 job 各保一份)
+        # Step 1: Convert to LeRobot format
         has_images = img_dir.is_dir() and any(img_dir.iterdir())
-        datasets_root = Path(__file__).parent.parent / "datasets" / repo_id
-        dataset_marker = datasets_root / "meta" / "info.json"
+        task_description = str(custom_params.get("task") or "manipulation task")
 
         def _bool_data_param(*keys: str, default: str = "false") -> bool:
             for key in keys:
@@ -812,6 +809,72 @@ class TrainingWorker:
             or ("pyav" if use_videos else "")
         )
         video_backend = str(video_backend) if video_backend else None
+        fps = 20
+        storage_key = f"video-{video_codec.lower()}" if use_videos else "image"
+        storage_key = "".join(c if c.isalnum() else "-" for c in storage_key).strip("-")
+        task_hash = _hashlib.md5(task_description.encode("utf-8")).hexdigest()[:8]
+        repo_id = f"box2robot-{ds_fingerprint[:8]}-{storage_key}-f{fps}-t{task_hash}"
+        datasets_root = Path(__file__).parent.parent / "datasets" / repo_id
+        dataset_marker = datasets_root / "meta" / "info.json"
+
+        def _compatible_legacy_dataset(candidate: Path) -> bool:
+            info_path = candidate / "meta" / "info.json"
+            if not info_path.is_file():
+                return False
+            try:
+                with open(info_path) as f:
+                    info = json.load(f)
+                if int(info.get("fps", fps)) != fps:
+                    return False
+                visual = (info.get("features") or {}).get(self.DATASET_VISION_KEY)
+                if has_images:
+                    if not visual:
+                        return False
+                    if use_videos:
+                        vinfo = visual.get("info") or {}
+                        if visual.get("dtype") != "video":
+                            return False
+                        if str(vinfo.get("video.codec", "")).lower() != video_codec.lower():
+                            return False
+                    elif visual.get("dtype") != "image":
+                        return False
+                tasks_path = candidate / "meta" / "tasks.parquet"
+                if tasks_path.is_file():
+                    import pandas as _pd
+                    tasks = _pd.read_parquet(tasks_path)
+                    task_values = {str(x) for x in list(tasks.index)}
+                    if "task" in tasks.columns:
+                        task_values.update(str(x) for x in tasks["task"].dropna().tolist())
+                    if task_description not in task_values:
+                        return False
+                return True
+            except Exception as e:
+                logger.warning("[CACHE] legacy dataset compatibility check failed for %s: %s", candidate, e)
+                return False
+
+        def _link_compatible_legacy_dataset() -> bool:
+            datasets_parent = datasets_root.parent
+            # 兼容旧命名: box2robot-<job_id>-<fp8>
+            legacy_pattern = f"box2robot-*-{ds_fingerprint[:8]}"
+            for candidate in sorted(datasets_parent.glob(legacy_pattern),
+                                    key=lambda p: p.stat().st_mtime,
+                                    reverse=True):
+                if candidate == datasets_root or not candidate.is_dir():
+                    continue
+                if not _compatible_legacy_dataset(candidate):
+                    continue
+                if datasets_root.exists() or datasets_root.is_symlink():
+                    return dataset_marker.exists()
+                try:
+                    datasets_root.symlink_to(candidate, target_is_directory=True)
+                    logger.info("[CACHE MIGRATE] linked stable dataset %s -> %s", datasets_root, candidate)
+                except Exception as e:
+                    logger.warning("[CACHE MIGRATE] symlink failed (%s), copying %s -> %s",
+                                   e, candidate, datasets_root)
+                    _shutil.copytree(candidate, datasets_root, symlinks=True)
+                    logger.info("[CACHE MIGRATE] copied stable dataset %s from %s", datasets_root, candidate)
+                return dataset_marker.exists()
+            return False
 
         # VLA models require camera images
         if is_vla and not has_images:
@@ -830,6 +893,10 @@ class TrainingWorker:
                 logger.info("[CACHE HIT] LeRobot dataset %s 已存在, 跳过转换", repo_id)
                 if progress_cb:
                     progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
+            elif _link_compatible_legacy_dataset():
+                logger.info("[CACHE HIT] LeRobot dataset %s 由旧缓存迁移命中, 跳过转换", repo_id)
+                if progress_cb:
+                    progress_cb(0, train_steps, {"phase": "converting", "message": "数据集已缓存, 跳过转换"})
             else:
                 logger.info(
                     "Converting to LeRobot format (vision=%s, videos=%s, codec=%s)...",
@@ -842,8 +909,8 @@ class TrainingWorker:
                 convert(
                     input_path=ds_dir,
                     repo_id=repo_id,
-                    task_description=custom_params.get("task", "manipulation task"),
-                    fps=20,
+                    task_description=task_description,
+                    fps=fps,
                     images_dir=img_dir if has_images else None,
                     root=datasets_root,
                     use_videos=use_videos,
@@ -1273,7 +1340,7 @@ class TrainingWorker:
             "lerobot_checkpoint": str(ckpt_dir),
             "chunk_size": chunk_size,
             "n_servos": len(trajectories[0]["frames"][0]["positions"]) if trajectories else 6,
-            "task_description": custom_params.get("task", "manipulation task"),
+            "task_description": task_description,
         }
         with open(config_path, "w") as f:
             _json.dump(inference_config, f, indent=2)
