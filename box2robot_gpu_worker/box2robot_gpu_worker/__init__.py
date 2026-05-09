@@ -1,11 +1,25 @@
 """Box2Robot GPU Worker — LeRobot integration layer for Box2Robot platform."""
-__version__ = "0.6.11"
+__version__ = "0.6.12"
 
 # Servo normalization constants
 STS_POS_MAX = 4095  # STS3215 encoder range
 SC_POS_MAX = 1023   # SC09 encoder range
 HW_POS_MAX = 4095   # Hiwonder HX (STS 兼容协议, 0-4095)
 DEFAULT_FPS = 20    # Box2Robot recording sample rate
+
+# 项目 ID → LeRobot 上游 policy.type 注册名 的映射.
+# Server / 前端用 "gr00t" (带数字 0, 我们的 ID), LeRobot 上游注册名是 "groot" (字母 o).
+# 不映射会导致 lerobot-train 报 'invalid choice: gr00t' (exit 2). worker 入口处统一归一化.
+PROJECT_TO_LEROBOT_POLICY_TYPE = {
+    "gr00t": "groot",
+}
+
+
+def normalize_model_type(model_type: str) -> str:
+    """把项目 ID 归一化成 worker 内部 + LeRobot 上游使用的 policy.type. 未知值原样返回."""
+    if not model_type:
+        return model_type
+    return PROJECT_TO_LEROBOT_POLICY_TYPE.get(model_type, model_type)
 
 
 def check_torch_cuda():

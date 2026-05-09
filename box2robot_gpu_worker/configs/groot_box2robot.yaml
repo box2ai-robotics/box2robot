@@ -1,0 +1,75 @@
+# GR00T N1.5 config for Box2Robot 6-DOF arm — NVIDIA humanoid foundation model.
+# Fine-tunes from nvidia/GR00T-N1.5-3B (Eagle2 vision + LLM + Diffusion action head).
+# Requires camera images.
+#
+# 关键差异 (跟 pi0/pi05 比):
+#   - GR00T 默认 max_state_dim/max_action_dim = 64/32 (humanoid 双臂多 DOF), BoxBot 用 8
+#   - lora_rank 控制 PEFT (pi0/pi05 用顶层 --peft.*, GR00T 用 --policy.lora_*)
+#   - embodiment_tag 默认 "new_embodiment", BoxBot 不在 NVIDIA 预训练形态库里, 走从头训 expert
+#
+# 注意: lerobot-train 会从 huggingface.co 下载 base_model_path + tokenizer_assets_repo,
+# 国内 AutoDL 实例需配 HF_ENDPOINT=https://hf-mirror.com 或预下载到 autodl-fs.
+
+policy:
+  type: groot                        # LeRobot 上游注册名 (我们项目 ID 是 gr00t, worker 入口归一化转 groot)
+  base_model_path: "nvidia/GR00T-N1.5-3B"
+  tokenizer_assets_repo: "lerobot/eagle2hg-processor-groot-n1p5"
+  embodiment_tag: "new_embodiment"   # 6-DOF 单臂不在 NVIDIA 预训练形态里, 走 fresh-train action head
+
+  # Action chunking (跟 LeRobot 上游对齐, 论文设计是 50 步 = 2.5s @ 20Hz)
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  # 维度对齐 BoxBot 6-DOF (默认 64/32 全是 humanoid 留的, 大量 0 padding 浪费 attention)
+  max_state_dim: 8
+  max_action_dim: 8
+
+  # Image (Eagle2 backbone 默认 224)
+  image_size: [224, 224]
+
+  # Fine-tune control (默认只调 projector + diffusion action head, 冻结 VLM 主干省显存)
+  tune_llm: false
+  tune_visual: false
+  tune_projector: true
+  tune_diffusion_model: true
+
+  # LoRA / PEFT (GR00T 用 --policy.lora_*, 跟 pi0/pi05/smolvla 的 --peft.* 命名空间不同)
+  # rank=0  → 全量微调 3B, ~32GB+ VRAM, 慎用
+  # rank=16 → 推荐 (~10-13GB VRAM, 收敛速度好)
+  # rank=32 → 接近全量微调
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  lora_full_model: false             # false = 只 LoRA 化 LLM 注意力层; true = 扩展到视觉/projector
+
+  # Memory optimization
+  use_bf16: true
+  gradient_checkpointing: true
+  compile_model: false               # A100+ 上可设 true; 旧 GPU/V100 不支持 bf16 时也别开
+
+training:
+  steps: 20000
+  batch_size: 16
+  lr: 1e-4
+  betas: [0.95, 0.999]
+  eps: 1e-8
+  weight_decay: 1e-5
+  grad_clip_norm: 1.0
+  scheduler_warmup_steps: 1000
+  warmup_ratio: 0.05
+
+dataset:
+  fps: 20
+  servo_count: 6
+  pos_max: 4095
+
+# GPU recommendations (GR00T-N1.5 3B params, BoxBot 6-DOF):
+#   RTX 3090 (24GB): batch_size 8,  lora_rank=16, ~8h / 20000 steps
+#   RTX 4090 (24GB): batch_size 16, lora_rank=16, ~4h / 20000 steps
+#   A100   (40GB):   batch_size 16, lora_rank=32 或全量微调 (rank=0), ~3h / 20000 steps
+#   A100   (80GB):   batch_size 32, 全量微调, ~1.5h / 20000 steps
+# Note:
+#   - V100/T4 不支持 bf16, dtype 改 float16 (但易 NaN, 慎用)
+#   - 首次训练需联网下载 ~6-12GB base_model + tokenizer assets
+#   - 建议预下载到 autodl-fs 共享盘加速

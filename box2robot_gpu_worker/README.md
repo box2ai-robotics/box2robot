@@ -4,8 +4,19 @@ GPU 算力节点 — 连接 Box2Robot 服务器，自动领取训练/推理任�
 
 所有操作（数据集选择、训练提交、推理部署）均在 APP 或服务器端完成，GPU Worker 只需安装、启动、绑定。
 
+## ⚠️ 环境铁律：必须用 conda env `b2r`
+
+**所有 Python 操作（pip install / b2r-train / b2r-serve / b2r-worker / b2r-gpu）必须在 conda env `b2r` 下运行**。
+
+- 本地：`conda create -n b2r python=3.12 -y && conda activate b2r` 后再 `pip install -e .`
+- 远程 AutoDL 实例：用 `/root/miniconda3/envs/b2r/bin/python`，**不要装到 base**
+- systemd / `onstart.sh` 启动 worker 时 PATH 必须包含 b2r env 的 `bin/`
+
+base 环境会被 AutoDL 镜像自带的 lerobot / datasets / av 老版本污染，导致 `import lerobot` 假成功但子模块缺失。**永远 b2r env，永不 base。**
+
 ## 系统要求
 
+- **conda env `b2r`** (强制, 详见上节)
 - **Python == 3.12** (强制, lerobot/torchcodec 部分子依赖只发布到 3.10~3.12;
   3.13 及以上目前会有 wheel 缺失或 build 失败问题。conda 环境锁 `python=3.12`)
 - NVIDIA GPU (RTX 3060+ 推荐)

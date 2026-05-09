@@ -411,6 +411,8 @@ class GPUWorker:
         # OTA: 防 60s 一次重复下载升级包. 进程内 WORKER_VERSION 是导入时常量,
         # pip install 后不会变 → 用 _installed_version 跟踪本进程"已经安装过的最新版本".
         self._installed_version: str = WORKER_VERSION
+        # P2 #6: OTA 升级失败时的错误描述, 心跳里上报让 server / APP 显示
+        self._upgrade_failed_msg: str = ""
 
     def run(self):
         """Main loop: activate → wait for bind → poll jobs → train."""
@@ -656,7 +658,9 @@ class GPUWorker:
         给"能不能加塞"做决策. 推理走 _VRAM_BASE_INFER (无训练增量); 训练走
         base + per_batch * batch_size, 然后乘上 LoRA / expert_only / grad_ckpt 的折扣.
         """
-        model_type = (job.get("model_type") or "act").lower()
+        # 入口归一化: 前端 "gr00t" → 内部 "groot" (跟 _VRAM_BASE_TRAIN dict key 对齐)
+        from box2robot_gpu_worker import normalize_model_type as _norm_mt
+        model_type = _norm_mt((job.get("model_type") or "act").lower())
         batch_size = int(job.get("batch_size") or 32)
         custom = job.get("custom_params") or {}
         if isinstance(custom, str):
@@ -903,6 +907,10 @@ class GPUWorker:
         if active_ids:
             payload["active_job_ids"] = active_ids
             payload["active_job_id"] = active_ids[0]
+        # P2 #6: OTA 升级失败时上报, server 收到后存到 device 让 APP 显示告警
+        if self._upgrade_failed_msg:
+            payload["upgrade_status"] = "failed"
+            payload["upgrade_error"] = self._upgrade_failed_msg[:500]
 
         try:
             r = self.client.post(f"{self.server_url}/api/gpu/heartbeat", json=payload)
@@ -1043,9 +1051,15 @@ class GPUWorker:
                             logger.info("升级安装成功 (v%s)", installed_ver)
                             # 记下来, 让 _check_upgrade 下次心跳判 "已经装过这个版本" 不再重复下载
                             self._installed_version = installed_ver
+                            self._upgrade_failed_msg = ""  # 清失败标记
                             self._maybe_restart_after_upgrade(new_ver=installed_ver)
                         else:
-                            logger.error("升级安装失败: %s", result.stderr[:200])
+                            err = (result.stderr or "")[:300]
+                            logger.error("升级安装失败: %s", err)
+                            # P2 #6: 心跳带 upgrade_status 让 server 知道升级失败
+                            self._upgrade_failed_msg = (
+                                f"v{info.get('version','?')} pip install failed (exit {result.returncode}): "
+                                + err)
                         break
             else:
                 logger.info("非 zip 格式, 跳过自动安装. 请手动处理: %s", pkg_path)
@@ -1053,6 +1067,7 @@ class GPUWorker:
             logger.info("=" * 40)
         except Exception as e:
             logger.error("升级失败: %s", e)
+            self._upgrade_failed_msg = f"升级异常: {type(e).__name__}: {str(e)[:200]}"
 
     def _maybe_restart_after_upgrade(self, new_ver: str = "?"):
         """升级后尝试自动重启 worker. 有活跃任务时跳过, 等任务结束后人工重启.
@@ -1152,21 +1167,40 @@ class GPUWorker:
         logger.info("继续监听下一个任务...")
 
     def _run_inference(self, job: dict, arm_device_id: str):
-        """Load trained model and run inference loop against remote arm."""
+        """Load trained model and run inference loop against remote arm.
+
+        Manager Phase 3.2 模型来源优先级 (从高到低):
+          1. deploy_info.model_fs_path (autodl-fs 共享盘, 同 region 跨 host 加载)
+          2. job.model_path (worker 本地盘, 训练机原地推理最快)
+          3. self.output_dir/<job>/model (老 worker 兼容兜底)
+        新字段 model_fs_path 协议向下兼容: 旧 worker 不识别 → 走老路径(2/3),
+        新 worker 看到 fs path 存在就用它.
+        """
         deploy_info = job.get("deploy_info", {})
         checkpoint_step = deploy_info.get("checkpoint_step")
 
-        model_path = job.get("model_path", "")
-        if not model_path:
-            model_path = str((self.output_dir / job["id"] / "model").resolve())
+        # L1: Manager Phase 3.2 — 优先用 deploy_info.model_fs_path (autodl-fs)
+        fs_path = (deploy_info.get("model_fs_path") or "").strip()
+        if fs_path and Path(fs_path).exists():
+            logger.info("[FS-PATH] 使用 autodl-fs 共享盘加载模型: %s", fs_path)
+            model_path = fs_path
+        else:
+            if fs_path:
+                logger.warning("[FS-PATH] deploy_info.model_fs_path 设了但路径不存在 (%s), "
+                               "回退到 model_path / output_dir", fs_path)
+            # L2: server DB 里的 model_path (worker 本地盘)
+            model_path = job.get("model_path", "")
+            if not model_path:
+                # L3: 兜底 — 老 worker 写入相对路径 / 本机已训过
+                model_path = str((self.output_dir / job["id"] / "model").resolve())
 
-        # 路径不存在时的兜底: DB 里可能存的是相对路径 (老 worker 写入)，或者来自其他 worker。
-        # 用本机 output_dir 重建一次绝对路径，能救回本机已训好的模型。
-        if not Path(model_path).exists():
-            fallback = (self.output_dir / job["id"] / "model").resolve()
-            if fallback.exists():
-                logger.warning("model_path 不存在 (%s)，回退到本机 output_dir: %s", model_path, fallback)
-                model_path = str(fallback)
+            # 路径不存在时的兜底: DB 里可能存的是相对路径 (老 worker 写入)，或者来自其他 worker。
+            # 用本机 output_dir 重建一次绝对路径，能救回本机已训好的模型。
+            if not Path(model_path).exists():
+                fallback = (self.output_dir / job["id"] / "model").resolve()
+                if fallback.exists():
+                    logger.warning("model_path 不存在 (%s)，回退到本机 output_dir: %s", model_path, fallback)
+                    model_path = str(fallback)
 
         # 如果指定了 checkpoint_step, 定位到具体的 checkpoint 目录
         # LeRobot v3 用 6 位零填充目录名 (e.g. checkpoints/000200/), 老格式是 str(step).

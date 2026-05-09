@@ -10,15 +10,38 @@
 # 输出（manager 解析）:
 #   ::B2R_BIND_CODE::123456    ← 拿到绑定码后给用户去 APP 输
 #   ::B2R_DEVICE_ID::GPU-XXX
-#   ::B2R_PHASE::done|err
+#   ::B2R_PHASE::<name>        ← 阶段进入 (init/probe/deps/install/start_worker/wait_bind/autostart/done)
+#   ::B2R_PHASE::failed:CODE   ← 失败 (CODE ∈ manager_server_protocol.md §9 错误码白名单)
+#                                 manager 把 CODE 透传到 server provision_error_code 字段
+# 协议: claude_md/manager_autodl_protocol.md §3.4
+# 错误码白名单 (改这里必须同步 claude_md/manager_server_protocol.md §9):
+#   MANAGER_INSTALL_FAIL     - probe/deps/install/autostart 任意一步失败
+#   MANAGER_WORKER_TIMEOUT   - start_worker/wait_bind 超时
+#   MANAGER_UNKNOWN          - 兜底 (set -e 触发的隐式失败)
 
 set -e
+
+# v0.2 协议 §9: 兜底失败码 (set -e 触发的退出走这条)
+# 各阶段开始前 update CURRENT_FAIL_CODE, 出错时由 trap emit
+CURRENT_FAIL_CODE="MANAGER_UNKNOWN"
+fail() {
+  local code="${1:-$CURRENT_FAIL_CODE}"
+  echo "::B2R_PHASE::failed:$code"
+  exit 1
+}
+# set -e 隐式失败时也打 phase
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then echo "::B2R_PHASE::failed:$CURRENT_FAIL_CODE"; fi' EXIT
 
 # AutoDL 实例的 conda 默认装在 /root/miniconda3，但 SSH 非交互式 shell 不读 ~/.bashrc，
 # 所以手动注入到 PATH。同时兜底 /opt/conda（部分镜像）和 /usr/local/bin。
 for d in /root/miniconda3/bin /opt/conda/bin /usr/local/bin; do
   [[ -d "$d" && ":$PATH:" != *":$d:"* ]] && export PATH="$d:$PATH"
 done
+
+# 铁律: 所有 box2robot worker 必须装到 conda env "b2r", 永远不装 base.
+# base 会被 AutoDL 镜像自带的 lerobot/datasets/av 老版本污染, 导致 import 假成功但子模块缺失.
+B2R_ENV_NAME="b2r"
+B2R_PYTHON_VERSION="3.12"
 
 SERVER="https://robot.box2ai.com"
 CUDA="cu124"
@@ -38,26 +61,56 @@ phase() { echo "::B2R_PHASE::$1"; }
 emit_bind_code() { echo "::B2R_BIND_CODE::$1"; }
 emit_device_id() { echo "::B2R_DEVICE_ID::$1"; }
 
+# AutoDL 学术加速 (仅本 SSH session 有效, 脚本退出自动失效)
+# 加速 github.com / githubusercontent.com / huggingface.co
+# 主路径仍走 PIP_INDEX_URL=清华源 + HF_ENDPOINT=hf-mirror, 学术加速作为兜底
+# 详见 claude_md/manager_autodl_protocol.md §3.7 "网络代理与学术加速"
+if [[ -f /etc/network_turbo ]]; then
+  source /etc/network_turbo 2>/dev/null && \
+    echo "[$(date +%T)] → AutoDL 学术加速已启用 (github + huggingface)" || \
+    echo "[$(date +%T)] ⚠ /etc/network_turbo 加载失败, 继续 (走清华源/hf-mirror)"
+else
+  echo "[$(date +%T)] ⚠ 此实例无 /etc/network_turbo, 走清华源/hf-mirror 兜底"
+fi
+
+CURRENT_FAIL_CODE="MANAGER_INSTALL_FAIL"
 phase "init"
 echo "[$(date +%T)] === Box2Robot GPU Worker 一键安装 ==="
 echo "  server  : $SERVER"
 echo "  cuda    : $CUDA"
 echo "  project : $PROJECT_DIR"
 
-# ---- Phase 1: 环境检测 ----
+# ---- Phase 1: 环境检测 + 切到 conda env "b2r" ----
+CURRENT_FAIL_CODE="MANAGER_INSTALL_FAIL"
 phase "probe"
-echo "[$(date +%T)] [1/5] 环境检测"
-nvidia-smi -L 2>&1 | head -1 || { echo "[!] nvidia-smi 不可用"; phase "err"; exit 1; }
-# AutoDL 实例上 python 命令通常缺失，只有 python3。统一用 PY 变量
-if command -v python >/dev/null 2>&1; then
-  PY=python
-elif command -v python3 >/dev/null 2>&1; then
-  PY=python3
-else
-  echo "[!] 找不到 python/python3"; phase "err"; exit 1
+echo "[$(date +%T)] [1/5] 环境检测 + 准备 conda env '$B2R_ENV_NAME'"
+nvidia-smi -L 2>&1 | head -1 || { echo "[!] nvidia-smi 不可用"; fail MANAGER_INSTALL_FAIL; }
+
+# 找 conda 二进制 (AutoDL 镜像默认 /root/miniconda3, 兜底 /opt/conda)
+CONDA_BIN=""
+for c in /root/miniconda3/bin/conda /opt/conda/bin/conda; do
+  [[ -x "$c" ]] && CONDA_BIN="$c" && break
+done
+if [[ -z "$CONDA_BIN" ]]; then
+  echo "[!] 找不到 conda — AutoDL 镜像异常?"; fail MANAGER_INSTALL_FAIL
 fi
-$PY --version
+CONDA_ROOT="$(dirname $(dirname $CONDA_BIN))"
+B2R_ENV_DIR="$CONDA_ROOT/envs/$B2R_ENV_NAME"
+
+# 创建 b2r env (如果不存在). python=3.12 锁定版本.
+if [[ ! -d "$B2R_ENV_DIR" ]]; then
+  echo "  → 创建 conda env '$B2R_ENV_NAME' (python=$B2R_PYTHON_VERSION)"
+  "$CONDA_BIN" create -n "$B2R_ENV_NAME" "python=$B2R_PYTHON_VERSION" -y 2>&1 | tee -a "$LOG"
+else
+  echo "  → conda env '$B2R_ENV_NAME' 已存在, 复用"
+fi
+
+# 后续所有 PY/PIP 都走 b2r env, 永远不污染 base
+PY="$B2R_ENV_DIR/bin/python"
 PIP="$PY -m pip"
+[[ -x "$PY" ]] || { echo "[!] $PY 不存在 — env 创建失败"; fail MANAGER_INSTALL_FAIL; }
+echo "  → Python: $PY"
+$PY --version
 $PIP --version >/dev/null 2>&1 || $PY -m ensurepip || true
 
 cd "$PROJECT_DIR"
@@ -69,12 +122,23 @@ cd "$PROJECT_DIR"
 }
 
 # ---- Phase 2: PyTorch + LeRobot ----
+CURRENT_FAIL_CODE="MANAGER_INSTALL_FAIL"
 phase "deps"
 echo "[$(date +%T)] [2/5] 装 PyTorch ($CUDA) + LeRobot 依赖"
 # 国内 pip 加速
 export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
 # HuggingFace 镜像
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+# HF_HOME 统一指向 autodl-fs (同 region 共享盘),
+# 让 4 台 worker 共享同一份 base 权重 (pi0/pi05 base 14GB+, 不重复下载)
+# 优先 /root/autodl-fs/data (新版 AutoDL 实例), fallback /autodl-fs/data
+if [[ -d /root/autodl-fs/data ]]; then
+  export HF_HOME=${HF_HOME:-/root/autodl-fs/data/box2robot-base-models}
+elif [[ -d /autodl-fs/data ]]; then
+  export HF_HOME=${HF_HOME:-/autodl-fs/data/box2robot-base-models}
+fi
+mkdir -p "$HF_HOME" 2>/dev/null || true
+echo "  HF_HOME = $HF_HOME (autodl-fs 共享盘, 跨实例复用)"
 
 if ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
   echo "  → torch CUDA 版未装，开始安装"
@@ -84,24 +148,37 @@ if ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
 fi
 $PY -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
 
-# LeRobot 基础 + dataset 扩展（pi0/smolvla 等 VLA 模型必需）
-if ! $PY -c "import lerobot" 2>/dev/null; then
+# LeRobot 基础 + dataset + training 扩展
+#   dataset:  pi0/smolvla 等 VLA 模型 + 数据集 codec (av) 必需
+#   training: lerobot_train 入口需要 accelerate, 否则 worker 抢任务后训练立即崩
+# 用 import accelerate 判断, 因为 import lerobot 顶层 success 不代表 training extras 装好.
+if ! $PY -c "import lerobot, accelerate" 2>/dev/null; then
   echo "  → 装 lerobot 基础包"
   (cd lerobot && $PIP install -e . --no-build-isolation) 2>&1 | tee -a "$LOG"
-  echo "  → 装 lerobot[dataset]"
-  $PIP install "lerobot[dataset] @ file:./lerobot" --no-build-isolation 2>&1 | tee -a "$LOG" || true
+  echo "  → 装 lerobot[dataset,training]"
+  $PIP install "lerobot[dataset,training] @ file:./lerobot" --no-build-isolation 2>&1 | tee -a "$LOG" || true
 fi
 
 # ---- Phase 3: box2robot_gpu_worker ----
+CURRENT_FAIL_CODE="MANAGER_INSTALL_FAIL"
 phase "install"
-echo "[$(date +%T)] [3/5] 装 box2robot_gpu_worker"
+echo "[$(date +%T)] [3/5] 装 box2robot_gpu_worker (env=$B2R_ENV_NAME)"
 $PIP install -e . --no-build-isolation 2>&1 | tee -a "$LOG"
-which b2r-worker || which b2r-gpu || { echo "[!] b2r-worker / b2r-gpu 入口缺失"; phase "err"; exit 1; }
+# entry 必须在 b2r env 的 bin/ 下, 不接受 base 的同名命令
+B2R_ENTRY=""
+for cand in "$B2R_ENV_DIR/bin/b2r-gpu" "$B2R_ENV_DIR/bin/b2r-worker"; do
+  [[ -x "$cand" ]] && B2R_ENTRY="$cand" && break
+done
+if [[ -z "$B2R_ENTRY" ]]; then
+  echo "[!] b2r-worker / b2r-gpu 入口在 $B2R_ENV_DIR/bin/ 下不存在"; fail MANAGER_INSTALL_FAIL
+fi
+echo "  → entry: $B2R_ENTRY"
 
 # ---- Phase 4: 启动 worker，拿绑定码 ----
+CURRENT_FAIL_CODE="MANAGER_WORKER_TIMEOUT"
 phase "start_worker"
-echo "[$(date +%T)] [4/5] 启动 b2r-worker（后台）"
-ENTRY=$(which b2r-gpu || which b2r-worker)
+echo "[$(date +%T)] [4/5] 启动 b2r-worker（后台, env=$B2R_ENV_NAME）"
+ENTRY="$B2R_ENTRY"
 WORKER_LOG="/root/b2r_worker.log"
 > "$WORKER_LOG"
 nohup "$ENTRY" --server "$SERVER" >"$WORKER_LOG" 2>&1 &
@@ -136,11 +213,12 @@ elif [[ -n "$TOKEN" ]]; then
 else
   echo "[!] 90s 内未拿到绑定码，最近日志:"
   tail -30 "$WORKER_LOG"
-  phase "err"
-  exit 1
+  fail MANAGER_WORKER_TIMEOUT
 fi
 
 # ---- Phase 5: 系统级 systemd 自启动（实例重启自动起 worker）----
+# autostart 失败不算致命 (worker 已经启动了), 仅打 warning, 不 fail
+CURRENT_FAIL_CODE="MANAGER_INSTALL_FAIL"
 phase "autostart"
 echo "[$(date +%T)] [5/5] 注册系统级 systemd 自启动"
 PY_BIN=$(dirname "$ENTRY")
@@ -156,6 +234,7 @@ User=root
 WorkingDirectory=/root/box2robot_gpu_worker
 Environment=PATH=$PY_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HF_ENDPOINT=$HF_ENDPOINT
+Environment=HF_HOME=$HF_HOME
 Environment=PIP_INDEX_URL=$PIP_INDEX_URL
 ExecStart=$ENTRY --server $SERVER
 Restart=always

@@ -17,8 +17,36 @@ from pathlib import Path
 
 import httpx
 
+from box2robot_gpu_worker import normalize_model_type as _normalize_model_type
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("box2robot.worker")
+
+
+def _setup_file_logging() -> None:
+    """落 ~/.b2r-gpu/worker.log (10MB × 5 滚转), b2r-worker 独立启动时也保留持久日志.
+    与 gpu_worker._setup_file_logging 共用同一文件 + 同一去重 flag, 同进程不重复加 handler."""
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_dir = Path.home() / ".b2r-gpu"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "worker.log"
+        root = logging.getLogger()
+        if any(getattr(h, "_b2r_file_log", False) for h in root.handlers):
+            return
+        handler = RotatingFileHandler(
+            str(log_file), maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
+        handler._b2r_file_log = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+        logger.info("[LOG] file logging → %s", log_file)
+    except Exception as e:
+        logger.warning("[LOG] file logging setup failed: %s", e)
+
+
+_setup_file_logging()
 
 
 # === Multi-slot race protection (v0.6.3+) ===
@@ -80,7 +108,9 @@ class TrainingWorker:
             self._report_status(job_id, "failed", error_msg="Failed to get job info")
             return
 
-        model_type = job_info.get("model_type", "act")
+        # 入口归一化: 把前端 "gr00t" 转成 LeRobot 上游的 "groot", 避免 lerobot-train
+        # invalid choice. 项目其他 ID (act/diffusion/pi0/pi05/smolvla/...) 原样直通.
+        model_type = _normalize_model_type(job_info.get("model_type", "act"))
         train_steps = job_info.get("train_steps", 10000)
         batch_size = job_info.get("batch_size", 64)
         chunk_size = job_info.get("chunk_size", 1)
@@ -255,11 +285,11 @@ class TrainingWorker:
         "pi05": "lerobot/pi05_base",
     }
     # Box2Robot dataset 当前的图像 key (convert.py 写死了; 单相机)
-    DATASET_VISION_KEY = "observation.images.top"
+    DATASET_VISION_KEY = "observation.images.wrist"
 
     # 已知 VLA base 期望的相机 key (用于 _get_base_visual_keys 离线/网络失败兜底).
     # 数据来源: 各 base 的 config.json input_features. 第一个 key 是主视角,
-    # rename_map 把我们的 'observation.images.top' 映射到这里; 其余 cam 会被
+    # rename_map 把我们的 'observation.images.wrist' 映射到这里; 其余 cam 会被
     # modeling 自动 -1 填充 (siglip empty camera).
     KNOWN_BASE_VISUAL_KEYS = {
         "lerobot/pi05_base": [
@@ -669,7 +699,7 @@ class TrainingWorker:
             # 真正模拟 dataloader 给的 batch, 跑一遍 preprocessor, 看 key 是否被改了
             "import torch",
             "fake_batch = {",
-            "    'observation.images.top': torch.zeros(3, 480, 640, dtype=torch.uint8),",
+            "    'observation.images.wrist': torch.zeros(3, 480, 640, dtype=torch.uint8),",
             "    'observation.state': torch.zeros(6),",
             "    'task': 'preflight test',",
             "    'action': torch.zeros(6),",
@@ -706,9 +736,9 @@ class TrainingWorker:
         2. HF Hub 下载 config.json (在线节点)
         3. KNOWN_BASE_VISUAL_KEYS 硬编码兜底 (离线节点 / HF 不可达)
 
-        VLA base 的相机 key 通常和我们 Box2Robot dataset 的 'observation.images.top'
+        VLA base 的相机 key 通常和我们 Box2Robot dataset 的 'observation.images.wrist'
         不一样, 直接训会抛 "All image features are missing from the batch". 拿到 base
-        期望的 key 列表后, 外层用 --rename_map 把 dataset 的 top 映射到 base 第一个 cam,
+        期望的 key 列表后, 外层用 --rename_map 把 dataset 的 wrist 映射到 base 第一个 cam,
         其余 base cam 会被 modeling.prepare_images 自动用 -1 填充 (siglip empty camera).
 
         Returns: list of visual key names. 全部失败才返回 [].
@@ -1006,7 +1036,7 @@ class TrainingWorker:
 
             # === 图像 key 适配 (rename_map) ===
             # base 训练时用了不同数据集 (pi0_base=aloha, pi05_base=droid, smolvla=...),
-            # input_features 里的 cam 命名跟我们 Box2Robot dataset 的 'observation.images.top'
+            # input_features 里的 cam 命名跟我们 Box2Robot dataset 的 'observation.images.wrist'
             # 对不上, 不处理会抛 "All image features are missing from the batch".
             #
             # 解法 (官方 rename_map.mdx): dataset 第一个 cam 映射到 base 第一个 cam,
@@ -1039,7 +1069,7 @@ class TrainingWorker:
                 logger.info("[RENAME-MAP] base_visual_keys (从 base config.json 读取): %s",
                             base_visual_keys)
                 if base_visual_keys:
-                    # 把我们的 top 映射到 base 第一个 cam (一般是主视角, 如 droid 的 exterior_1_left)
+                    # 把我们的 wrist 映射到 base 第一个 cam (一般是主视角, 如 droid 的 exterior_1_left)
                     rename_map_dict = {self.DATASET_VISION_KEY: base_visual_keys[0]}
                     rename_str = json.dumps(rename_map_dict)
                     cmd.append(f"--rename_map={rename_str}")
@@ -1061,7 +1091,7 @@ class TrainingWorker:
             # lerobot_train.py 当 use_relative_actions=true + 有 pretrained_path + 不 resume 时,
             # 会把 processor_pretrained_path 设成 None (warning: "Building processors from current
             # policy config"), 导致 preprocessor 从头建, 我们的 rename_map override 全部丢失,
-            # batch 里仍然是 'observation.images.top' → 训练第一步报 "All image features are missing".
+            # batch 里仍然是 'observation.images.wrist' → 训练第一步报 "All image features are missing".
             # 这里强制剥掉, 让 lerobot 走 from_pretrained + override 路径.
             ura_val = str(custom_params.get("use_relative_actions", "")).lower()
             if ura_val in ("true", "1", "yes"):
@@ -1245,7 +1275,63 @@ class TrainingWorker:
         # Match tqdm progress: "Training:  15%|...| 150/10000 [01:23<..."
         tqdm_re = re.compile(r'Training:\s+\d+%\|.*\|\s*(\d+)/(\d+)\s+\[')
 
-        for line in proc.stdout:
+        # ===== stdout 心跳监控 (P0 #1) =====
+        # 之前直接 for line in proc.stdout 阻塞读, 子进程卡死 (CUDA / 死锁 / IO 死等) 时
+        # 主进程跟着无限阻塞, server 看 worker heartbeat 还在 → job 永远 training 不动.
+        # 改成: 独立 reader 线程把 stdout 推 queue, 主循环每 10s 检查一次, 连续
+        # STDOUT_STUCK_S 没新行 → kill + report failed.
+        import queue as _queue
+        import threading as _threading
+        STDOUT_STUCK_S = 600  # 10 分钟无 stdout 视为卡死 (大模型首步 forward 可能 ~5 分钟)
+        _line_q: "_queue.Queue[str | None]" = _queue.Queue(maxsize=10000)
+
+        def _stdout_pump():
+            try:
+                for raw in proc.stdout:
+                    _line_q.put(raw)
+            finally:
+                _line_q.put(None)  # EOF sentinel
+
+        _reader = _threading.Thread(target=_stdout_pump, daemon=True)
+        _reader.start()
+
+        last_output_at = time.time()
+        eof = False
+        while not eof:
+            try:
+                line = _line_q.get(timeout=10)
+            except _queue.Empty:
+                line = ""  # 超时 sentinel
+                idle_s = time.time() - last_output_at
+                if idle_s > STDOUT_STUCK_S:
+                    logger.warning("[STUCK] training subprocess no stdout for %.0fs, killing pid=%s",
+                                   idle_s, proc.pid)
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"训练子进程卡死 ({int(idle_s)}s 无 stdout, "
+                        f"可能 OOM / CUDA 死锁 / 数据加载阻塞)。"
+                        f"最后日志: {' '.join(list(tail_lines)[-3:])[:300]}")
+                # 同时响应停止/暂停信号 (跟原 for-loop 内逻辑一致)
+                if self._should_stop or self._should_pause:
+                    reason = "paused" if self._should_pause else "cancelled"
+                    logger.info("Stopping LeRobot subprocess (user %s, idle path)", reason)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
+                continue
+            if line is None:
+                eof = True
+                break
+            last_output_at = time.time()
             line = line.strip()
             if not line:
                 continue
@@ -1855,7 +1941,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
 
     # === VLA 推理: 加载 lerobot 完整 preprocessor/postprocessor pipeline ===
     # VLA 模型 (pi0/pi05/smolvla) 推理需要的处理远不止 image key rename:
-    #   1. RenameObservations  — top → 模型期望的 cam (base_0_rgb 等)
+    #   1. RenameObservations  — wrist → 模型期望的 cam (base_0_rgb 等)
     #   2. AddBatchDimension   — 加 batch 维
     #   3. RelativeActions     — 相对动作转换 (use_relative_actions=true 时)
     #   4. NormalizerProcessor — 用训练时 dataset stats (q01/q99 for pi05) 归一化 state/action
@@ -1865,7 +1951,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     # 之前 worker 手动构造 batch 跳过这些, 导致缺 language.tokens / normalize 不一致 / state 没离散化等.
     # 正解: 用 lerobot make_pre_post_processors 加载训练时保存的完整 pipeline (含 stats).
     _vla_pre = _vla_post = None
-    _vision_key = "observation.images.top"  # ACT/Diffusion 默认 (跟 dataset 一致, 它们 from-scratch)
+    _vision_key = "observation.images.wrist"  # ACT/Diffusion 默认 (跟 dataset 一致, 它们 from-scratch)
     if is_vla:
         try:
             from lerobot.policies import make_pre_post_processors
@@ -2027,8 +2113,8 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
 
         if is_vla and _vla_pre is not None:
             # VLA + 完整 lerobot pipeline 路径 (推荐)
-            # raw obs 用 dataset 时的 key (top), 不带 batch dim — preprocessor 会自动:
-            #   RenameObservations (top → cam_high/base_0_rgb 等)
+            # raw obs 用 dataset 时的 key (wrist), 不带 batch dim — preprocessor 会自动:
+            #   RenameObservations (wrist → cam_high/base_0_rgb 等)
             #   AddBatchDimension
             #   Normalizer (用训练时 dataset stats: q01/q99 for pi05)
             #   Pi05PrepareStateTokenizer (state 离散化)
@@ -2042,7 +2128,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 img = cam_image or Image.new("RGB", (640, 480))
                 img_arr = np.array(img, dtype=np.float32) / 255.0
                 img_t = torch.from_numpy(img_arr.transpose(2, 0, 1))  # (3, H, W) 不带 batch
-                raw["observation.images.top"] = img_t
+                raw[_vision_key] = img_t
             # === 检查点 3: raw obs shape (preprocessor 输入) ===
             if not getattr(_build_obs, "_logged_check3", False):
                 logger.info("[CHECK-3] raw obs (preprocessor 输入), 首次推理 dump:")
@@ -2087,7 +2173,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             obs["task"] = task_description
         else:
             # ACT/Diffusion: manual MEAN_STD normalization. ACT from-scratch 训练时
-            # input_features 自动从 dataset 推导, 推理时 _vision_key 跟 dataset 一致 (top).
+            # input_features 自动从 dataset 推导, 推理时 _vision_key 跟 dataset 一致 (wrist).
             state_norm = (state_t - _state_mean) / (_state_std + 1e-8)
             obs = {"observation.state": state_norm}
             if use_vision:

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "box2robot-gpu-worker"
+version = "0.6.1"
+description = "Box2Robot GPU Worker — LeRobot ACT/SmolVLA/pi0/pi05 训练 + 推理 + 数据集对齐"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy",
+    "pyarrow",
+    "httpx",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+train = ["accelerate>=1.10", "wandb"]
+smolvla = ["transformers>=4.57", "accelerate>=1.10"]
+pi = ["transformers>=4.52", "accelerate>=1.10"]
+vla = ["transformers>=4.57", "accelerate>=1.10"]
+
+[project.scripts]
+b2r-gpu = "box2robot_gpu_worker.gpu_worker:main"
+b2r-worker = "box2robot_gpu_worker.worker:main"
+box2robot-gpu = "box2robot_gpu_worker.gpu_worker:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["box2robot_gpu_worker*"]
+exclude = ["base_model*", "cache*", "datasets*", "outputs*", "lerobot*", "scripts*", "configs*", "docs*"]

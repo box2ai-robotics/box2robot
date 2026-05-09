@@ -209,7 +209,7 @@ def convert(
         },
     }
     if use_vision:
-        features["observation.images.top"] = {
+        features["observation.images.wrist"] = {
             "dtype": "video" if use_video_storage else "image",
             "shape": (image_size[0], image_size[1], 3),
             "names": ["height", "width", "channels"],
@@ -306,7 +306,7 @@ def convert(
                     img_path = image_paths[i]
                     if img_path and os.path.isfile(img_path):
                         last_image = _load_image(img_path, image_size)
-                    frame_data["observation.images.top"] = (
+                    frame_data["observation.images.wrist"] = (
                         last_image if last_image is not None
                         else Image.new("RGB", (image_size[1], image_size[0]))
                     )
@@ -383,7 +383,7 @@ def convert(
                     img_path = image_paths[i]
                     if img_path and os.path.isfile(img_path):
                         last_image = _load_image(img_path, image_size)
-                    frame_data["observation.images.top"] = (
+                    frame_data["observation.images.wrist"] = (
                         last_image if last_image is not None
                         else Image.new("RGB", (image_size[1], image_size[0]))
                     )
@@ -432,7 +432,7 @@ def convert(
                     img_path = image_paths[i]
                     if img_path and os.path.isfile(img_path):
                         last_image = _load_image(img_path, image_size)
-                    frame_data["observation.images.top"] = (
+                    frame_data["observation.images.wrist"] = (
                         last_image if last_image is not None
                         else Image.new("RGB", (image_size[1], image_size[0]))
                     )
@@ -486,7 +486,7 @@ def convert(
                     img_path = image_paths[i]
                     if img_path and os.path.isfile(img_path):
                         last_image = _load_image(img_path, image_size)
-                    frame_data["observation.images.top"] = (
+                    frame_data["observation.images.wrist"] = (
                         last_image if last_image is not None
                         else Image.new("RGB", (image_size[1], image_size[0]))
                     )
