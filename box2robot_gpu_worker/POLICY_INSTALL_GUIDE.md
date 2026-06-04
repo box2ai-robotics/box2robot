@@ -51,6 +51,118 @@ pip install -e .
 
 ---
 
+## AutoDL 实例：共享 pip cache（强烈推荐）
+
+> ⚠️ **每次开新 AutoDL 实例都重新下载几 GB wheel 太浪费**。本节说明如何让同 region 的所有实例共享一份 pip wheel cache，避免重复下载。
+
+### 原理
+
+AutoDL 提供两个特殊存储：
+| 路径 | 性质 | 用途 |
+|---|---|---|
+| `/root/autodl-tmp/` | 数据盘，**单实例独占**，扛 reboot | 项目代码（`workspace/box2robot/`） |
+| `/root/autodl-fs/` | 网络盘，**同 region 跨实例共享**，扛实例销毁 | pip wheel cache + HF 模型权重 |
+
+把 `PIP_CACHE_DIR` 指向 `autodl-fs/pip-cache`：第一台实例下载的 wheel 落到共享盘，**之后同 region 任何实例 `pip install` 都能命中缓存秒装**，跨 region 各装一份。
+
+### 使用方法（任何新开的 AutoDL 实例）
+
+**1. 一次性写入 `/etc/profile.d/b2r_env.sh`**（见下文"固化到 /etc/profile.d"），之后每次 login shell 自动生效
+
+**2. 创建目录（首次）**：
+```bash
+mkdir -p /root/autodl-fs/pip-cache /root/autodl-fs/data/box2robot-base-models
+```
+
+**3. 装任意 lerobot extra, 命中 cache 秒装**：
+```bash
+# 重新 SSH 进来 / 跑 bash -lc 让 env 生效
+pip install "lerobot[diffusion,pi,smolvla] @ file:./lerobot" --no-build-isolation
+```
+
+**临时 export（不写文件, 仅本 session 用）**：
+```bash
+export PIP_CACHE_DIR=/root/autodl-fs/pip-cache
+export HF_HOME=/root/autodl-fs/data/box2robot-base-models
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+**固化到 `/etc/profile.d/b2r_env.sh`（推荐, login shell 自动加载, 比 `~/.bashrc` 更可靠）**：
+```bash
+cat > /etc/profile.d/b2r_env.sh <<'EOF'
+# Box2Robot AutoDL 环境配置 (region-scoped 共享盘 + HF/pip 国内镜像)
+# 自动加载: bash login shell 会 source /etc/profile -> /etc/profile.d/*.sh
+[ -d /root/autodl-fs ] && {
+    export PIP_CACHE_DIR=/root/autodl-fs/pip-cache
+    export HF_HOME=/root/autodl-fs/data/box2robot-base-models
+    export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+    export HF_ENDPOINT=https://hf-mirror.com
+}
+EOF
+chmod 644 /etc/profile.d/b2r_env.sh
+```
+
+> **为什么不写 `~/.bashrc`**：paramiko/SSH 非交互式 exec_command 不会 source `~/.bashrc`（只会 source `/etc/profile` 链）。而 `bash -lc <cmd>` 或者交互式 ssh 都会走 `/etc/profile.d/*.sh`，所以这个位置最通用。
+>
+> **`HF_ENDPOINT=hf-mirror.com` 的必要性**：缺这个变量时, 任何要从 HuggingFace Hub 下东西的策略会卡死或失败：
+> - **multi_task_dit** 实例化时下 `openai/clip-vit-base-patch16` (config + 权重)
+> - **smolvla / pi0 / pi05 / wall_x / xvla / groot** 加载 base 权重 (lerobot 命名空间)
+> - **lerobot 数据集**: `datasets.load_dataset("lerobot/...")`
+> - **transformers tokenizer**: 任何 `AutoTokenizer.from_pretrained(...)` 调用
+>
+> 国内直连 huggingface.co 通常 [Errno 99] Cannot assign requested address 或超时 → 看起来像策略 bug，实际是网络。
+
+> **AutoDL 实例没有 systemd**：开机自启只能走 `/root/onstart.sh`（AutoDL 镜像约定的开机钩子）或 `~/.bashrc`（仅 SSH 登录触发, 不可靠）。worker 长跑用 `nohup ... &` 后台跑 + 写 PID 到 `/root/b2r_worker.pid`，详见 `scripts/install_on_autodl.sh`。
+
+### 西北B区已预热 cache（813 机）
+
+`/root/autodl-fs/pip-cache/` (~7 GB, 536 个 wheel)，覆盖以下 extras：
+
+```
+lerobot[dataset,training,diffusion,pi,smolvla,multi_task_dit,wallx,xvla,sarm]
+```
+
+预热时间: 2026-05-09。包含 transformers 5.3.0、diffusers 0.35.2、peft 0.19.1、accelerate 1.13.0、torch 2.10.0+cu128、scipy、qwen-vl-utils、torchdiffeq、num2words、faker、matplotlib 等所有重型依赖的 wheel。
+
+**已验证可 import 的策略**（在 813 机 `b2r` env 实测，2026-05-10）：
+
+| 策略 | Import | 备注 |
+|---|---|---|
+| act, tdmpc, vqbet, sac, rtc | ✓ | 基础策略，无 extra 依赖 |
+| diffusion | ✓ | `lerobot[diffusion]` |
+| pi0, pi0_fast, pi05 | ✓ | `lerobot[pi]` |
+| smolvla | ✓ | `lerobot[smolvla]` |
+| multi_task_dit | ✓ | `lerobot[multi_task_dit]` |
+| wall_x | ✓ | `lerobot[wallx]` |
+| xvla | ✓ | `lerobot[xvla]` |
+| groot | ✓ (顶层 import) | 实跑需 `flash-attn`（要按 GPU SM 编译，未预热） |
+| **sarm** | ✗ | **`lerobot.policies.sarm` 模块在上游仓库不存在**，extra 装的是依赖（pydantic/faker/qwen-vl-utils），但策略代码未合入 |
+
+### 一次性预热脚本
+
+如果开了一台新 region 的实例，需要预热全套 extras 给同 region 后续实例用，跑：
+
+```bash
+cd box2robot_gpu_cloud_manager
+conda activate b2r
+python _setup_full_extras.py <实例名关键字>
+```
+
+脚本流程: 装 miniconda → 创建 b2r conda env → clone box2robot → clone lerobot → 装 torch cu124 → 装 lerobot 全套 extras（wheel 全落 autodl-fs）。耗时 30-60 分钟。
+
+### 已知坑（避坑指南）
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| `Upload did not complete.` 创建 conda env 时 | conda 24.4 默认装 `anaconda-anon-usage` plugin，学术加速代理拦截 telemetry 上传导致 abort | `pip uninstall anaconda-anon-usage -y` |
+| `JSONDecodeError: Expecting value` conda 拉 repodata 失败 | repodata cache 损坏（拿到空 JSON） | `conda clean -i -y && rm -rf /root/miniconda3/pkgs/cache/*.json` |
+| `non-default solver backend (libmamba) but it was not recognized` | `CONDA_NO_PLUGINS` 关掉了 libmamba | `conda config --set solver classic` |
+| `lerobot/pyproject.toml: No such file or directory` | `git clone --depth 1 box2robot.git` 没拉 lerobot submodule | `cd box2robot_gpu_worker && rm -rf lerobot && git clone https://github.com/huggingface/lerobot.git lerobot && cd lerobot && git checkout cb0a9449` |
+| `torchaudio requires torch==2.6.0, but you have torch 2.10.0` | 装 lerobot 时 pip resolver 升级 torch 但没同步 torchaudio | 装完 lerobot 后再跑 `pip install torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128` 拉齐版本 |
+
+---
+
 ## 策略总览
 
 | 策略 | 类型 | 参数量 | 需要图像 | 最低显存 | 额外依赖 |

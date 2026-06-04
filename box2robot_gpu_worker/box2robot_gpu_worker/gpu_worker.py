@@ -432,6 +432,8 @@ class GPUWorker:
         if result["status"] == "need_bind":
             bind_code = result["bind_code"]
             self.device_id = result["device_id"]
+            # 记录首次 print 的 bind_code, _wait_for_bind 内部对比这个值判断是否轮转
+            self._last_printed_bind_code = bind_code
             print()
             print("=" * 50)
             print(f"  绑定码: {bind_code}")
@@ -508,20 +510,45 @@ class GPUWorker:
             return {}
 
     def _wait_for_bind(self, timeout=300) -> bool:
-        """Poll server until device is bound."""
+        """Poll server until device is bound.
+
+        每 3s re-activate 一次, 同时:
+        - 检测 bind_code 是否轮转, 变了重新 print (而不是只显示首次的 stale code).
+          为什么要做: server 端 bind_code 有 TTL, 过期会重新生成. worker 早期版本
+          只在 _activate() 入口 print 一次, 之后一直 stdout 显示首次 code.
+          但 server 端的有效 code 可能已经轮转, 这时:
+            - manage.py admin-bind 通过 SSH 抓 worker.log 拿到的是 stale code
+            - 调 server admin-bind API 时 server 说 "Invalid or expired bind_code"
+            - 用户看 APP 显示的 code (按 server 来) 跟 worker.log 不一致, 困惑
+          修法: bind_code 变了就重新 print, 让 worker.log + server 永远一致.
+        """
+        last_bind_code = getattr(self, "_last_printed_bind_code", "")
         t0 = time.time()
         while time.time() - t0 < timeout:
             time.sleep(3)
             try:
-                # Re-activate to check if bound
                 r = self.client.post(f"{self.server_url}/api/gpu/activate", json=self.hw_info)
                 r.raise_for_status()
                 data = r.json()
                 if data.get("status") == "activated":
                     self.device_id = data["device_id"]
                     self.token = data["token"]
+                    print()  # 换行, 跳出 \r 进度行
                     logger.info("绑定成功!")
                     return True
+                elif data.get("status") == "need_bind":
+                    new_code = data.get("bind_code", "")
+                    if new_code and new_code != last_bind_code:
+                        # bind_code 轮转了, 重新 print 一行让 manage.py admin-bind 能抓到新 code
+                        print()  # 换行跳出 \r
+                        print("=" * 50)
+                        print(f"  绑定码: {new_code}  (轮转, server 已废弃旧码)")
+                        print(f"  设备ID: {data.get('device_id', self.device_id)}")
+                        print("=" * 50)
+                        # 也写到 logger 让 file log handler 落盘
+                        logger.info("[BIND-ROTATE] new bind_code: %s", new_code)
+                        last_bind_code = new_code
+                        self._last_printed_bind_code = new_code
             except Exception:
                 pass
             remaining = int(timeout - (time.time() - t0))
@@ -1396,6 +1423,57 @@ def _cmd_upgrade(args):
     )
 
 
+def _prewarm_base_models_async():
+    """启动时后台预热 base 模型到 OS page cache, 加快首次任务加载.
+
+    背景: pi05_base / pi0_base 各 14GB, smolvla 873M, GR00T 5GB. 从 autodl-fs NFS
+    共享盘加载到 GPU 慢 (~4 分钟 pi05). lerobot 用 safetensors mmap, 实际依赖 OS
+    page cache. worker 启动时后台 cat 整文件到 /dev/null → 14GB 进 RAM page cache
+    → 后续 lerobot subprocess 读时 RAM hit → 加载从 ~4min 降到 ~30-60s (CPU bound).
+
+    线程模式 daemon=True: 不阻塞 worker bind/心跳; worker 早死 prewarm 也跟着停, 无遗留.
+    用 1MB chunk 顺序读: 比 cat /dev/null 多一次 syscall 但 Python stdlib 兼容性好.
+    RAM 占用: 约 34GB (smolvla+pi0+pi05+GR00T), 1TB 内存 AutoDL 实例无压力.
+    """
+    import threading, os, glob, time as _time
+
+    def _do_prewarm():
+        hf_home = os.environ.get("HF_HOME", "")
+        if not hf_home or not os.path.isdir(hf_home):
+            return
+        # 找所有 lerobot/*_base + GR00T + SmolVLM2 的 model.safetensors (含 sharded *.safetensors)
+        # paligemma 17M config-only 不预热; tokenizer/json 文件零碎不预热
+        patterns = [
+            f"{hf_home}/hub/models--lerobot--pi05_base/snapshots/*/model.safetensors",
+            f"{hf_home}/hub/models--lerobot--pi0_base/snapshots/*/model.safetensors",
+            f"{hf_home}/hub/models--lerobot--smolvla_base/snapshots/*/model.safetensors",
+            f"{hf_home}/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/*/*.safetensors",
+            f"{hf_home}/hub/models--nvidia--GR00T-N1.5-3B/snapshots/*/*.safetensors",
+        ]
+        files = []
+        for pat in patterns:
+            files.extend(glob.glob(pat))
+        if not files:
+            logger.debug("[PREWARM] no base model files found in %s", hf_home)
+            return
+        total_gb = sum(os.path.getsize(f) for f in files) / 1024**3
+        logger.info("[PREWARM] 后台预热 %d 个 base 模型文件到 page cache (~%.1fGB), "
+                    "首次任务加载会快 3-5x", len(files), total_gb)
+        t0 = _time.time()
+        for f in files:
+            try:
+                sz = os.path.getsize(f)
+                with open(f, "rb") as fh:
+                    while fh.read(1 << 20):  # 1MB chunk 顺序读到 page cache
+                        pass
+                logger.debug("[PREWARM]  %s (%.0f MB)", os.path.basename(f), sz/1024/1024)
+            except Exception as e:
+                logger.debug("[PREWARM] skip %s: %s", f, e)
+        logger.info("[PREWARM] 完成, 耗时 %.0fs", _time.time() - t0)
+
+    threading.Thread(target=_do_prewarm, name="base-prewarm", daemon=True).start()
+
+
 def _passive_version_check():
     """Worker 启动时被动跑一次版本检查 (失败/慢都不阻塞主流程).
 
@@ -1466,6 +1544,10 @@ def main():
     # 被动版本检查 (失败不阻塞)
     if not args.no_version_check:
         _passive_version_check()
+
+    # 后台预热 base 模型到 OS page cache, 加快首次任务加载
+    # (pi05 14GB 从 autodl-fs NFS 加载 4 分钟 → page cache 命中后 ~30s)
+    _prewarm_base_models_async()
 
     # 自动选择 output_dir: 优先共享网盘 (autodl-fs / 类似挂载点), 否则 cwd outputs/.
     # 共享盘 = 同一 AutoDL 账号的多台实例共享, 跨机器推理部署也能读到模型.

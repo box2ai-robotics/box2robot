@@ -18,6 +18,12 @@
 #   MANAGER_INSTALL_FAIL     - probe/deps/install/autostart 任意一步失败
 #   MANAGER_WORKER_TIMEOUT   - start_worker/wait_bind 超时
 #   MANAGER_UNKNOWN          - 兜底 (set -e 触发的隐式失败)
+#
+# autodl-fs 共享盘策略 (region 内跨实例持久化):
+#   /root/autodl-fs/data/box2robot-base-models  ← HF_HOME (HuggingFace 模型权重)
+#   /root/autodl-fs/pip-cache                   ← PIP_CACHE_DIR (pip wheel 缓存)
+# 第一台实例首次装 lerobot[diffusion]/[pi]/[smolvla] 等 extras 会下载 wheel 到 pip-cache,
+# 之后同 region 任何实例 pip install 都从该 cache 离线装, 不再走网络. 跨 region 各装一份.
 
 set -e
 
@@ -47,6 +53,12 @@ SERVER="https://robot.box2ai.com"
 CUDA="cu124"
 PROJECT_DIR="/root/box2robot_gpu_worker"
 LOG="/root/b2r_install.log"
+
+# autodl-fs 共享盘根目录探测 (region 内跨实例持久化, 用于 HF_HOME + pip cache)
+AUTODL_FS_ROOT=""
+for d in /root/autodl-fs /autodl-fs; do
+  [[ -d "$d" ]] && AUTODL_FS_ROOT="$d" && break
+done
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -129,16 +141,19 @@ echo "[$(date +%T)] [2/5] 装 PyTorch ($CUDA) + LeRobot 依赖"
 export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
 # HuggingFace 镜像
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
-# HF_HOME 统一指向 autodl-fs (同 region 共享盘),
-# 让 4 台 worker 共享同一份 base 权重 (pi0/pi05 base 14GB+, 不重复下载)
-# 优先 /root/autodl-fs/data (新版 AutoDL 实例), fallback /autodl-fs/data
-if [[ -d /root/autodl-fs/data ]]; then
-  export HF_HOME=${HF_HOME:-/root/autodl-fs/data/box2robot-base-models}
-elif [[ -d /autodl-fs/data ]]; then
-  export HF_HOME=${HF_HOME:-/autodl-fs/data/box2robot-base-models}
+# autodl-fs 共享盘 (region 内跨实例持久化):
+#   HF_HOME       → base 权重缓存 (pi0/pi05 14GB+, 跨 worker 复用)
+#   PIP_CACHE_DIR → pip wheel 缓存 (lerobot[diffusion]/[pi]/[smolvla] 等 extras
+#                   首次实例下载, 之后所有实例从共享盘秒装, 不再走网络)
+if [[ -n "$AUTODL_FS_ROOT" ]]; then
+  export HF_HOME=${HF_HOME:-$AUTODL_FS_ROOT/data/box2robot-base-models}
+  export PIP_CACHE_DIR=${PIP_CACHE_DIR:-$AUTODL_FS_ROOT/pip-cache}
+  mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" 2>/dev/null || true
+  echo "  HF_HOME       = $HF_HOME"
+  echo "  PIP_CACHE_DIR = $PIP_CACHE_DIR (跨实例 wheel 缓存)"
+else
+  echo "  ⚠ autodl-fs 不可用, pip cache 走本地默认 (~/.cache/pip), 跨实例不共享"
 fi
-mkdir -p "$HF_HOME" 2>/dev/null || true
-echo "  HF_HOME = $HF_HOME (autodl-fs 共享盘, 跨实例复用)"
 
 if ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
   echo "  → torch CUDA 版未装，开始安装"
@@ -148,15 +163,24 @@ if ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
 fi
 $PY -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
 
-# LeRobot 基础 + dataset + training 扩展
-#   dataset:  pi0/smolvla 等 VLA 模型 + 数据集 codec (av) 必需
-#   training: lerobot_train 入口需要 accelerate, 否则 worker 抢任务后训练立即崩
+# LeRobot 基础 + 全部 policy extras
+# 历史教训 (2026-05-10): 之前只装 [dataset,training], 然后训 pi0 / smolvla / diffusion / gr00t
+# 各自缺包都要 hot-fix 一次:
+#   - lerobot[pi]: transformers (pi0/pi05 用)
+#   - lerobot[smolvla]: transformers (smolvla 用, 跟 pi 共享)
+#   - lerobot[diffusion]: diffusers
+#   - lerobot[gr00t]: peft, dm-tree (注: lerobot pyproject.toml 没列 dm-tree 在 extras 里, 单独装)
+#   - lerobot[peft]: peft (LoRA 微调用)
+# 改成默认装全套, 一次到位. pip-cache 共享盘命中后秒装, 没显著延长 setup 时间.
 # 用 import accelerate 判断, 因为 import lerobot 顶层 success 不代表 training extras 装好.
-if ! $PY -c "import lerobot, accelerate" 2>/dev/null; then
+if ! $PY -c "import lerobot, accelerate, transformers, diffusers, peft, tree" 2>/dev/null; then
   echo "  → 装 lerobot 基础包"
   (cd lerobot && $PIP install -e . --no-build-isolation) 2>&1 | tee -a "$LOG"
-  echo "  → 装 lerobot[dataset,training]"
-  $PIP install "lerobot[dataset,training] @ file:./lerobot" --no-build-isolation 2>&1 | tee -a "$LOG" || true
+  echo "  → 装 lerobot[dataset,training,pi,smolvla,diffusion,peft,gr00t]"
+  $PIP install "lerobot[dataset,training,pi,smolvla,diffusion,peft,gr00t] @ file:./lerobot" --no-build-isolation 2>&1 | tee -a "$LOG" || true
+  # GR00T 用的 dm-tree (Google DeepMind tree util) 不在 lerobot extras 里, 单独装
+  echo "  → 装 dm-tree (GR00T 依赖, lerobot extras 漏列)"
+  $PIP install dm-tree 2>&1 | tee -a "$LOG" || true
 fi
 
 # ---- Phase 3: box2robot_gpu_worker ----
@@ -236,6 +260,7 @@ Environment=PATH=$PY_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 Environment=HF_ENDPOINT=$HF_ENDPOINT
 Environment=HF_HOME=$HF_HOME
 Environment=PIP_INDEX_URL=$PIP_INDEX_URL
+Environment=PIP_CACHE_DIR=${PIP_CACHE_DIR:-/root/.cache/pip}
 ExecStart=$ENTRY --server $SERVER
 Restart=always
 RestartSec=10

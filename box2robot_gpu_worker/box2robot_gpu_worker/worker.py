@@ -412,7 +412,44 @@ class TrainingWorker:
     POLICY_FIELDS["pi0_fast"] = POLICY_FIELDS["pi0"]
     POLICY_FIELDS["pi05"] = POLICY_FIELDS["pi0"]
 
+    # 需要 tuple[int, int] 的字段 — 前端可能传 int 或 [int,int], _add_policy_param 自动 wrap.
+    # 不处理的话 draccus 会抛 DecodingError("`image_size`: ... 'int' has no len()") 让训练 exit 1.
+    # (model_type, real_key) → 维度 (2 = [H,W], 3 = [H,W,C])
+    # 注意 model_type key 用 worker 内部归一化后的值: "gr00t" (前端) → "groot" (lerobot 上游)
+    # 见 _normalize_model_type / __init__.py:14, 这里必须用 "groot" 才能匹配!
+    _TUPLE_INT_FIELDS = {
+        ("groot", "image_size"): 2,         # GrootConfig.image_size: tuple[int, int]
+        ("diffusion", "crop_shape"): 2,     # DiffusionConfig.crop_shape: tuple[int, int] | None
+        ("diffusion", "resize_shape"): 2,   # DiffusionConfig.resize_shape: tuple[int, int]
+    }
+
     @classmethod
+    def _wrap_tuple_int(cls, model_type: str, real_key: str, value):
+        """前端传 int (如 224) 时, 把 value 自动转成 '[N,N]' (draccus 能解析的 JSON list).
+        非 tuple 字段直接返回 value 不动.
+        """
+        dim = cls._TUPLE_INT_FIELDS.get((model_type, real_key))
+        if dim is None:
+            return value
+        # 已经是 list/tuple 的, 转成 JSON 风格字符串让 draccus 解析
+        if isinstance(value, (list, tuple)):
+            try:
+                items = [int(x) for x in value]
+                if len(items) == dim:
+                    return "[" + ",".join(str(x) for x in items) + "]"
+            except (ValueError, TypeError):
+                return value
+            return value
+        # 标量 (int / "224") → 复制成 dim 维
+        try:
+            v = int(str(value).strip())
+            wrapped = "[" + ",".join([str(v)] * dim) + "]"
+            logger.info("[%s] auto-wrap %s: %r → %s (tuple[int]*%d)",
+                        model_type.upper(), real_key, value, wrapped, dim)
+            return wrapped
+        except (ValueError, TypeError):
+            return value
+
     def _add_policy_param(cls, cmd: list, model_type: str, key: str, value) -> bool:
         """加 --policy.{key}={value} 到 cmd, 但只在该 model 实际支持时.
 
@@ -421,12 +458,15 @@ class TrainingWorker:
         本函数:
         1. 把前端 key 通过 PARAM_ALIASES 映射到真实 config 字段名 (如 lr→optimizer_lr)
         2. 用 POLICY_FIELDS[model_type] 校验, 不在白名单的静默跳过 + warning
-        3. 通过则 append --policy.{真实字段}={value}
+        3. 对 tuple[int] 类字段 (如 gr00t.image_size) 自动 wrap (前端传 int 时复制成 [N,N])
+        4. 通过则 append --policy.{真实字段}={value}
 
         Returns True if added, False if skipped.
         """
         real_key = cls.PARAM_ALIASES.get(key, key)
         fields = cls.POLICY_FIELDS.get(model_type)
+        # 自动 wrap tuple 字段 (gr00t.image_size 等) — 在 white-list 检查前做, 让 wrap 后的值也能透传
+        value = cls._wrap_tuple_int(model_type, real_key, value)
         if fields is None:
             # 未知 model_type — 兜底放行, 让 lerobot 自己报错
             cmd.append(f"--policy.{real_key}={value}")
@@ -565,6 +605,32 @@ class TrainingWorker:
                 "HuggingFace Hub 下载失败 (网络问题). 解决方案:\n"
                 "  - 检查网络 / 代理\n"
                 "  - 国内可设 HF_ENDPOINT=https://hf-mirror.com 后重启 worker"
+            )
+        elif "config.json not found on the huggingface hub" in joined:
+            # lerobot policies.py:202 把 LocalEntryNotFoundError (offline+无缓存) 包成这条
+            # 误导性消息; 真正原因是 HF_HUB_OFFLINE=1 + base 模型未预下载. 主进程的
+            # _ensure_vla_base_cached 应该已经预下了, 走到这里说明该方法被跳过或网络一直挂.
+            kw_hint = (
+                "VLA base 模型未预下载到 HF cache, 训练子进程离线模式下找不到 config.json.\n"
+                "  - 主 worker 进程网络是否通: curl -I $HF_ENDPOINT\n"
+                "  - AutoDL: source /etc/network_turbo 启用学术加速\n"
+                "  - 国内: 设 HF_ENDPOINT=https://hf-mirror.com\n"
+                "  - 手动预下: huggingface-cli download lerobot/smolvla_base\n"
+                "  - 检查 HF_HOME 磁盘空间 (smolvla ~2GB / pi0 ~6GB / pi05 ~14GB)"
+            )
+        elif ("we couldn't connect to" in joined and "huggingface" in joined) \
+                or ("oserror" in joined and "couldn't find them in the cached files" in joined):
+            # transformers/utils/hub.py 在 OFFLINE=1 + cache 缺失时的报错文案.
+            # 多见于 SmolVLA 的 VLM 主干 (HuggingFaceTB/SmolVLM2-500M-Video-Instruct)
+            # 没被预下到 cache. _ensure_vla_base_cached 会同时拉 base + VLM 依赖,
+            # 走到这里说明 VLM_DEPS 没覆盖到, 或主进程 HF 不通.
+            kw_hint = (
+                "transformers 加载模型时找不到 cache 又联不上 HF.\n"
+                "  通常是 SmolVLA 的 VLM 主干 (SmolVLM2-500M-Video-Instruct) 没预下载.\n"
+                "  - 主 worker 进程网络是否通: curl -I $HF_ENDPOINT\n"
+                "  - AutoDL: source /etc/network_turbo\n"
+                "  - 手动预下 VLM: huggingface-cli download HuggingFaceTB/SmolVLM2-500M-Video-Instruct\n"
+                "  - 检查 HF_HOME 磁盘空间 (SmolVLM2 ~1GB)"
             )
         elif "all image features are missing" in joined:
             kw_hint = (
@@ -774,6 +840,201 @@ class TrainingWorker:
             )
             return list(fallback)
         return []
+
+    # VLA base 间接依赖的 VLM/backbone repo (lerobot/xxx_base 之外还要从 HF 拉的)
+    # smolvla = SmolVLM2 + action expert; base 包只有 expert, VLM 走单独 repo.
+    # pi0/pi05 的 gemma 权重已经塞在 base 包里, 不需要额外拉.
+    VLA_VLM_DEPS = {
+        "lerobot/smolvla_base": ["HuggingFaceTB/SmolVLM2-500M-Video-Instruct"],
+    }
+
+    @staticmethod
+    def _hf_snapshot_or_raise(repo_id: str, *, allow_patterns: list, label: str) -> str:
+        """主进程在线状态拉一个 HF repo snapshot. 临时撤销 OFFLINE env, 失败抛
+        RuntimeError 让上层把 job 标 failed + 给清晰错误.
+        """
+        import os as _os
+        from huggingface_hub import snapshot_download
+        prev_offline = _os.environ.pop("HF_HUB_OFFLINE", None)
+        prev_tf_offline = _os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        prev_ds_offline = _os.environ.pop("HF_DATASETS_OFFLINE", None)
+        hf_home = _os.environ.get("HF_HOME") or _os.path.expanduser("~/.cache/huggingface")
+        endpoint = _os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+        logger.info("[VLA-CACHE] %s 预下: repo=%s endpoint=%s HF_HOME=%s",
+                    label, repo_id, endpoint, hf_home)
+        try:
+            local_dir = snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=allow_patterns,
+            )
+            logger.info("[VLA-CACHE] %s OK → %s", label, local_dir)
+            return local_dir
+        except Exception as e:
+            logger.error("[VLA-CACHE] %s snapshot_download 失败: %s", label, e)
+            raise RuntimeError(
+                f"{label} '{repo_id}' 下载失败: {e}\n"
+                f"  HF_ENDPOINT={endpoint}\n"
+                f"  HF_HOME={hf_home}\n"
+                f"  解决方案:\n"
+                f"  1. 检查 GPU 节点网络 (curl -I {endpoint})\n"
+                f"  2. AutoDL 实例: source /etc/network_turbo 启用学术加速\n"
+                f"  3. 国内可设 HF_ENDPOINT=https://hf-mirror.com 后重启 worker\n"
+                f"  4. 手动预下: huggingface-cli download {repo_id}"
+            ) from e
+        finally:
+            if prev_offline is not None:
+                _os.environ["HF_HUB_OFFLINE"] = prev_offline
+            if prev_tf_offline is not None:
+                _os.environ["TRANSFORMERS_OFFLINE"] = prev_tf_offline
+            if prev_ds_offline is not None:
+                _os.environ["HF_DATASETS_OFFLINE"] = prev_ds_offline
+
+    @classmethod
+    def _ensure_vla_base_cached(cls, pretrained_path: str) -> None:
+        """确保 VLA base (config.json + 权重 + tokenizer + VLM 主干) 已下载到 HF cache.
+
+        训练子进程会被强制设 HF_HUB_OFFLINE=1 (避免训练中途调 model_info() 崩),
+        所以必须在主 worker 进程 (在线) 把 base 整套预下到 cache. 否则首次训练
+        SmolVLA / Pi0 时子进程立刻抛:
+            FileNotFoundError: config.json not found on the HuggingFace Hub in lerobot/smolvla_base
+            OSError: We couldn't connect to 'https://huggingface.co' to load the files...
+        实际是 LocalEntryNotFoundError (offline + 不在 cache) 被 lerobot/transformers
+        包装成看起来像"Hub 上没这个文件 / 没网"的误导性错误.
+
+        本地路径 (含 / 或 \\) 跳过. HF repo_id 才下载. snapshot_download 已缓存
+        会立刻返回 (秒级).
+
+        SmolVLA 特殊处理: 还要拉 VLM 主干 (HuggingFaceTB/SmolVLM2-500M-Video-Instruct).
+        smolvla_base 只有 action expert 权重, 训练时 transformers 还要从 vlm_model_name
+        拉 VLM tokenizer + config + 权重, 不预下也会因 OFFLINE=1 崩.
+        """
+        import os as _os
+        if not pretrained_path:
+            return
+        # 本地绝对/相对路径 (含 config.json 的目录) 不需要拉
+        if _os.path.isabs(pretrained_path) or _os.sep in pretrained_path \
+                or _os.path.isdir(pretrained_path):
+            logger.info("[VLA-CACHE] 本地路径, 跳过 snapshot_download: %s", pretrained_path)
+            return
+        try:
+            from huggingface_hub import snapshot_download  # noqa: F401  (检测可用性)
+        except Exception as e:
+            logger.warning("[VLA-CACHE] huggingface_hub 不可用: %s — 子进程在线模式兜底", e)
+            return
+
+        # Step 1: 拉 VLA base 包本身 (action expert 权重 + config + tokenizer)
+        cls._hf_snapshot_or_raise(
+            pretrained_path,
+            allow_patterns=[
+                "*.json", "*.safetensors", "*.bin", "*.model",
+                "tokenizer*", "*.txt", "*.py",
+            ],
+            label="VLA base",
+        )
+
+        # Step 2: 读 base 的 config.json, 找 vlm_model_name (smolvla 必有, 其它 VLA 可能没有)
+        vlm_deps = list(cls.VLA_VLM_DEPS.get(pretrained_path, []))
+        try:
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(repo_id=pretrained_path, filename="config.json")
+            with open(cfg_path, encoding="utf-8") as f:
+                base_cfg = json.load(f)
+            dynamic_vlm = base_cfg.get("vlm_model_name", "")
+            if dynamic_vlm and dynamic_vlm not in vlm_deps:
+                vlm_deps.append(dynamic_vlm)
+        except Exception as e:
+            # base 没 vlm_model_name 字段 (pi0/pi05) 或读不到 - 走硬编码 deps 即可
+            logger.debug("[VLA-CACHE] 读 base config.json 拿 vlm_model_name 失败: %s", e)
+
+        # Step 3: 拉所有间接依赖 (VLM 主干 + tokenizer)
+        for vlm_repo in vlm_deps:
+            cls._hf_snapshot_or_raise(
+                vlm_repo,
+                # VLM 主干: 配置 + 权重 + tokenizer; 不下示例图省带宽
+                allow_patterns=[
+                    "*.json", "*.safetensors", "*.bin", "*.model",
+                    "tokenizer*", "*.txt", "vocab*", "merges*", "added_tokens*",
+                    "special_tokens*", "preprocessor_config*",
+                ],
+                label="VLM 主干",
+            )
+
+    @classmethod
+    def _ensure_groot_eagle_assets(cls, assets_repo: str) -> None:
+        """GR00T 训练时 lerobot 内部 ensure_eagle_cache_ready 会从 HF 下 11 个
+        tokenizer/processor assets, 但子进程 HF_HUB_OFFLINE=1 下不动. 这里主进程
+        (在线) 预下到 $HF_HOME/lerobot/<assets_repo>/.
+
+        路径计算 (跟 lerobot/utils/constants.py + groot/groot_n1.py 对齐):
+            HF_LEROBOT_HOME = HF_HOME / "lerobot"
+            cache_dir       = HF_LEROBOT_HOME / assets_repo
+                            = $HF_HOME/lerobot/lerobot/eagle2hg-processor-groot-n1p5/
+        (路径里 lerobot/lerobot/ 重复是 lerobot 的 cache 子目录 + repo_id 含 'lerobot/' org 前缀, 不是 bug)
+        """
+        import os as _os
+        if not assets_repo:
+            return
+        try:
+            from huggingface_hub import hf_hub_download
+        except Exception as e:
+            logger.warning("[GROOT-EAGLE] huggingface_hub 不可用: %s", e)
+            return
+        hf_home = _os.environ.get("HF_HOME") or _os.path.expanduser("~/.cache/huggingface")
+        target_dir = _os.path.join(hf_home, "lerobot", assets_repo)
+        # 已下完整 (config.json 在) → 跳过, 别重复请求
+        if _os.path.isfile(_os.path.join(target_dir, "config.json")) \
+                and _os.path.isfile(_os.path.join(target_dir, "vocab.json")):
+            logger.info("[GROOT-EAGLE] cache 已完整, 跳过预下: %s", target_dir)
+            return
+        _os.makedirs(target_dir, exist_ok=True)
+        # 临时撤销 OFFLINE env (主进程必须能联网)
+        prev_offline = _os.environ.pop("HF_HUB_OFFLINE", None)
+        prev_tf_offline = _os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        endpoint = _os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+        _os.environ.setdefault("HF_HUB_DISABLE_XET", "1")  # 大文件走 LFS, 防 401
+        # 跟 lerobot/policies/groot/utils.py::ensure_eagle_cache_ready 必下清单一致
+        ASSETS = [
+            "vocab.json", "merges.txt", "added_tokens.json", "chat_template.json",
+            "special_tokens_map.json", "config.json", "generation_config.json",
+            "preprocessor_config.json", "processor_config.json", "tokenizer_config.json",
+        ]
+        logger.info("[GROOT-EAGLE] 预下 eagle assets: repo=%s endpoint=%s target=%s",
+                    assets_repo, endpoint, target_dir)
+        try:
+            for fname in ASSETS:
+                dst = _os.path.join(target_dir, fname)
+                if _os.path.isfile(dst):
+                    continue
+                try:
+                    hf_hub_download(repo_id=assets_repo, filename=fname,
+                                    repo_type="model", local_dir=target_dir)
+                    logger.info("[GROOT-EAGLE]   OK %s", fname)
+                except Exception as e:
+                    # 个别文件不存在 (如 tokenizer.json 在某些版本是 404) → SKIP, 不阻塞
+                    logger.warning("[GROOT-EAGLE]   SKIP %s: %s", fname,
+                                   type(e).__name__)
+            # patch config.json: HF 上 _attn_implementation="flash_attention_2", 但 worker
+            # 环境通常没装 flash_attn (装编译麻烦, 需 nvcc + torch 版本严格对齐).
+            # 改成 "sdpa" (PyTorch 内置 Scaled Dot-Product Attention, 所有 GPU 都支持).
+            cfg_path = _os.path.join(target_dir, "config.json")
+            if _os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    if cfg.get("_attn_implementation") == "flash_attention_2":
+                        cfg["_attn_implementation"] = "sdpa"
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f, ensure_ascii=False, indent=2)
+                        logger.info("[GROOT-EAGLE] patched config.json: "
+                                    "_attn_implementation flash_attention_2 → sdpa "
+                                    "(worker 没装 flash_attn, sdpa 是 PyTorch 内置兜底)")
+                except Exception as e:
+                    logger.warning("[GROOT-EAGLE] patch config.json 失败: %s", e)
+        finally:
+            if prev_offline is not None:
+                _os.environ["HF_HUB_OFFLINE"] = prev_offline
+            if prev_tf_offline is not None:
+                _os.environ["TRANSFORMERS_OFFLINE"] = prev_tf_offline
 
     def _train_lerobot(self, trajectories, model_type, model_dir,
                        train_steps, batch_size, chunk_size, custom_params, progress_cb,
@@ -1034,6 +1295,11 @@ class TrainingWorker:
             )
             cmd.append(f"--policy.path={pretrained_path}")
 
+            # 预下载 VLA base 到 HF cache (主进程在线状态), 否则训练子进程因
+            # HF_HUB_OFFLINE=1 + cache 缺 config.json/权重立刻挂. snapshot_download
+            # 已缓存即刻返回; 失败抛 RuntimeError, 上层把 job 标 failed.
+            self._ensure_vla_base_cached(pretrained_path)
+
             # === 图像 key 适配 (rename_map) ===
             # base 训练时用了不同数据集 (pi0_base=aloha, pi05_base=droid, smolvla=...),
             # input_features 里的 cam 命名跟我们 Box2Robot dataset 的 'observation.images.wrist'
@@ -1125,22 +1391,76 @@ class TrainingWorker:
                                     custom_params.get("dtype", "bfloat16"))
             self._add_policy_param(cmd, model_type, "gradient_checkpointing",
                                     custom_params.get("gradient_checkpointing", "true"))
-            # SmolVLA: freeze vision + train expert only 默认开 (省显存); 其它 VLA 默认关
-            if model_type == "smolvla":
+
+            # === 显存预算预检 (B) — 不让用户白等几分钟加载完才发现 OOM ===
+            # pi0 / pi05 / pi0_fast 是 4B 参数; 全量微调时:
+            #   weights (bf16) 8GB + grad (bf16) 8GB + Adam 一阶矩 (fp32) 16GB + 二阶矩 16GB
+            #   ≈ 48GB (光优化器状态), 加 activations + KV cache 实际要 60-80GB.
+            # 已知在 4080 SUPER 32GB / vGPU-32GB 上 100% OOM (实测 1d4fc93f 任务 25s 后崩).
+            # smolvla 450M 全量微调约 8-12GB, 32GB 能跑.
+            def _truthy(v) -> bool:
+                return str(v).lower() in ("true", "1", "yes", "on")
+            def _falsy(v) -> bool:
+                return str(v).lower() in ("false", "0", "no", "off", "")
+            if model_type in ("pi0", "pi0_fast", "pi05"):
+                # 用户显式传 false (没让默认 true 兜底) → 全量微调路径
+                fve = custom_params.get("freeze_vision_encoder", "true")
+                teo = custom_params.get("train_expert_only", "true")
+                # peft (LoRA) 启用时不需要这检查 (LoRA 只训百万参数, 全量"骨架"冻结)
+                peft_on = _truthy(custom_params.get("peft_enable", ""))
+                if not peft_on and _falsy(fve) and _falsy(teo):
+                    # 拿当前 GPU vram (worker self.hw_info 在子类里; 用 nvidia-smi 现查兜底)
+                    vram_gb = 0
+                    try:
+                        import subprocess as _sp
+                        r = _sp.run(["nvidia-smi", "--query-gpu=memory.total",
+                                     "--format=csv,noheader,nounits"],
+                                    capture_output=True, text=True, timeout=5)
+                        if r.returncode == 0:
+                            vram_gb = int(r.stdout.strip().splitlines()[0]) // 1024
+                    except Exception:
+                        pass
+                    REQUIRED_GB = 60
+                    if vram_gb and vram_gb < REQUIRED_GB:
+                        msg = (
+                            f"{model_type.upper()} 全量微调 (freeze_vision_encoder=false + "
+                            f"train_expert_only=false) 需 ≥ {REQUIRED_GB}GB VRAM (4B 参数 "
+                            f"+ Adam 一阶/二阶矩 ~48GB), 当前 GPU 仅 {vram_gb}GB.\n"
+                            f"\n"
+                            f"建议 (任选其一):\n"
+                            f"  1. (推荐) 关闭全量微调: freeze_vision_encoder=true + "
+                            f"train_expert_only=true (worker 默认值, ~16GB 即可)\n"
+                            f"  2. 改用 LoRA 微调: peft_enable=true peft_method_type=LORA peft_r=16\n"
+                            f"  3. 换更大显存 GPU (H100/A100 80G)\n"
+                            f"\n"
+                            f"如确认 GPU 显存足够 (运维强制), 可在 custom_params 加 "
+                            f"'override_vram_budget=true' 跳过本检查."
+                        )
+                        if not _truthy(custom_params.get("override_vram_budget", "")):
+                            raise RuntimeError(f"[VRAM-BUDGET] {msg}")
+                        else:
+                            logger.warning("[VRAM-BUDGET] 全量微调 vram 预算超限 (need %dGB, "
+                                           "have %dGB), 但 override_vram_budget=true 强制继续",
+                                           REQUIRED_GB, vram_gb)
+
+            # 所有 VLA: freeze vision encoder + train expert only 默认开 (省显存).
+            # 不开的话: pi0 (4B) / pi05 (4B) / smolvla (450M) 训练时全 forward 4B/450M
+            # 加 Adam 二阶矩 → 4080 SUPER 32GB 都装不下 (实测 OOM, 见 fix_history).
+            # 用户想全量微调可在 custom_params 显式传 false 覆盖.
+            if model_type in ("smolvla", "pi0", "pi0_fast", "pi05"):
                 self._add_policy_param(cmd, model_type, "freeze_vision_encoder",
                                         custom_params.get("freeze_vision_encoder", "true"))
                 self._add_policy_param(cmd, model_type, "train_expert_only",
                                         custom_params.get("train_expert_only", "true"))
+            # SmolVLA 独有: train_state_proj (pi0/pi05 没这字段)
+            if model_type == "smolvla":
                 self._add_policy_param(cmd, model_type, "train_state_proj",
                                         custom_params.get("train_state_proj", "true"))
-            # Pi0/Pi05: 可选 compile + expert-only
-            elif model_type in ("pi0", "pi0_fast", "pi05"):
+            # Pi0/Pi05: 可选 compile_model
+            if model_type in ("pi0", "pi0_fast", "pi05"):
                 if custom_params.get("compile_model"):
                     self._add_policy_param(cmd, model_type, "compile_model",
                                             custom_params["compile_model"])
-                if custom_params.get("train_expert_only"):
-                    self._add_policy_param(cmd, model_type, "train_expert_only",
-                                            custom_params["train_expert_only"])
             # VLA chunk_size/n_action_steps: use model defaults (50) unless explicitly overridden
             if chunk_size > 1 and custom_params.get("override_chunk_size"):
                 self._add_policy_param(cmd, model_type, "chunk_size", chunk_size)
@@ -1149,6 +1469,37 @@ class TrainingWorker:
             # ACT/Diffusion/GR00T 等: train from scratch
             cmd.append(f"--policy.type={model_type}")
             cmd.append(f"--policy.repo_id=box2robot/{repo_id}")
+            # GR00T 训练需要 lerobot/eagle2hg-processor-groot-n1p5 的 11 个
+            # tokenizer/processor assets. lerobot 内部的 ensure_eagle_cache_ready
+            # 会在子进程里 hf_hub_download 这些文件, 但 worker 子进程 HF_HUB_OFFLINE=1
+            # 拉不动 → ValueError("Unrecognized model in .../eagle2hg-processor-groot-n1p5").
+            # 这里在主进程 (在线) 预下到 $HF_HOME/lerobot/<assets_repo>/, 让子进程离线
+            # 模式下 AutoConfig.from_pretrained 能读到.
+            if model_type == "groot":
+                custom_repo = custom_params.get("tokenizer_assets_repo",
+                                                "lerobot/eagle2hg-processor-groot-n1p5")
+                self._ensure_groot_eagle_assets(custom_repo)
+                # 强制 max_state_dim/max_action_dim 跟 GR00T-N1.5-3B 预训练 head 对齐.
+                # 预训练 head 硬编码 action_dim=32 / state_dim=64 (action_head_cfg). 用户实际
+                # action 维度可以小 (BoxBot 6/7/8 关节), 但要 0-padding 到 32/64 才匹配 head shape.
+                # 不强制就崩在 validate_inputs: action.shape[2] != self.action_dim.
+                GROOT_REQUIRED_STATE_DIM = 64
+                GROOT_REQUIRED_ACTION_DIM = 32
+                user_state = int(custom_params.get("max_state_dim", 0) or 0)
+                user_action = int(custom_params.get("max_action_dim", 0) or 0)
+                if user_state and user_state < GROOT_REQUIRED_STATE_DIM:
+                    logger.warning("[GROOT] max_state_dim=%d 太小, 强制设为 %d (跟预训练 head 对齐)",
+                                   user_state, GROOT_REQUIRED_STATE_DIM)
+                    custom_params["max_state_dim"] = GROOT_REQUIRED_STATE_DIM
+                if user_action and user_action < GROOT_REQUIRED_ACTION_DIM:
+                    logger.warning("[GROOT] max_action_dim=%d 太小, 强制设为 %d (跟预训练 head 对齐)",
+                                   user_action, GROOT_REQUIRED_ACTION_DIM)
+                    custom_params["max_action_dim"] = GROOT_REQUIRED_ACTION_DIM
+                # 用户没传时也补默认 (不依赖前端 schema 改)
+                if "max_state_dim" not in custom_params:
+                    custom_params["max_state_dim"] = GROOT_REQUIRED_STATE_DIM
+                if "max_action_dim" not in custom_params:
+                    custom_params["max_action_dim"] = GROOT_REQUIRED_ACTION_DIM
             if chunk_size > 1:
                 # Diffusion 用 horizon 不是 chunk_size; 其它走 chunk_size
                 if model_type == "diffusion":
@@ -1271,9 +1622,24 @@ class TrainingWorker:
         tail_lines: deque = deque(maxlen=80)
         import re
         # Match INFO log: "step:10 smpl:80 loss:41.394 grdn:627.730"
-        metrics_re = re.compile(r'\bstep:(\d+)\b.*\bloss:([\d.e+-]+)\b')
+        # 注意: lerobot MetricsTracker.__str__ 用 format_big_number(step, precision=0),
+        # step >= 1000 会变成 "step:1K" / "step:50K" / "step:1.2M" — 必须把 K/M/B/T/Q 后缀也接住,
+        # 否则 pi0 / 大步数训练 (步数 1000+) 全程没法上报 step.
+        metrics_re = re.compile(
+            r'\bstep:([\d.]+[KMBTQ]?)\b.*?\bloss:([\d.e+-]+)\b'
+        )
         # Match tqdm progress: "Training:  15%|...| 150/10000 [01:23<..."
         tqdm_re = re.compile(r'Training:\s+\d+%\|.*\|\s*(\d+)/(\d+)\s+\[')
+
+        def _parse_big_num(s: str) -> int:
+            """反解析 lerobot format_big_number — '1K' → 1000, '1.2M' → 1200000."""
+            s = s.strip()
+            if not s:
+                return 0
+            mult = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000, "T": 10**12, "Q": 10**15}
+            if s[-1] in mult:
+                return int(float(s[:-1]) * mult[s[-1]])
+            return int(float(s))
 
         # ===== stdout 心跳监控 (P0 #1) =====
         # 之前直接 for line in proc.stdout 阻塞读, 子进程卡死 (CUDA / 死锁 / IO 死等) 时
@@ -1357,10 +1723,12 @@ class TrainingWorker:
             m = metrics_re.search(line)
             if m:
                 try:
-                    step = int(m.group(1))
+                    step = _parse_big_num(m.group(1))
                     loss = float(m.group(2))
                     if step > last_report_step:
                         metrics = {"loss": loss}
+                        # 其它数值指标 (grdn / lr / dt / ...) — 跳过 step/smpl/ep 这种 K-format 整数,
+                        # 它们用 [\d.e+-]+ 不一定能精确解析回来, 而且 server 端不需要.
                         for kv in re.findall(r'(\w+):([\d.e+-]+)', line):
                             if kv[0] not in ("step", "smpl", "ep"):
                                 try:
@@ -1385,6 +1753,15 @@ class TrainingWorker:
                         pass
             # 其他重要行 (WARNING/ERROR/INFO 但非 metrics)
             elif any(k in line for k in ("WARNING", "ERROR", "Creating", "End of", "Checkpoint", "Start")):
+                # 过滤已知预期但每次都打的 noise (避免吓用户):
+                #   - lerobot 默认 device='mps' (Apple Silicon), 没 mps 时 fallback cuda — 正常行为, 每次启动打 2 次
+                # 别的 WARNING (Vision embedding key / quantile stats / etc) 仍透传, 它们是有用信息
+                LERROR_NOISE_KEYWORDS = (
+                    "Device 'mps' is not available",
+                    "Switching to 'cuda'",
+                )
+                if any(noise in line for noise in LERROR_NOISE_KEYWORDS):
+                    continue   # 静默丢弃, 不上报 server
                 report_metrics: dict = {"log": line}
                 # Checkpoint 保存事件 — 扫描并上报 checkpoint 列表
                 if "Checkpoint" in line:
