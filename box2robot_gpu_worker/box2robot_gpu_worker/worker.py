@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from box2robot_gpu_worker.lerobot_extensions import ensure_lerobot_policy_extensions
 from box2robot_gpu_worker import normalize_model_type as _normalize_model_type
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -47,6 +48,26 @@ def _setup_file_logging() -> None:
 
 
 _setup_file_logging()
+
+
+def _policy_expects_images(policy_config) -> bool:
+    """根据 policy config 推断推理时是否需要摄像头输入."""
+    if policy_config is None:
+        return False
+
+    image_features = getattr(policy_config, "image_features", None) or {}
+    if image_features:
+        return True
+
+    input_features = getattr(policy_config, "input_features", None) or {}
+    for key, feature in input_features.items():
+        if isinstance(key, str) and key.startswith("observation.images."):
+            return True
+        feature_type = getattr(feature, "type", None)
+        feature_type = getattr(feature_type, "value", feature_type)
+        if feature_type == "VISUAL":
+            return True
+    return False
 
 
 # === Multi-slot race protection (v0.6.3+) ===
@@ -93,6 +114,9 @@ def _sanitize_error_path(text):
 class TrainingWorker:
     """Connects to Box2Robot server, trains models, reports progress."""
 
+    TRANSFORMER_DIFFUSION_POLICY_TYPE = "diffusion_transformer"
+    DIFFUSION_POLICY_TYPES = {"diffusion", TRANSFORMER_DIFFUSION_POLICY_TYPE}
+
     def __init__(self, server_url: str, pairing_key: str = "", output_dir: str = "outputs"):
         self.server_url = server_url.rstrip("/")
         self.pairing_key = pairing_key
@@ -118,12 +142,13 @@ class TrainingWorker:
 
         Args:
             resume_from_step: If set, resume training from this checkpoint step
-                              (uses LeRobot --resume --checkpoint_path)
+                              (uses LeRobot --config_path + --resume).
+                              Also supports custom_params fallback for manually-submitted
+                              resume jobs on the platform.
         """
         self._should_stop = False
         self._should_pause = False
-        logger.info("Processing job: %s%s", job_id,
-                     f" (resume from step {resume_from_step})" if resume_from_step else "")
+        logger.info("Processing job: %s", job_id)
         self._report_status(job_id, "downloading")
 
         # 1. 先获取 job 信息 (轻量, 不含轨迹帧数据)
@@ -141,9 +166,49 @@ class TrainingWorker:
         custom_params = job_info.get("custom_params", {})
         if isinstance(custom_params, str):
             custom_params = json.loads(custom_params) if custom_params else {}
+        elif not isinstance(custom_params, dict):
+            custom_params = {}
         dataset_ids = job_info.get("dataset_ids", [])
         if isinstance(dataset_ids, str):
             dataset_ids = json.loads(dataset_ids) if dataset_ids else []
+        # 当前 job 的输出目录 (新训练结果写这里). resume 源模型可由 custom_params 覆盖到其它 job.
+        model_dir = str((self.output_dir / job_id / "model").resolve())
+        effective_resume_step, resume_step_source = self._resolve_effective_resume_step(
+            resume_from_step, custom_params
+        )
+        resume_model_dir = None
+        resume_model_source = None
+        if effective_resume_step is not None:
+            resume_model_dir, resume_model_source = self._resolve_resume_model_dir(
+                current_model_dir=model_dir,
+                custom_params=custom_params,
+            )
+            logger.info(
+                "Resume requested: step=%d (%s), source_model_dir=%s (%s), target_steps=%d",
+                effective_resume_step,
+                resume_step_source,
+                resume_model_dir,
+                resume_model_source,
+                int(train_steps),
+            )
+        else:
+            resume_hint, resume_hint_key = self._first_present_custom_param(
+                custom_params,
+                "resume_model_path",
+                "source_model_path",
+                "resume_path",
+                "checkpoint_path",
+                "resume_job_id",
+                "source_job_id",
+                "checkpoint_job_id",
+                "base_job_id",
+            )
+            if resume_hint_key:
+                logger.warning(
+                    "Found custom resume source %s=%s but no resume step; ignoring resume source.",
+                    resume_hint_key,
+                    resume_hint,
+                )
 
         # 2. 用 dataset_ids 算特征码, 强校验本地缓存完整性
         ds_fingerprint = self._ds_fingerprint(dataset_ids)
@@ -211,8 +276,6 @@ class TrainingWorker:
             "message": f"数据集下载完成: {len(trajectories)} 条轨迹" + (f", {sum(1 for d in img_base.iterdir() if d.is_dir())} 组图像" if has_any_images else ""),
         })
         self._report_status(job_id, "training")
-        # 用绝对路径，避免 worker 重启 / cwd 变化后 Path(model_path).exists() 失败
-        model_dir = str((self.output_dir / job_id / "model").resolve())
 
         # 残留清理: 共享盘 (autodl-fs / NFS) 上同 job_id 的 model/ 目录可能因上次训练
         # 被 kill / OOM / 实例销毁而残留. lerobot configs/train.py:145 会因目录已存在
@@ -264,6 +327,7 @@ class TrainingWorker:
                 self._should_pause = True
 
         try:
+<<<<<<< HEAD
             # 训练入口分发:
             #   - lingbot_vla → 独立 b2r-vla env (lerobot v0.4.2 + lingbot-vla 仓库),
             #                   走 lingbot_vla_trainer (subprocess 调 train.sh)
@@ -282,6 +346,17 @@ class TrainingWorker:
                     resume_from_step=resume_from_step,
                     ds_fingerprint=ds_fingerprint,
                 )
+=======
+            # 训练入口: 全部走 LeRobot pipeline (ACT/Diffusion/VLA).
+            # 先把 Box2Robot JSON 轨迹转成 LeRobot v3 dataset, 再调 lerobot-train subprocess.
+            result = self._train_lerobot(
+                trajectories, model_type, model_dir,
+                train_steps, batch_size, chunk_size, custom_params, progress_cb,
+                resume_from_step=effective_resume_step,
+                resume_model_dir=resume_model_dir,
+                ds_fingerprint=ds_fingerprint,
+            )
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
 
             if self._should_stop:
                 # 取消前先扫描已保存的 checkpoint 并随 status 一起上报
@@ -462,6 +537,13 @@ class TrainingWorker:
     # pi0_fast / pi05 字段集合跟 pi0 一致 (lerobot 上游设计如此, 都用 OpenPI 移植)
     POLICY_FIELDS["pi0_fast"] = POLICY_FIELDS["pi0"]
     POLICY_FIELDS["pi05"] = POLICY_FIELDS["pi0"]
+    POLICY_FIELDS[TRANSFORMER_DIFFUSION_POLICY_TYPE] = POLICY_FIELDS["diffusion"] | {
+        "use_transformer",
+        "n_layers",
+        "n_heads",
+        "n_emb",
+        "causal_attn",
+    }
 
     # 需要 tuple[int, int] 的字段 — 前端可能传 int 或 [int,int], _add_policy_param 自动 wrap.
     # 不处理的话 draccus 会抛 DecodingError("`image_size`: ... 'int' has no len()") 让训练 exit 1.
@@ -530,6 +612,210 @@ class TrainingWorker:
             return False
         cmd.append(f"--policy.{real_key}={value}")
         return True
+
+    @staticmethod
+    def _first_present_custom_param(custom_params: dict, *keys: str) -> tuple[object | None, str | None]:
+        """返回第一个存在且非空的 custom_params 值与 key 名."""
+        for key in keys:
+            value = custom_params.get(key)
+            if value not in (None, ""):
+                return value, key
+        return None, None
+
+    @staticmethod
+    def _is_truthy(value: object) -> bool:
+        return str(value).lower() in ("true", "1", "yes", "on")
+
+    @classmethod
+    def _resolve_effective_policy_type(cls, model_type: str, custom_params: dict) -> str:
+        """Resolve the actual LeRobot policy type used for training/loading.
+
+        The platform still exposes the generic `diffusion` model, but worker-side custom params
+        can switch the denoiser backend to our local transformer diffusion wrapper.
+        """
+
+        if model_type == cls.TRANSFORMER_DIFFUSION_POLICY_TYPE:
+            return model_type
+        if model_type != "diffusion":
+            return model_type
+
+        backend_value, _ = cls._first_present_custom_param(
+            custom_params,
+            "diffusion_policy_type",
+            "diffusion_backbone",
+            "diffusion_model",
+        )
+        if backend_value is not None and str(backend_value).lower() in (
+            cls.TRANSFORMER_DIFFUSION_POLICY_TYPE,
+            "transformer",
+            "transformer_diffusion",
+        ):
+            return cls.TRANSFORMER_DIFFUSION_POLICY_TYPE
+
+        use_transformer_value, _ = cls._first_present_custom_param(custom_params, "use_transformer")
+        if use_transformer_value is not None and cls._is_truthy(use_transformer_value):
+            return cls.TRANSFORMER_DIFFUSION_POLICY_TYPE
+
+        return model_type
+
+    @classmethod
+    def _resolve_effective_resume_step(
+        cls, resume_from_step: int | None, custom_params: dict
+    ) -> tuple[int | None, str | None]:
+        """优先用 poll-job 顶层字段，其次回退到 custom_params."""
+        step_value = resume_from_step
+        source = "poll-job.resume_from_step" if resume_from_step not in (None, "") else None
+        if step_value in (None, ""):
+            step_value, key = cls._first_present_custom_param(
+                custom_params,
+                "resume_from_step",
+                "resume_step",
+                "checkpoint_step",
+            )
+            if key:
+                source = f"custom_params.{key}"
+        if step_value in (None, ""):
+            return None, None
+
+        try:
+            step = int(step_value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"恢复训练步数非法: {step_value!r}") from e
+        if step <= 0:
+            raise ValueError(f"恢复训练步数必须 > 0, got {step}")
+        return step, source
+
+    def _normalize_resume_model_dir(self, resume_value: object) -> Path:
+        """把 custom_params 里的 resume 源路径归一化成 model_dir.
+
+        支持以下输入：
+        - model 目录: /outputs/<job>/model
+        - checkpoints 目录: /outputs/<job>/model/checkpoints
+        - 单个 checkpoint 目录: /outputs/<job>/model/checkpoints/010000
+        - pretrained_model 目录
+        - train_config.json 文件
+        - 相对路径: 相对于 worker output_dir
+        """
+        path = Path(str(resume_value)).expanduser()
+        if not path.is_absolute():
+            path = self.output_dir / path
+        path = path.resolve()
+
+        if path.is_file():
+            if (
+                path.name == "train_config.json"
+                and path.parent.name == "pretrained_model"
+                and path.parent.parent.parent.name == "checkpoints"
+            ):
+                return path.parent.parent.parent.parent
+            raise FileNotFoundError(f"不支持的 resume 文件路径: {path}")
+
+        if (path / "checkpoints").is_dir():
+            return path
+        if path.name == "checkpoints":
+            return path.parent
+        if (path / "pretrained_model").is_dir() and path.parent.name == "checkpoints":
+            return path.parent.parent
+        if (
+            path.name == "pretrained_model"
+            and path.parent.parent.name == "checkpoints"
+        ):
+            return path.parent.parent.parent
+
+        raise FileNotFoundError(
+            f"无法识别 resume 源路径: {path}. "
+            "请传 model 目录、checkpoints 目录、具体 checkpoint 目录、pretrained_model 目录，"
+            "或 train_config.json 文件。"
+        )
+
+    def _resolve_resume_model_dir(
+        self, current_model_dir: str, custom_params: dict
+    ) -> tuple[str, str]:
+        """解析 resume 源模型目录.
+
+        默认用当前 job 的 model_dir；若 custom_params 指定了来源 job / path，则覆盖。
+        """
+        path_value, path_key = self._first_present_custom_param(
+            custom_params,
+            "resume_model_path",
+            "source_model_path",
+            "resume_path",
+            "checkpoint_path",
+        )
+        if path_key:
+            model_dir = self._normalize_resume_model_dir(path_value)
+            return str(model_dir), f"custom_params.{path_key}"
+
+        job_value, job_key = self._first_present_custom_param(
+            custom_params,
+            "resume_job_id",
+            "source_job_id",
+            "checkpoint_job_id",
+            "base_job_id",
+        )
+        if job_key:
+            model_dir = (self.output_dir / str(job_value) / "model").resolve()
+            return str(model_dir), f"custom_params.{job_key}"
+
+        return current_model_dir, "current job output"
+
+    @classmethod
+    def _resolve_resume_checkpoint(cls, model_dir: str, resume_from_step: int) -> tuple[Path, Path]:
+        """定位 resume 使用的 checkpoint 目录与 train_config.json.
+
+        LeRobot 恢复训练的正规入口是:
+            --config_path=<ckpt>/pretrained_model/train_config.json --resume=true
+
+        这里显式校验 checkpoint 完整性，避免 resume 失败时悄悄退回从头训练。
+        """
+        ckpt_root = Path(model_dir) / "checkpoints"
+        step = int(resume_from_step)
+        candidates = [
+            ckpt_root / f"{step:06d}",
+            ckpt_root / str(step),
+        ]
+        ckpt_dir = next(
+            (
+                candidate for candidate in candidates
+                if candidate.is_dir() and (candidate / "pretrained_model").is_dir()
+            ),
+            None,
+        )
+        if ckpt_dir is None:
+            available = cls._scan_checkpoints(model_dir)
+            raise FileNotFoundError(
+                f"找不到恢复所需 checkpoint step={step} (目录: {ckpt_root}). "
+                f"当前可用 checkpoints: {available or '[]'}"
+            )
+
+        config_path = ckpt_dir / "pretrained_model" / "train_config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"checkpoint {ckpt_dir} 缺少 train_config.json: {config_path}"
+            )
+        return ckpt_dir, config_path
+
+    @classmethod
+    def _append_resume_args(
+        cls,
+        cmd: list[str],
+        model_dir: str,
+        resume_from_step: int,
+        train_steps: int,
+    ) -> Path:
+        """向训练命令追加 resume 参数，返回命中的 checkpoint 目录."""
+        step = int(resume_from_step)
+        total_steps = int(train_steps)
+        if total_steps <= step:
+            raise ValueError(
+                f"恢复训练时目标步数必须大于 checkpoint 步数: "
+                f"resume_from_step={step}, train_steps={total_steps}"
+            )
+
+        ckpt_dir, config_path = cls._resolve_resume_checkpoint(model_dir, step)
+        cmd.append(f"--config_path={config_path}")
+        cmd.append("--resume=true")
+        return ckpt_dir
 
     def _ensure_quantile_stats(self, repo_id: str, datasets_root: Path, model_type: str):
         """如果模型用 QUANTILES normalization, 给 dataset 补算 q01/q99 stats.
@@ -898,6 +1184,7 @@ class TrainingWorker:
             return list(fallback)
         return []
 
+<<<<<<< HEAD
     # VLA base 间接依赖的 VLM/backbone repo (lerobot/xxx_base 之外还要从 HF 拉的)
     # smolvla = SmolVLM2 + action expert; base 包只有 expert, VLM 走单独 repo.
     # pi0/pi05 的 gemma 权重已经塞在 base 包里, 不需要额外拉.
@@ -1269,10 +1556,26 @@ class TrainingWorker:
             n_servos=n_servos,
         )
         return result
+=======
+    @classmethod
+    def _select_base_visual_key(cls, base_visual_keys: list[str]) -> tuple[str, str]:
+        """Choose the closest pretrained camera slot for the Box2Robot dataset camera."""
+        if not base_visual_keys:
+            return "", "none"
+
+        dataset_key = cls.DATASET_VISION_KEY.lower()
+        if "wrist" in dataset_key:
+            wrist_keys = [key for key in base_visual_keys if "wrist" in key.lower()]
+            if wrist_keys:
+                return wrist_keys[0], "wrist camera match"
+
+        return base_visual_keys[0], "first base camera fallback"
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
 
     def _train_lerobot(self, trajectories, model_type, model_dir,
                        train_steps, batch_size, chunk_size, custom_params, progress_cb,
                        resume_from_step: int = None,
+                       resume_model_dir: str | None = None,
                        ds_fingerprint: str = None):
         """Train using LeRobot (ACT/Diffusion/SmolVLA/Pi0/etc).
 
@@ -1292,7 +1595,27 @@ class TrainingWorker:
         import shutil as _shutil
         from box2robot_gpu_worker.convert import convert
 
-        is_vla = model_type in self.VLA_MODELS
+        effective_policy_type = self._resolve_effective_policy_type(model_type, custom_params)
+        resume_source_model_dir = resume_model_dir or model_dir
+        resume_ckpt_dir = None
+        if resume_from_step:
+            resume_ckpt_dir, _ = self._resolve_resume_checkpoint(
+                resume_source_model_dir, resume_from_step
+            )
+            resume_config_file = resume_ckpt_dir / "pretrained_model" / "config.json"
+            if resume_config_file.is_file():
+                try:
+                    with open(resume_config_file) as f:
+                        resume_policy_type = json.load(f).get("type")
+                    if resume_policy_type:
+                        effective_policy_type = _normalize_model_type(resume_policy_type)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to read policy type from resume checkpoint %s: %s",
+                        resume_config_file,
+                        e,
+                    )
+        is_vla = effective_policy_type in self.VLA_MODELS
 
         # 优先用 process_job 透传过来的指纹 (与 dataset_ids 同源, 防止 server 删轨迹后口径错位).
         # 仅在 fingerprint 缺失 (旧调用路径) 时退回用 trajectories.id 现算.
@@ -1468,7 +1791,7 @@ class TrainingWorker:
         import importlib.util
         import shutil as _sh
         if importlib.util.find_spec("lerobot") is not None or lerobot_src.exists():
-            cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train"]
+            cmd = [sys.executable, "-m", "box2robot_gpu_worker.lerobot_train_wrapper"]
         else:
             console_bin = _sh.which("lerobot-train")
             if console_bin:
@@ -1527,7 +1850,8 @@ class TrainingWorker:
                 "pretrained_path",
                 self.VLA_PRETRAINED.get(model_type, f"lerobot/{model_type}_base"),
             )
-            cmd.append(f"--policy.path={pretrained_path}")
+            if not resume_ckpt_dir:
+                cmd.append(f"--policy.path={pretrained_path}")
 
             # 预下载 VLA base 到 HF cache (主进程在线状态), 否则训练子进程因
             # HF_HUB_OFFLINE=1 + cache 缺 config.json/权重立刻挂. snapshot_download
@@ -1539,8 +1863,10 @@ class TrainingWorker:
             # input_features 里的 cam 命名跟我们 Box2Robot dataset 的 'observation.images.wrist'
             # 对不上, 不处理会抛 "All image features are missing from the batch".
             #
-            # 解法 (官方 rename_map.mdx): dataset 第一个 cam 映射到 base 第一个 cam,
-            # 其余 base cam 由 pi0/pi05 modeling.prepare_images 自动 -1 填充 (siglip empty).
+            # 解法 (官方 rename_map.mdx): dataset cam 映射到 base 最接近的 cam slot.
+            # Box2Robot 目前是腕部单相机, 优先映射到 base 的 wrist cam; 找不到 wrist
+            # 再退回第一个 cam. 其余 base cam 由 pi0/pi05 modeling.prepare_images 自动
+            # -1 填充 (siglip empty).
             #
             # 用户可通过 custom_params['rename_map'] 显式覆盖 (JSON string).
             logger.info("=" * 60)
@@ -1569,6 +1895,7 @@ class TrainingWorker:
                 logger.info("[RENAME-MAP] base_visual_keys (从 base config.json 读取): %s",
                             base_visual_keys)
                 if base_visual_keys:
+<<<<<<< HEAD
                     # 按语义匹配 base key, 不要盲目选第一个 (一般是 base/exterior).
                     # 用户数据集是 wrist 单相机, 强行映射到 base_0_rgb (主视角) 会导致
                     # pi05 把腕部抓取动作的视角理解成"远景全景"语义错位 → 推理动作错乱.
@@ -1613,6 +1940,18 @@ class TrainingWorker:
                     logger.info("[RENAME-MAP] CLI arg: --rename_map=%s", rename_str)
                     logger.info("[RENAME-MAP] %s -> %s (base 共 %d 个 cam; %d 个会被 -1 填充)",
                                 self.DATASET_VISION_KEY, chosen_base_key,
+=======
+                    target_visual_key, target_reason = self._select_base_visual_key(base_visual_keys)
+                    rename_map_dict = {self.DATASET_VISION_KEY: target_visual_key}
+                    rename_str = json.dumps(rename_map_dict)
+                    cmd.append(f"--rename_map={rename_str}")
+                    n_padded = max(0, len(base_visual_keys) - 1)
+                    logger.info("[RENAME-MAP] 来源: 自动生成 (%s)", target_reason)
+                    logger.info("[RENAME-MAP] dict: %s", rename_map_dict)
+                    logger.info("[RENAME-MAP] CLI arg: --rename_map=%s", rename_str)
+                    logger.info("[RENAME-MAP] %s -> %s (base 共 %d 个 cam; %d 个会被 -1 填充)",
+                                self.DATASET_VISION_KEY, target_visual_key,
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
                                 len(base_visual_keys), n_padded)
                 else:
                     logger.error(
@@ -1732,9 +2071,10 @@ class TrainingWorker:
             # VLA chunk_size/n_action_steps: use model defaults (50) unless explicitly overridden
             if chunk_size > 1 and custom_params.get("override_chunk_size"):
                 self._add_policy_param(cmd, model_type, "chunk_size", chunk_size)
-                self._add_policy_param(cmd, model_type, "n_action_steps", chunk_size)
+                self._add_policy_param(cmd, effective_policy_type, "n_action_steps", chunk_size)
         else:
             # ACT/Diffusion/GR00T 等: train from scratch
+<<<<<<< HEAD
             cmd.append(f"--policy.type={model_type}")
             cmd.append(f"--policy.repo_id=box2robot/{repo_id}")
             # GR00T 训练需要 lerobot/eagle2hg-processor-groot-n1p5 的 11 个
@@ -1768,19 +2108,25 @@ class TrainingWorker:
                     custom_params["max_state_dim"] = GROOT_REQUIRED_STATE_DIM
                 if "max_action_dim" not in custom_params:
                     custom_params["max_action_dim"] = GROOT_REQUIRED_ACTION_DIM
+=======
+            if not resume_ckpt_dir:
+                cmd.append(f"--policy.type={effective_policy_type}")
+                cmd.append(f"--policy.repo_id=box2robot/{repo_id}")
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
             if chunk_size > 1:
                 # Diffusion 用 horizon 不是 chunk_size; 其它走 chunk_size
-                if model_type == "diffusion":
-                    self._add_policy_param(cmd, model_type, "horizon", chunk_size)
+                if effective_policy_type in self.DIFFUSION_POLICY_TYPES:
+                    self._add_policy_param(cmd, effective_policy_type, "horizon", chunk_size)
                 else:
-                    self._add_policy_param(cmd, model_type, "chunk_size", chunk_size)
+                    self._add_policy_param(cmd, effective_policy_type, "chunk_size", chunk_size)
                 # n_action_steps=1 + temporal_ensemble 是 ACT 推荐用法 (每步推一次,
                 # EMA 平滑), 不适用于其它模型. GR00T 默认 50; Diffusion 用户通过
                 # advancedParams 自己设.
                 if model_type == "act":
-                    self._add_policy_param(cmd, model_type, "n_action_steps", 1)
-                    self._add_policy_param(cmd, model_type, "temporal_ensemble_coeff", 0.01)
+                    self._add_policy_param(cmd, effective_policy_type, "n_action_steps", 1)
+                    self._add_policy_param(cmd, effective_policy_type, "temporal_ensemble_coeff", 0.01)
 
+<<<<<<< HEAD
         # Resume from checkpoint (暂停后恢复训练)
         # LeRobot v3 用 6 位零填充目录名 (000200), 老格式是 str(step). 两种都试.
         # 注意: lerobot 的 CLI 接口是 `--resume=true --config_path=<train_config.json>`,
@@ -1813,6 +2159,22 @@ class TrainingWorker:
                     f"Searched: {[str(c.name) for c in candidates]}. "
                     f"Checkpoint may have been cleaned up; please start a new training job."
                 )
+=======
+        if resume_from_step:
+            resume_ckpt_dir = self._append_resume_args(
+                cmd,
+                model_dir=resume_source_model_dir,
+                resume_from_step=resume_from_step,
+                train_steps=train_steps,
+            )
+            logger.info(
+                "Resuming from checkpoint: %s (source model dir=%s, step %d -> target %d)",
+                resume_ckpt_dir,
+                resume_source_model_dir,
+                int(resume_from_step),
+                int(train_steps),
+            )
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
         # === PEFT (LoRA) 处理 — 顶层 --peft.* 命名空间, 不是 --policy.* ===
         # lerobot 的 PEFT 通过顶层 PeftConfig 配置 (lerobot/configs/default.py:PeftConfig).
         # 默认 None (不启用); 一旦传任意 --peft.xxx 字段, lerobot 自动 wrap policy with PEFT.
@@ -1848,6 +2210,13 @@ class TrainingWorker:
                          "persistent_workers",
                          "use_videos", "dataset_use_videos", "video_codec",
                          "dataset_video_codec", "video_backend", "dataset_video_backend",
+                         "use_transformer", "diffusion_policy_type", "diffusion_backbone",
+                         "diffusion_model",
+                         # resume 控制参数由 worker 自己处理，不透传给 --policy.*
+                         "resume_from_step", "resume_step", "checkpoint_step",
+                         "resume_model_path", "source_model_path", "resume_path",
+                         "checkpoint_path",
+                         "resume_job_id", "source_job_id", "checkpoint_job_id", "base_job_id",
                          # chunk_size / n_action_steps / horizon 在主分支已处理 (传 server
                          # 选定的统一值), 不再从 custom_params 透传以免重复
                          "chunk_size", "n_action_steps", "horizon",
@@ -1880,9 +2249,14 @@ class TrainingWorker:
         for k, v in custom_params.items():
             if k in _handled_keys:
                 continue
-            self._add_policy_param(cmd, model_type, k, v)
+            self._add_policy_param(cmd, effective_policy_type, k, v)
 
-        logger.info("LeRobot train cmd: %s %s", model_type.upper(), " ".join(cmd[-6:]))
+        logger.info(
+            "LeRobot train cmd: %s (lerobot policy=%s) %s",
+            model_type.upper(),
+            effective_policy_type,
+            " ".join(cmd[-6:]),
+        )
         # 完整 cmd dump — 出问题时直接复制粘贴可复现
         logger.info("=" * 60)
         logger.info("[CMD] 完整训练命令 (复制即可手动复现):")
@@ -2139,6 +2513,7 @@ class TrainingWorker:
         import json as _json
         inference_config = {
             "model_type": model_type,
+            "lerobot_policy_type": effective_policy_type,
             "is_vla": is_vla,
             "pos_max": 4095,
             "use_vision": has_images,
@@ -2151,7 +2526,12 @@ class TrainingWorker:
         with open(config_path, "w") as f:
             _json.dump(inference_config, f, indent=2)
 
-        return {"model_dir": model_dir, "model_type": model_type, "checkpoint": str(ckpt_dir)}
+        return {
+            "model_dir": model_dir,
+            "model_type": model_type,
+            "lerobot_policy_type": effective_policy_type,
+            "checkpoint": str(ckpt_dir),
+        }
 
     @staticmethod
     def _scan_checkpoints(model_dir: str) -> list:
@@ -2525,8 +2905,6 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     else:
         config = {"n_servos": 6, "pos_max": pos_max}
 
-    # VLA models use LeRobot's built-in preprocessing (VLM handles images internally)
-    is_vla = config.get("is_vla", model_type in ("smolvla", "pi0", "pi0_fast", "pi05"))
     task_description = config.get("task_description", "manipulation task")
 
     # === LingBot-VLA 4B: 走独立 b2r-vla env subprocess + WS, 不经 lerobot factory ===
@@ -2563,11 +2941,49 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     if not ckpt_path or not (Path(ckpt_path) / "config.json").exists():
         raise FileNotFoundError(f"No pretrained_model found in {model_dir}")
 
-    logger.info("Loading LeRobot %s from %s", model_type.upper(), ckpt_path)
+    lerobot_policy_type = config.get("lerobot_policy_type")
+    if not lerobot_policy_type:
+        try:
+            with open(Path(ckpt_path) / "config.json") as f:
+                lerobot_policy_type = json.load(f).get("type")
+        except Exception:
+            lerobot_policy_type = None
+    lerobot_policy_type = _normalize_model_type(lerobot_policy_type or model_type)
+
+    if model_type != lerobot_policy_type:
+        logger.warning(
+            "Inference config model_type=%s mismatches checkpoint policy=%s; using checkpoint policy for runtime routing",
+            model_type,
+            lerobot_policy_type,
+        )
+        model_type = lerobot_policy_type
+
+    is_vla = bool(
+        config.get(
+            "is_vla",
+            model_type in TrainingWorker.VLA_MODELS or lerobot_policy_type in TrainingWorker.VLA_MODELS,
+        )
+    )
+    if lerobot_policy_type in TrainingWorker.VLA_MODELS and not is_vla:
+        logger.warning(
+            "Checkpoint policy=%s is a VLA model but config.is_vla=%s; forcing VLA preprocessing",
+            lerobot_policy_type,
+            config.get("is_vla"),
+        )
+        is_vla = True
+
+    logger.info(
+        "Loading LeRobot %s (policy=%s) from %s",
+        model_type.upper(),
+        lerobot_policy_type,
+        ckpt_path,
+    )
     sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
+    ensure_lerobot_policy_extensions()
     from lerobot.policies.factory import get_policy_class
     from safetensors.torch import load_file as _load_sf
 
+<<<<<<< HEAD
     # GR00T: 兜底 patch HF cache 里的 config.json (_attn_implementation flash_attention_2 → sdpa).
     # 即使 lerobot/.../groot/utils.py 的 patch 没生效 (例如 cache 已存在 → hf_hub_download 跳过下载
     # 不会刷新文件), 这里再过一次确保 worker 没装 flash_attn 也能加载 GR00T.
@@ -2576,6 +2992,9 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             "lerobot/eagle2hg-processor-groot-n1p5")
 
     policy_cls = get_policy_class(model_type)
+=======
+    policy_cls = get_policy_class(lerobot_policy_type)
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
 
     # === LoRA / PEFT 格式自动检测 ===
     # 用户开 LoRA 微调训练时, lerobot 保存的 ckpt 不含 model.safetensors,
@@ -2633,6 +3052,15 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
         model = model.cuda()
     if hasattr(model, "reset"):
         model.reset()
+
+    inferred_use_vision = _policy_expects_images(getattr(model, "config", None))
+    if inferred_use_vision and not use_vision:
+        logger.warning(
+            "Checkpoint policy=%s expects visual observations but config.use_vision=%s; forcing use_vision=True",
+            lerobot_policy_type,
+            config.get("use_vision"),
+        )
+        use_vision = True
 
     # 加载 MEAN_STD 归一化参数
     # VLA models handle normalization differently — check if preprocessor files exist
@@ -2835,9 +3263,45 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     logger.info("[INFERENCE] stop_poller 后台线程启动 (每 5s 查 server, 主循环不阻塞)")
 
     def _should_stop():
+<<<<<<< HEAD
         """主循环用. atomic 读 flag, 不阻塞."""
         with _stop_lock:
             return _stop_flag
+=======
+        nonlocal last_stop_check, _stop_flag
+        if _stop_flag:
+            return True
+        now = time.time()
+        if now - last_stop_check < 5:
+            return False
+        last_stop_check = now
+        if not job_id:
+            return False
+        try:
+            # 检查 Server 是否停止了推理
+            r = client.get(f"/api/training/jobs/{job_id}/check-inference")
+            if r.status_code == 200:
+                data = r.json()
+                # v1.0+ 单源信号 should_stop + stop_reason; 老 server 没这字段时回退到 running/arm_online
+                if "should_stop" in data:
+                    if data.get("should_stop"):
+                        _stop_flag = True
+                        logger.info("推理停止 (reason=%s)", data.get("stop_reason") or "unknown")
+                        return True
+                else:
+                    # 旧 server 兼容路径
+                    if not data.get("running", True):
+                        _stop_flag = True
+                        logger.info("推理已被 Server 停止")
+                        return True
+                    if not data.get("arm_online", True):
+                        _stop_flag = True
+                        logger.warning("机械臂离线，自动停止推理")
+                        return True
+        except Exception:
+            pass
+        return False
+>>>>>>> 5ca5b467613360174326e56eb5e4f255820021b5
 
     # ===== 共用工具函数 =====
     def _read_state():
@@ -2965,6 +3429,11 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
         else:
             # ACT/Diffusion: manual MEAN_STD normalization. ACT from-scratch 训练时
             # input_features 自动从 dataset 推导, 推理时 _vision_key 跟 dataset 一致 (wrist).
+            if not _has_manual_norm or _state_mean is None or _state_std is None:
+                raise RuntimeError(
+                    "当前 checkpoint 缺少 ACT/Diffusion 手工归一化 stats, 但 runtime 路由到了非 VLA 分支. "
+                    f"model_type={model_type}, policy={lerobot_policy_type}, is_vla={is_vla}, ckpt={ckpt_path}"
+                )
             state_norm = (state_t - _state_mean) / (_state_std + 1e-8)
             obs = {"observation.state": state_norm}
             if use_vision:
@@ -3099,7 +3568,7 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
             # 先 populate_queues, 否则触发 "torch.stack expects a non-empty TensorList".
             # 其他 queue 类策略 (pi0/smolvla/multi_task_dit/...) 在 predict_action_chunk
             # 内部已自行 populate, 不需要外部介入.
-            _needs_manual_populate = (model_type == "diffusion")
+            _needs_manual_populate = (lerobot_policy_type in TrainingWorker.DIFFUSION_POLICY_TYPES)
             if _needs_manual_populate:
                 sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
                 from lerobot.policies.utils import populate_queues as _populate_queues
@@ -3154,8 +3623,15 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                         raw_chunk = model.predict_action_chunk(batch)
                     else:
                         raw_chunk = model.predict_action_chunk(obs)  # (1, chunk_size, n_servos)
-                # 反归一化: (1, chunk_size, n_servos) → (chunk_size, n_servos) [0,1]
-                chunk_01 = (raw_chunk[0] * _action_std + _action_mean).clamp(0, 1).cpu().numpy()
+                # 反归一化: 统一走 _unnorm_action, 兼容 ACT/Diffusion manual stats
+                # 和 pi0/pi05/smolvla 的 VLA postprocessor.
+                chunk_01 = np.asarray(_unnorm_action(raw_chunk), dtype=np.float32)
+                if chunk_01.ndim == 3:
+                    chunk_01 = chunk_01[0]
+                elif chunk_01.ndim != 2:
+                    raise RuntimeError(
+                        f"Unexpected action chunk shape after unnormalize: {chunk_01.shape}"
+                    )
                 infer_ms = (time.perf_counter() - t_infer) * 1000
 
                 # 3. ChunkOptimizer 决定执行步数
