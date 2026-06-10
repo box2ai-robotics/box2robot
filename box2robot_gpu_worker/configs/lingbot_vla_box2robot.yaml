@@ -1,0 +1,85 @@
+# LingBot VLA 4B config for Box2Robot 6-DOF arm — 蚂蚁灵波 VLA 基础模型 (Qwen2.5-VL 3B backbone + flow-matching action expert).
+# Fine-tunes from robbyant/lingbot-vla-4b. Requires camera images.
+#
+# 关键差异 (跟 lerobot 上游 VLA 比):
+#   - 不走 lerobot-train CLI, 走 lingbot-vla 自己的 `bash train.sh tasks/vla/train_lingbotvla.py <cfg>`
+#   - 跟 lerobot v0.5 不兼容, 锁 lerobot v0.4.2; 用独立 conda env b2r-vla
+#   - 训练 backend = FSDP2 + torch.compile + bf16 (官方设计, 不可改)
+#   - LoRA 微调强烈推荐 (4B 全量微调 ≥60GB VRAM, LoRA 24GB 起步)
+#   - 数据格式 = 标准 LeRobot v3.0 parquet+mp4 (跟 box2robot convert.py 输出兼容)
+#   - 官方 robotwin 配置是 14-dim 双臂, 这里改成 6-dim 单臂 (跟 SO-101 / BoxBot 一致)
+#
+# 安装: scripts/install_lingbot_vla_addon.sh (独立 b2r-vla env)
+# 启动: bash <lingbot-vla>/train.sh tasks/vla/train_lingbotvla.py <generated_cfg>.yaml
+#
+# 本 yaml 是 box2robot 前端 schema 的默认值源 (models_registry.py 解析后扁平化给前端).
+# 实际跑训练时, worker 端的 lingbot_vla_trainer 会把这里的字段翻译成 lingbot-vla 原生 yaml 格式.
+
+policy:
+  type: lingbot_vla                  # 项目内部 ID, worker 路由用 (跟 lerobot 上游策略名空间隔离)
+  model_path: "robbyant/lingbot-vla-4b"        # 默认 4B 无深度版; 可选 robbyant/lingbot-vla-4b-depth (含深度蒸馏)
+  tokenizer_path: "Qwen/Qwen2.5-VL-3B-Instruct"
+
+  # Action chunking (官方 RLinf 推荐 50 步 = 2.5s @ 20Hz)
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  # 维度对齐 (lingbot-vla 4B 预训练 head 硬编码 max_action_dim=75 / max_state_dim=75!)
+  # 必须 ≥ 75, 改小会撞 "tensor a (8) must match tensor b (75)" (同 GR00T 坑).
+  # BoxBot 6-DOF 实际数据会被 0-padding 到 75, 不影响精度只是浪费 attention.
+  max_state_dim: 75
+  max_action_dim: 75
+
+  # Image (Qwen2.5-VL backbone 224 标准)
+  image_size: [224, 224]
+
+  # Fine-tune 控制 (post-training 模式)
+  # 重要 (2026-05-26 pipeline review 发现): lingbot-vla 完全没有 LoRA/peft 支持!
+  # ModelArguments 没有 lora_* 任何字段. 32GB 4080 SUPER 全量微调 4B 必 OOM.
+  # 省显存正解: freeze_vision_encoder=true + train_expert_only=true
+  # (冻结 VLM 主干, 只训 action expert ~几百 MB 参数, 显存 ~10-15GB)
+  post_training: true                # 启用 post-training fine-tune 模式
+  freeze_vision_encoder: true        # 冻结 vision encoder (省显存)
+  train_expert_only: true            # 冻结整个 VLM, 只训 action expert (代替 LoRA)
+  adanorm_time: true
+  norm_type: "meanstd"               # arguments.py Literal["meanstd","bounds_99","minmax","identity"]; 默认 meanstd
+  tokenizer_max_length: 72
+
+  # FSDP / 分布式 (官方设计, 一般不改; 单 GPU 训练 ulysses_parallel_size 必须 1)
+  data_parallel_mode: "fsdp2"
+  enable_full_shard: false
+  module_fsdp_enable: true
+  ulysses_parallel_size: 1
+
+  # 精度优化
+  dtype: "bfloat16"                  # action expert 走 fp32 (官方 enable_fp32: true), VLM 走 bf16
+  use_compile: true                  # torch.compile (4080 SUPER/A100 加速明显)
+  gradient_checkpointing: true
+
+training:
+  steps: 40000                       # 官方 real_load20000h 默认 40000 (post-train 推荐 30-40k)
+  batch_size: 8                      # micro_batch_size; 单卡 4080 SUPER 32GB + train_expert_only 实测 8 (官方 8 卡 32)
+  gradient_accumulation_steps: 1     # global_batch = micro * gradient_acc * num_gpu
+  lr: 5.0e-5                         # 官方默认 (constant decay)
+  lr_decay_style: "constant"         # constant / cosine / linear
+  scheduler_warmup_steps: 1000       # warmup 步数
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  save_steps: 10000                  # checkpoint 频率
+
+dataset:
+  fps: 20                            # Box2Robot 录制 20Hz
+  servo_count: 6                     # 单臂 5 关节 + 1 夹爪
+  pos_max: 4095                      # STS3215 编码器范围
+
+# GPU recommendations (LingBot-VLA 4B, BoxBot 6-DOF):
+#   RTX 4080 SUPER (32GB): batch_size 8,  lora_rank=16, ~10h / 30000 steps
+#   RTX 4090       (24GB): batch_size 8,  lora_rank=16, ~8h  / 30000 steps (刚好够)
+#   A100 (40GB):           batch_size 16, lora_rank=32, ~5h  / 30000 steps
+#   A100 (80GB):           batch_size 32, 全量微调,      ~3h  / 30000 steps
+# Note:
+#   - V100/T4 不支持 bf16, 会自动 fallback float16 (易 NaN, 不建议)
+#   - 首次训练需联网下载 ~8GB base (robbyant/lingbot-vla-4b) + 7GB Qwen2.5-VL-3B
+#     建议预下载到 autodl-fs 共享盘 (HF_HOME=/root/autodl-fs/data/box2robot-base-models)
+#   - 训练前 worker 需调 scripts/install_lingbot_vla_addon.sh 装 b2r-vla env

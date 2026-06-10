@@ -396,11 +396,16 @@ b2r-gpu --server https://robot.box2ai.com
 
 ## 支持的模型
 
-| 模型 | 说明 | GPU 需求 |
-|------|------|----------|
-| MLP | 快速验证，纯 PyTorch | CPU 即可 |
-| ACT | Action Chunking Transformer，推荐 | RTX 3060+ |
-| Diffusion Policy | 生成式策略 | RTX 3090+ |
+| 模型 | 说明 | GPU 需求 | env |
+|------|------|----------|-----|
+| MLP | 快速验证，纯 PyTorch | CPU 即可 | b2r |
+| ACT | Action Chunking Transformer，推荐 | RTX 3060+ | b2r |
+| Diffusion Policy | 生成式策略 | RTX 3090+ | b2r |
+| SmolVLA / Pi0 / Pi05 / GR00T | LeRobot VLA 系列 (base ckpt ~10GB) | RTX 4090 / A100 | b2r (lerobot 0.5.2) |
+| **LingBot-VLA 4B** 🆕 | **世界模型 VLA**，独立上游 repo (`lingbot-vla/`)，配置 schema 跟 lerobot 完全不同 | RTX 4090+ / A100 (24GB+ VRAM) | **b2r-vla** (lerobot 0.4.2，独立隔离) |
+
+> LingBot-VLA 前置：在目标实例上跑 `scripts/install_lingbot_vla_addon.sh` 一次性装好 b2r-vla env + lingbot-vla repo。
+> 训练入口走 `bash train.sh tasks/vla/train_lingbotvla.py <cfg>.yaml`，由 worker 在 `model_type == "lingbot_vla"` 时自动分发。
 
 ## 依赖
 

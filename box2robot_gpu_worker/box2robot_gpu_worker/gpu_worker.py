@@ -1282,10 +1282,17 @@ class GPUWorker:
             ctrl_c = True
             logger.info("推理已停止 (Ctrl+C)")
         except Exception as e:
-            logger.error("推理失败: %s", e)
+            # P2-10: 把 traceback 一起塞进 error_msg, 让前端能看到真正的 root cause
+            # 不只是 "推理部署失败: KeyError: 'image'" 这种顶层 str(e)
+            import traceback as _tb
+            tb_text = _tb.format_exc()
+            # 取最后 1500 字符 (避免超大 traceback 把 DB 字段撑爆)
+            tb_tail = tb_text[-1500:] if len(tb_text) > 1500 else tb_text
+            logger.error("推理失败: %s\n%s", e, tb_text)
             # 推理部署失败 → 恢复为 completed (训练结果完好), 仅把错误信息上报
             # 不能用 "failed", 否则训练任务会被标记为彻底失败、无法再次部署
-            self._report_status(job["id"], "completed", error_msg=f"推理部署失败: {e}")
+            self._report_status(job["id"], "completed",
+                                error_msg=f"推理部署失败: {e}\n{tb_tail}")
             # 释放可能已开启的力矩 / 摄像头流 (不再重复上报状态, 避免覆盖 error_msg)
             if arm_device_id:
                 try:
@@ -1329,9 +1336,10 @@ class GPUWorker:
     def _report_status(self, job_id: str, status: str, error_msg: str = None,
                        model_path: str = None, checkpoints: list = None):
         try:
+            from box2robot_gpu_worker.worker import _sanitize_error_path
             data = {"status": status, "key": ""}
             if error_msg:
-                data["error_msg"] = error_msg
+                data["error_msg"] = _sanitize_error_path(error_msg)
             if model_path:
                 data["model_path"] = model_path
             if checkpoints:

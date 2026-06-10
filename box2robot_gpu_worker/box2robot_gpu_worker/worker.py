@@ -66,6 +66,30 @@ def _get_file_lock(key: str) -> "_threading.Lock":
         return _FILE_LOCKS[key]
 
 
+# === error_msg 脱敏 ===
+# 上报给 server / 透传给前端的错误消息里不能出现 cloud 供应商绝对路径,
+# 替换成中性占位符 <cloud-storage> / <workspace>, 保留 job_id 之后的尾段方便排错.
+# 仅作用于 error_msg 字符串, 不动 model_path (推理需要真实路径).
+import re as _re
+
+_PATH_REDACT_RULES = (
+    (_re.compile(r'/(?:root/)?autodl-fs(?:/data)?/box2robot-outputs/pool-default'), '<cloud-storage>'),
+    (_re.compile(r'/mnt/box2robot-outputs/pool-default'),                            '<cloud-storage>'),
+    (_re.compile(r'/(?:root/)?autodl-fs(?:/data)?'),                                 '<cloud-storage>'),
+    (_re.compile(r'/(?:root/)?autodl-tmp/workspace/box2robot'),                      '<workspace>'),
+    (_re.compile(r'/(?:root/)?autodl-tmp'),                                          '<workspace>'),
+)
+
+
+def _sanitize_error_path(text):
+    """把错误消息里暴露 cloud 供应商的绝对路径替换成中性占位符. 非字符串原样返回."""
+    if not isinstance(text, str) or not text:
+        return text
+    for pattern, repl in _PATH_REDACT_RULES:
+        text = pattern.sub(repl, text)
+    return text
+
+
 class TrainingWorker:
     """Connects to Box2Robot server, trains models, reports progress."""
 
@@ -190,6 +214,20 @@ class TrainingWorker:
         # 用绝对路径，避免 worker 重启 / cwd 变化后 Path(model_path).exists() 失败
         model_dir = str((self.output_dir / job_id / "model").resolve())
 
+        # 残留清理: 共享盘 (autodl-fs / NFS) 上同 job_id 的 model/ 目录可能因上次训练
+        # 被 kill / OOM / 实例销毁而残留. lerobot configs/train.py:145 会因目录已存在
+        # 且 resume=false 抛 FileExistsError. 这里只在"非 resume" 路径下清理, resume
+        # 路径走 _train_lerobot 内部 checkpoint 检查, 不动 model_dir.
+        if not resume_from_step:
+            try:
+                _md = Path(model_dir)
+                if _md.is_dir():
+                    import shutil as _shutil
+                    _shutil.rmtree(_md, ignore_errors=True)
+                    logger.info("[CLEAN] removed stale model_dir: %s", model_dir)
+            except Exception as e:
+                logger.warning("[CLEAN] stale model_dir cleanup failed: %s", e)
+
         # 每次 progress 上报都让 server 知道 model_dir + 当前 checkpoint 列表,
         # 这样训练中途任何时刻断电/崩溃, server 都已经记下"这个 job 的模型在哪、有哪些可用 ckpt".
         # 不依赖 cancel/pause/done 路径才上报, 防止 OOM / 突然 kill 时来不及汇报.
@@ -226,14 +264,24 @@ class TrainingWorker:
                 self._should_pause = True
 
         try:
-            # 训练入口: 全部走 LeRobot pipeline (ACT/Diffusion/VLA).
-            # 先把 Box2Robot JSON 轨迹转成 LeRobot v3 dataset, 再调 lerobot-train subprocess.
-            result = self._train_lerobot(
-                trajectories, model_type, model_dir,
-                train_steps, batch_size, chunk_size, custom_params, progress_cb,
-                resume_from_step=resume_from_step,
-                ds_fingerprint=ds_fingerprint,
-            )
+            # 训练入口分发:
+            #   - lingbot_vla → 独立 b2r-vla env (lerobot v0.4.2 + lingbot-vla 仓库),
+            #                   走 lingbot_vla_trainer (subprocess 调 train.sh)
+            #   - 其他 (ACT/Diffusion/VLA) → _train_lerobot (lerobot-train CLI)
+            # 一机一模型互斥靠 max_concurrent=1 自动保证 (subprocess 占 slot 其他 job 排队).
+            if model_type == "lingbot_vla":
+                result = self._train_lingbot_vla(
+                    trajectories, model_dir, train_steps, batch_size,
+                    custom_params, progress_cb, ds_fingerprint,
+                )
+            else:
+                # 先把 Box2Robot JSON 轨迹转成 LeRobot v3 dataset, 再调 lerobot-train subprocess.
+                result = self._train_lerobot(
+                    trajectories, model_type, model_dir,
+                    train_steps, batch_size, chunk_size, custom_params, progress_cb,
+                    resume_from_step=resume_from_step,
+                    ds_fingerprint=ds_fingerprint,
+                )
 
             if self._should_stop:
                 # 取消前先扫描已保存的 checkpoint 并随 status 一起上报
@@ -351,11 +399,14 @@ class TrainingWorker:
         },
         "diffusion": {
             "n_obs_steps", "horizon", "n_action_steps", "drop_n_last_frames",
+            "arch",
             "vision_backbone", "resize_shape", "crop_ratio", "crop_shape", "crop_is_random",
             "pretrained_backbone_weights", "use_group_norm",
             "spatial_softmax_num_keypoints", "use_separate_rgb_encoder_per_camera",
             "down_dims", "kernel_size", "n_groups",
             "diffusion_step_embed_dim", "use_film_scale_modulation",
+            "n_layers", "n_heads", "n_emb",
+            "p_drop_emb", "p_drop_attn", "n_cond_layers", "causal_attn",
             "noise_scheduler_type", "num_train_timesteps", "beta_schedule",
             "beta_start", "beta_end", "prediction_type", "clip_sample", "clip_sample_range",
             "num_inference_steps", "compile_model", "compile_mode", "do_mask_loss_for_padding",
@@ -672,13 +723,19 @@ class TrainingWorker:
                 "  - LoRA fine-tune 的 ckpt 不能直接当 base 模型加载, 需要先 merge_and_unload"
             )
 
-        # 3. 拼最终信息: 关键字提示 + 最后 5 行原始日志
+        # 3. 拼最终信息: 关键字提示 + 最后 15 行原始日志
         # (信号类终止已在第 1 步直接 return, 这里 sig_msg 必空, 不再拼接)
+        # P2-10 (2026-05-21): tail 从 5 行扩到 15 行 — 真正能看到 traceback 顶部
+        # File "xxx.py", line N, in <fn> 等 root cause 行; 之前 5 行只显示尾部
+        # "RuntimeError: xxx" 没有调用栈, 用户看不出真因.
         parts = [f"训练失败 (exit code {returncode})"]
         if kw_hint:
             parts.append(kw_hint)
         if tail_lines:
-            parts.append("最后日志:\n  " + "\n  ".join(tail_lines[-5:]))
+            tail = tail_lines[-15:]
+            # 行数标识 (让用户知道这是 stderr 尾部, 不是完整 log)
+            label = f"最后 {len(tail)} 行 stderr (完整 log 在 worker 端):"
+            parts.append(label + "\n  " + "\n  ".join(tail))
         return "\n".join(parts)
 
     @staticmethod
@@ -981,11 +1038,12 @@ class TrainingWorker:
             return
         hf_home = _os.environ.get("HF_HOME") or _os.path.expanduser("~/.cache/huggingface")
         target_dir = _os.path.join(hf_home, "lerobot", assets_repo)
-        # 已下完整 (config.json 在) → 跳过, 别重复请求
-        if _os.path.isfile(_os.path.join(target_dir, "config.json")) \
-                and _os.path.isfile(_os.path.join(target_dir, "vocab.json")):
+        # cache 已完整 → 跳过下载, 但 **仍要走 config.json patch** (旧 cache 可能是 unpatched
+        # 的 flash_attention_2 版本; 早期 return 会让推理路径永远拿不到 patch).
+        cache_ready = (_os.path.isfile(_os.path.join(target_dir, "config.json"))
+                       and _os.path.isfile(_os.path.join(target_dir, "vocab.json")))
+        if cache_ready:
             logger.info("[GROOT-EAGLE] cache 已完整, 跳过预下: %s", target_dir)
-            return
         _os.makedirs(target_dir, exist_ok=True)
         # 临时撤销 OFFLINE env (主进程必须能联网)
         prev_offline = _os.environ.pop("HF_HUB_OFFLINE", None)
@@ -1016,13 +1074,26 @@ class TrainingWorker:
             # patch config.json: HF 上 _attn_implementation="flash_attention_2", 但 worker
             # 环境通常没装 flash_attn (装编译麻烦, 需 nvcc + torch 版本严格对齐).
             # 改成 "sdpa" (PyTorch 内置 Scaled Dot-Product Attention, 所有 GPU 都支持).
+            # 外层 + text_config + vision_config 三处都要 patch (transformers 在 PreTrainedModel
+            # 加载时 check 外层; Eagle25VL 内部加载 Qwen2 / Siglip 时 check 嵌套子配置).
             cfg_path = _os.path.join(target_dir, "config.json")
             if _os.path.isfile(cfg_path):
                 try:
                     with open(cfg_path, encoding="utf-8") as f:
                         cfg = json.load(f)
+                    patched = False
                     if cfg.get("_attn_implementation") == "flash_attention_2":
                         cfg["_attn_implementation"] = "sdpa"
+                        patched = True
+                    tc = cfg.get("text_config")
+                    if isinstance(tc, dict) and tc.get("_attn_implementation") == "flash_attention_2":
+                        tc["_attn_implementation"] = "sdpa"
+                        patched = True
+                    vc = cfg.get("vision_config")
+                    if isinstance(vc, dict) and vc.get("_attn_implementation") == "flash_attention_2":
+                        vc["_attn_implementation"] = "sdpa"
+                        patched = True
+                    if patched:
                         with open(cfg_path, "w", encoding="utf-8") as f:
                             json.dump(cfg, f, ensure_ascii=False, indent=2)
                         logger.info("[GROOT-EAGLE] patched config.json: "
@@ -1030,11 +1101,174 @@ class TrainingWorker:
                                     "(worker 没装 flash_attn, sdpa 是 PyTorch 内置兜底)")
                 except Exception as e:
                     logger.warning("[GROOT-EAGLE] patch config.json 失败: %s", e)
+            # === 2026-05-21 P2: patch HF dynamic modules 路径 ===
+            # transformers 用 trust_remote_code=True 加载 GR00T 时, 真正 import 的不是
+            # vendor 也不是 snapshot cache, 而是 ${HF_HOME}/modules/transformers_modules/
+            # <repo_safe>/ 下的 .py 文件 (HF 把 - 转成 _hyphen_, / 转 _ 后写到这).
+            # 这些文件是 HF 上的原版 (flash_attention_2 硬编码), 之前的 patch 全部走偏.
+            # 这里用本地 vendor 已 patched 的两个 .py 覆盖过去, idempotent.
+            try:
+                cls._patch_hf_modules_groot_attn(hf_home)
+            except Exception as e:
+                logger.warning("[GROOT-EAGLE] patch HF modules 失败: %s", e)
         finally:
             if prev_offline is not None:
                 _os.environ["HF_HUB_OFFLINE"] = prev_offline
             if prev_tf_offline is not None:
                 _os.environ["TRANSFORMERS_OFFLINE"] = prev_tf_offline
+
+    @classmethod
+    def _patch_hf_modules_groot_attn(cls, hf_home: str) -> None:
+        """把本地 vendor 已 patched 的 configuration_eagle2_5_vl.py +
+        modeling_eagle2_5_vl.py 拷贝到 HF dynamic modules 路径
+        (${HF_HOME}/modules/transformers_modules/<eagle2*groot*>/).
+
+        transformers 用 trust_remote_code=True 加载 GR00T 时, 从这个路径动态
+        import .py — 这才是真正生效的源码. 之前修 vendor / snapshot cache 都不生效
+        (transformers 不读那两个路径).
+
+        idempotent: 每次启动都跑, 文件内容相同则 noop; pyc cache 会清掉.
+
+        Args:
+            hf_home: HF_HOME 路径, modules 目录在 $hf_home/modules/transformers_modules/
+        """
+        import os as _os
+        import shutil as _shutil
+        modules_root = _os.path.join(hf_home, "modules", "transformers_modules")
+        if not _os.path.isdir(modules_root):
+            logger.info("[GROOT-EAGLE] HF modules 路径不存在, 跳过 patch (transformers "
+                        "尚未首次加载该模型): %s", modules_root)
+            return
+        # 找匹配 eagle2*groot* 的子目录 (HF 把 lerobot/eagle2hg-processor-groot-n1p5
+        # 转成 eagle2hg_hyphen_processor_hyphen_groot_hyphen_n1p5; 可能多个版本共存)
+        candidates = [d for d in _os.listdir(modules_root)
+                      if "eagle2" in d.lower() and "groot" in d.lower()
+                      and _os.path.isdir(_os.path.join(modules_root, d))]
+        if not candidates:
+            logger.info("[GROOT-EAGLE] HF modules 下没找到 eagle2*groot* 目录, 跳过")
+            return
+        # vendor patched .py 源路径 (worker.py 同 git repo 下的 lerobot submodule)
+        # worker.py: <repo>/box2robot_gpu_worker/box2robot_gpu_worker/worker.py
+        # vendor:    <repo>/box2robot_gpu_worker/lerobot/src/lerobot/policies/groot/eagle2_hg_model/
+        worker_file = _os.path.abspath(__file__)
+        repo_subroot = _os.path.dirname(_os.path.dirname(worker_file))  # .../box2robot_gpu_worker
+        vendor_dir = _os.path.join(repo_subroot, "lerobot", "src", "lerobot",
+                                    "policies", "groot", "eagle2_hg_model")
+        files_to_copy = ["configuration_eagle2_5_vl.py", "modeling_eagle2_5_vl.py"]
+        for fname in files_to_copy:
+            src = _os.path.join(vendor_dir, fname)
+            if not _os.path.isfile(src):
+                logger.warning("[GROOT-EAGLE] vendor patched 源文件不存在, 跳过: %s", src)
+                continue
+            # 简单检查 vendor 文件已 patched (含 sdpa 字串)
+            try:
+                with open(src, encoding="utf-8") as f:
+                    head = f.read(8192)
+                if "sdpa" not in head:
+                    logger.warning("[GROOT-EAGLE] vendor %s 看起来未 patched (无 sdpa "
+                                   "字串), 跳过覆盖防破坏", fname)
+                    continue
+            except Exception as e:
+                logger.warning("[GROOT-EAGLE] 读 vendor %s 异常: %s", fname, e)
+                continue
+            for cand in candidates:
+                dst = _os.path.join(modules_root, cand, fname)
+                # 已是 patched 版 (内容相同) → noop, 不刷时间戳避免触发 transformers
+                # 重 import 检查机制
+                try:
+                    if _os.path.isfile(dst):
+                        with open(dst, encoding="utf-8") as f:
+                            dst_head = f.read(8192)
+                        if dst_head == head:
+                            continue  # 已经是 patched 版
+                    # 备份再覆盖 (备份文件名固定, 每次启动覆盖同一个 .bak 防累积)
+                    if _os.path.isfile(dst):
+                        try:
+                            _shutil.copy2(dst, dst + ".orig.bak")
+                        except Exception:
+                            pass
+                    _shutil.copy2(src, dst)
+                    logger.info("[GROOT-EAGLE] 覆盖 HF modules .py → %s", dst)
+                    # 清 pyc cache (旧编译产物会让 Python 跳过 .py 直接用)
+                    pycache = _os.path.join(modules_root, cand, "__pycache__")
+                    if _os.path.isdir(pycache):
+                        try:
+                            _shutil.rmtree(pycache)
+                            logger.info("[GROOT-EAGLE] 清 pyc cache: %s", pycache)
+                        except Exception as e:
+                            logger.warning("[GROOT-EAGLE] 清 pyc cache 失败: %s", e)
+                except Exception as e:
+                    logger.warning("[GROOT-EAGLE] 覆盖 %s 失败: %s", dst, e)
+
+    def _train_lingbot_vla(self, trajectories, model_dir,
+                            train_steps, batch_size, custom_params, progress_cb,
+                            ds_fingerprint: str = None):
+        """LingBot-VLA 4B 训练入口 — 走独立 b2r-vla env + lingbot-vla 仓库.
+
+        Pipeline:
+          1. 复用 process_job 已下到 cache/ds_<fp>/dataset/ 的轨迹 JSON
+          2. 调 convert.py 转 LeRobot v3 dataset (输出到 cache/ds_<fp>/lingbot_dataset/)
+          3. 调 lingbot_vla_trainer.train_lingbot_vla (subprocess 走 b2r-vla env)
+
+        前置条件: 目标实例必须跑过 scripts/install_lingbot_vla_addon.sh (装 b2r-vla env + repo).
+        没装直接 raise (manager 收到失败 stage, server 标 failed, 用户看 error_msg).
+        """
+        import os as _os
+        from pathlib import Path as _Path
+        from box2robot_gpu_worker.convert import convert as _convert
+        from box2robot_gpu_worker.lingbot_vla_trainer import train_lingbot_vla as _train_lvla
+
+        if not ds_fingerprint:
+            ds_fingerprint = self._ds_fingerprint([t.get("id", "") for t in trajectories])
+        ds_cache_dir = _Path(__file__).parent.parent / "cache" / f"ds_{ds_fingerprint}"
+        traj_json_dir = ds_cache_dir / "dataset"           # process_job 已写入 traj_*.json
+        img_base = ds_cache_dir / "images"
+        lingbot_ds_dir = ds_cache_dir / "lingbot_dataset"  # convert 输出目录 (跟 _train_lerobot 的 datasets/ 区分)
+
+        # Step 1: convert → LeRobot v3 (lingbot-vla 要求 v3 格式)
+        has_images = img_base.is_dir() and any(img_base.iterdir())
+        task_desc = str(custom_params.get("task") or "manipulation task")
+        if not lingbot_ds_dir.exists() or not (lingbot_ds_dir / "meta" / "info.json").is_file():
+            logger.info("[LINGBOT-VLA] convert → %s (images=%s, task=%r)",
+                        lingbot_ds_dir, has_images, task_desc[:60])
+            # LeRobotDataset.create(root=...) 的 root 是**完整 dataset 路径**, 不是 parent.
+            # convert.py:218 直接传给 lerobot, 它内部 mkdir(root, exist_ok=False) 要求 root 不存在.
+            # 之前传 .parent 会让 obj.root = cache/ds_<fp>/ (已存在的 traj 目录) → FileExistsError.
+            _convert(
+                input_path=traj_json_dir,
+                repo_id=lingbot_ds_dir.name,
+                task_description=task_desc,
+                root=lingbot_ds_dir,   # 完整 dataset 路径
+                images_dir=img_base if has_images else None,
+                use_videos=has_images,  # 有图就用 video 存储 (lingbot-vla 期望 mp4)
+                video_codec="h264",
+            )
+        else:
+            logger.info("[LINGBOT-VLA] dataset 已存在, 跳过 convert: %s", lingbot_ds_dir)
+
+        # Step 2: 检测 n_servos (从第一条 traj)
+        n_servos = 6  # SO-101 默认
+        try:
+            first_traj = trajectories[0]
+            first_frame = first_traj["frames"][0]
+            n_servos = len({p["id"] for p in first_frame["positions"]})
+        except Exception as e:
+            logger.warning("[LINGBOT-VLA] n_servos 检测失败 (%s), 用默认 %d", e, n_servos)
+
+        # Step 3: 调 trainer (阻塞)
+        progress_cb(0, train_steps, {"phase": "training",
+                                     "message": f"启动 lingbot-vla 训练 (n_servos={n_servos})"})
+        result = _train_lvla(
+            ds_dir=str(lingbot_ds_dir),
+            model_dir=model_dir,
+            train_steps=train_steps,
+            batch_size=batch_size,
+            custom_params=custom_params,
+            progress_cb=progress_cb,
+            should_stop_cb=lambda: self._should_stop,
+            n_servos=n_servos,
+        )
+        return result
 
     def _train_lerobot(self, trajectories, model_type, model_dir,
                        train_steps, batch_size, chunk_size, custom_params, progress_cb,
@@ -1335,16 +1569,50 @@ class TrainingWorker:
                 logger.info("[RENAME-MAP] base_visual_keys (从 base config.json 读取): %s",
                             base_visual_keys)
                 if base_visual_keys:
-                    # 把我们的 wrist 映射到 base 第一个 cam (一般是主视角, 如 droid 的 exterior_1_left)
-                    rename_map_dict = {self.DATASET_VISION_KEY: base_visual_keys[0]}
+                    # 按语义匹配 base key, 不要盲目选第一个 (一般是 base/exterior).
+                    # 用户数据集是 wrist 单相机, 强行映射到 base_0_rgb (主视角) 会导致
+                    # pi05 把腕部抓取动作的视角理解成"远景全景"语义错位 → 推理动作错乱.
+                    # 优先级: 数据集 key 含 wrist → base 含 wrist 的; 含 top/front → base
+                    # 含 base/front 的; 都不匹配 → 第一个 (旧行为兜底).
+                    ds_key_lower = self.DATASET_VISION_KEY.lower()
+                    chosen_base_key = None
+                    if "wrist" in ds_key_lower:
+                        # 优先 right_wrist (主导手), 然后 left_wrist, 然后任何含 wrist 的
+                        for k in base_visual_keys:
+                            if "right_wrist" in k.lower():
+                                chosen_base_key = k
+                                break
+                        if not chosen_base_key:
+                            for k in base_visual_keys:
+                                if "left_wrist" in k.lower():
+                                    chosen_base_key = k
+                                    break
+                        if not chosen_base_key:
+                            for k in base_visual_keys:
+                                if "wrist" in k.lower():
+                                    chosen_base_key = k
+                                    break
+                    elif any(s in ds_key_lower for s in ("top", "front", "exterior", "base")):
+                        for k in base_visual_keys:
+                            if any(s in k.lower() for s in ("base_", "front", "exterior")):
+                                chosen_base_key = k
+                                break
+                    if not chosen_base_key:
+                        chosen_base_key = base_visual_keys[0]
+                        logger.info("[RENAME-MAP] 语义匹配未命中, fallback 到第一个 base cam")
+                    else:
+                        logger.info("[RENAME-MAP] 语义匹配命中: %s 含 'wrist' → 选 %s",
+                                    self.DATASET_VISION_KEY, chosen_base_key)
+
+                    rename_map_dict = {self.DATASET_VISION_KEY: chosen_base_key}
                     rename_str = json.dumps(rename_map_dict)
                     cmd.append(f"--rename_map={rename_str}")
                     n_padded = max(0, len(base_visual_keys) - 1)
-                    logger.info("[RENAME-MAP] 来源: 自动生成 (base 第一个 cam)")
+                    logger.info("[RENAME-MAP] 来源: 自动生成 (按语义匹配 base cam)")
                     logger.info("[RENAME-MAP] dict: %s", rename_map_dict)
                     logger.info("[RENAME-MAP] CLI arg: --rename_map=%s", rename_str)
                     logger.info("[RENAME-MAP] %s -> %s (base 共 %d 个 cam; %d 个会被 -1 填充)",
-                                self.DATASET_VISION_KEY, base_visual_keys[0],
+                                self.DATASET_VISION_KEY, chosen_base_key,
                                 len(base_visual_keys), n_padded)
                 else:
                     logger.error(
@@ -1515,6 +1783,9 @@ class TrainingWorker:
 
         # Resume from checkpoint (暂停后恢复训练)
         # LeRobot v3 用 6 位零填充目录名 (000200), 老格式是 str(step). 两种都试.
+        # 注意: lerobot 的 CLI 接口是 `--resume=true --config_path=<train_config.json>`,
+        # 不接受 `--checkpoint_path` (它是 configs/train.py 里 field(init=False) 的内部字段).
+        # lerobot 从 config_path 反推 checkpoint_path (policy_dir.parent).
         if resume_from_step:
             ckpt_root = Path(model_dir) / "checkpoints"
             candidates = [
@@ -1523,12 +1794,25 @@ class TrainingWorker:
             ]
             ckpt_path = next((c for c in candidates if c.exists()), None)
             if ckpt_path is not None:
+                train_config = ckpt_path / "pretrained_model" / "train_config.json"
+                if not train_config.is_file():
+                    raise FileNotFoundError(
+                        f"Resume checkpoint {ckpt_path.name} exists but missing "
+                        f"pretrained_model/train_config.json (incomplete save). "
+                        f"Try an earlier checkpoint or start a new job."
+                    )
                 cmd.append("--resume=true")
-                cmd.append(f"--checkpoint_path={ckpt_path}")
-                logger.info("Resuming from checkpoint: %s (step %d)", ckpt_path, resume_from_step)
+                cmd.append(f"--config_path={train_config}")
+                logger.info("Resuming from checkpoint: %s (step %d) via config_path",
+                            ckpt_path, resume_from_step)
             else:
-                logger.warning("Checkpoint step %d not found in %s, training from scratch",
-                               resume_from_step, ckpt_root)
+                # 显式失败, 不再静默 fallback 到从头训练 — 后者会因 model_dir 已存在
+                # 触发 lerobot FileExistsError, 给用户的报错指向不明.
+                raise FileNotFoundError(
+                    f"Resume requested at step {resume_from_step} but checkpoint not found. "
+                    f"Searched: {[str(c.name) for c in candidates]}. "
+                    f"Checkpoint may have been cleaned up; please start a new training job."
+                )
         # === PEFT (LoRA) 处理 — 顶层 --peft.* 命名空间, 不是 --policy.* ===
         # lerobot 的 PEFT 通过顶层 PeftConfig 配置 (lerobot/configs/default.py:PeftConfig).
         # 默认 None (不启用); 一旦传任意 --peft.xxx 字段, lerobot 自动 wrap policy with PEFT.
@@ -1569,7 +1853,30 @@ class TrainingWorker:
                          "chunk_size", "n_action_steps", "horizon",
                          # peft_* 已在上面以顶层 --peft.* 形式处理, 不要再走 --policy.*
                          "peft_enable", "peft_method_type", "peft_r",
-                         "peft_target_modules", "peft_full_training_modules"}
+                         "peft_target_modules", "peft_full_training_modules",
+                         # 前端 split H/W 字段, 下方合并成 resize_shape/crop_shape 后再透传
+                         "resize_shape_h", "resize_shape_w",
+                         "crop_shape_h", "crop_shape_w"}
+
+        # 前端 schema 把 resize_shape / crop_shape 拆成 H/W 两个 int 字段以改善 UX,
+        # 这里合并回 LeRobot config 要求的 [H, W] (0 视为未设置).
+        def _merge_hw(h_key: str, w_key: str, target: str):
+            h = custom_params.get(h_key)
+            w = custom_params.get(w_key)
+            try:
+                h_i = int(h) if h not in (None, "", "null") else 0
+                w_i = int(w) if w not in (None, "", "null") else 0
+            except (TypeError, ValueError):
+                return
+            if h_i > 0 and w_i > 0 and target not in custom_params:
+                custom_params[target] = [h_i, w_i]
+                logger.info("[DIFFUSION] merge %s=%d + %s=%d → %s=[%d,%d]",
+                            h_key, h_i, w_key, w_i, target, h_i, w_i)
+
+        if model_type == "diffusion":
+            _merge_hw("resize_shape_h", "resize_shape_w", "resize_shape")
+            _merge_hw("crop_shape_h", "crop_shape_w", "crop_shape")
+
         for k, v in custom_params.items():
             if k in _handled_keys:
                 continue
@@ -1662,6 +1969,11 @@ class TrainingWorker:
         _reader.start()
 
         last_output_at = time.time()
+        # 主动 server-check: lerobot 卡在 base 模型加载 (VLA pi05 14GB ~3min) 时不上报 progress,
+        # progress→409 cancel 信号收不到, 孤儿 subprocess 一直占显存 (实测 13:23 启动→14:18 还在跑).
+        # 修法: stdout 超时分支每 30s 主动 GET /jobs/{id} 看 status, cancelled/paused 就 set flag.
+        _SERVER_CHECK_INTERVAL_S = 30
+        _last_server_check = time.time()
         eof = False
         while not eof:
             try:
@@ -1683,7 +1995,30 @@ class TrainingWorker:
                         f"训练子进程卡死 ({int(idle_s)}s 无 stdout, "
                         f"可能 OOM / CUDA 死锁 / 数据加载阻塞)。"
                         f"最后日志: {' '.join(list(tail_lines)[-3:])[:300]}")
-                # 同时响应停止/暂停信号 (跟原 for-loop 内逻辑一致)
+                # 主动 server-check (每 30s 一次, 短 timeout 不卡循环) — 防孤儿
+                if (not self._should_stop and not self._should_pause
+                        and time.time() - _last_server_check > _SERVER_CHECK_INTERVAL_S):
+                    _last_server_check = time.time()
+                    try:
+                        _r = self.client.get(
+                            f"{self.server_url}/api/training/jobs/{job_id}",
+                            timeout=3.0)
+                        if _r.status_code == 200:
+                            _j = _r.json() or {}
+                            _st = _j.get("status", "")
+                            if _st == "cancelled":
+                                logger.warning(
+                                    "[SERVER-CHECK] job %s status=cancelled, triggering stop "
+                                    "(progress 通道收不到 cancel, 兜底主动 poll 发现)", job_id)
+                                self._should_stop = True
+                            elif _st == "paused":
+                                logger.warning(
+                                    "[SERVER-CHECK] job %s status=paused, triggering pause "
+                                    "(progress 通道收不到, 兜底主动 poll 发现)", job_id)
+                                self._should_pause = True
+                    except Exception as _e:
+                        logger.debug("[SERVER-CHECK] failed (will retry next interval): %s", _e)
+                # 响应停止/暂停信号 (跟原 for-loop 内逻辑一致)
                 if self._should_stop or self._should_pause:
                     reason = "paused" if self._should_pause else "cancelled"
                     logger.info("Stopping LeRobot subprocess (user %s, idle path)", reason)
@@ -1719,16 +2054,28 @@ class TrainingWorker:
             if not progress_cb:
                 continue
 
-            # 解析 INFO metrics 行 (有 loss 数据)
+            # 步数解析: tqdm 优先 (有精确 cur/total), metrics_re 兜底.
+            # 关键 bug (2026-05-10 fix): lerobot format_big_number(step, precision=0) 把
+            # step >= 1000 round 成 "step:1K"/"step:3K", 即便 step=2606 也显示 "step:3K".
+            # 之前先解析 metrics_re → step 直接被当成 3000 上报 → server 提前判完成,
+            # 真训练还差几百步. 修: 同一行先取 tqdm 准确 step, 再用 metrics 取 loss.
+            tqdm_step: int = 0
+            if is_tqdm:
+                tm = tqdm_re.search(line)
+                if tm:
+                    try:
+                        tqdm_step = int(tm.group(1))
+                    except Exception:
+                        tqdm_step = 0
             m = metrics_re.search(line)
             if m:
                 try:
-                    step = _parse_big_num(m.group(1))
+                    metrics_step = _parse_big_num(m.group(1))
                     loss = float(m.group(2))
-                    if step > last_report_step:
+                    # 优先用 tqdm 精确 step (没 tqdm 才用 metrics K-rounded — 它仍单调递增)
+                    real_step = tqdm_step if tqdm_step > 0 else metrics_step
+                    if real_step > last_report_step:
                         metrics = {"loss": loss}
-                        # 其它数值指标 (grdn / lr / dt / ...) — 跳过 step/smpl/ep 这种 K-format 整数,
-                        # 它们用 [\d.e+-]+ 不一定能精确解析回来, 而且 server 端不需要.
                         for kv in re.findall(r'(\w+):([\d.e+-]+)', line):
                             if kv[0] not in ("step", "smpl", "ep"):
                                 try:
@@ -1736,21 +2083,17 @@ class TrainingWorker:
                                 except ValueError:
                                     pass
                         metrics["log"] = line
-                        progress_cb(step, train_steps, metrics)
-                        last_report_step = step
+                        progress_cb(real_step, train_steps, metrics)
+                        last_report_step = real_step
                 except Exception:
                     pass
-            # 解析 tqdm 进度条
-            elif is_tqdm:
-                tm = tqdm_re.search(line)
-                if tm:
-                    try:
-                        step = int(tm.group(1))
-                        if step > last_report_step:
-                            progress_cb(step, train_steps, {"log": line})
-                            last_report_step = step
-                    except Exception:
-                        pass
+            elif tqdm_step > 0 and tqdm_step > last_report_step:
+                # 纯 tqdm 行 (没 metrics, 例如 dataloader 阶段) — 仍上报 step 进度
+                try:
+                    progress_cb(tqdm_step, train_steps, {"log": line})
+                    last_report_step = tqdm_step
+                except Exception:
+                    pass
             # 其他重要行 (WARNING/ERROR/INFO 但非 metrics)
             elif any(k in line for k in ("WARNING", "ERROR", "Creating", "End of", "Checkpoint", "Start")):
                 # 过滤已知预期但每次都打的 noise (避免吓用户):
@@ -1949,7 +2292,7 @@ class TrainingWorker:
         url = f"{self.server_url}/api/training/jobs/{job_id}/status"
         data = {"status": status, "key": self.pairing_key}
         if error_msg:
-            data["error_msg"] = error_msg
+            data["error_msg"] = _sanitize_error_path(error_msg)
         if model_path:
             data["model_path"] = model_path
         if checkpoints:
@@ -2186,6 +2529,19 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     is_vla = config.get("is_vla", model_type in ("smolvla", "pi0", "pi0_fast", "pi05"))
     task_description = config.get("task_description", "manipulation task")
 
+    # === LingBot-VLA 4B: 走独立 b2r-vla env subprocess + WS, 不经 lerobot factory ===
+    # 架构跟 lerobot policies 完全不同 (Qwen2.5-VL + flow-matching), 用 lingbot-vla 官方
+    # 推理服务 (deploy.lingbot_vla_policy WS). 见 lingbot_vla_inferencer.py.
+    if model_type == "lingbot_vla":
+        from box2robot_gpu_worker.lingbot_vla_inferencer import run_inference_lingbot_vla
+        logger.info("[INFER] dispatching to lingbot_vla inferencer (model_dir=%s)", model_dir)
+        return run_inference_lingbot_vla(
+            model_dir=model_dir, server_url=server_url, device_id=device_id,
+            token=token, pos_max=pos_max, fps=fps, camera_id=camera_id,
+            chunk_size=chunk_size, job_id=job_id, execution_mode=execution_mode,
+            chunk_params=chunk_params,
+        )
+
     # LeRobot policy — 解析 model_dir 到具体的 pretrained_model 目录.
     # model_dir 可能传进来三种形态:
     #   (a) 顶层 model_dir, 内含 checkpoints/<step>/pretrained_model/  → glob 找 last
@@ -2211,6 +2567,13 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     sys.path.insert(0, str(Path(__file__).parent.parent / "lerobot" / "src"))
     from lerobot.policies.factory import get_policy_class
     from safetensors.torch import load_file as _load_sf
+
+    # GR00T: 兜底 patch HF cache 里的 config.json (_attn_implementation flash_attention_2 → sdpa).
+    # 即使 lerobot/.../groot/utils.py 的 patch 没生效 (例如 cache 已存在 → hf_hub_download 跳过下载
+    # 不会刷新文件), 这里再过一次确保 worker 没装 flash_attn 也能加载 GR00T.
+    if model_type == "groot":
+        TrainingWorker._ensure_groot_eagle_assets(
+            "lerobot/eagle2hg-processor-groot-n1p5")
 
     policy_cls = get_policy_class(model_type)
 
@@ -2419,45 +2782,69 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
     _ema_state = None
     logger.info("EMA smoothing alpha=%.2f (1.0=off)", _ema_alpha)
 
+    # ===== 推理停止信号: 主循环只读 flag, HTTP 查询丢到后台线程 =====
+    # 关键设计: 推理主循环每个 tick 必须 < 50ms (≥20Hz), 任何 HTTP 调用都不能在主循环里同步等.
+    # 老版 _should_stop 同步调 /check-inference, 一次网络抖动整个循环卡 60s → 机械臂不动.
+    # 新版: 后台线程每 5s polling, 主循环只 atomic 读 _stop_flag, 永远不卡.
+    # 默认"继续推理", 只有 server 明确说 stop 才停, 网络挂了不影响推理流畅性 (符合
+    # "用户不主动停就一直跑" 原则).
+    import threading as _th_inf
     _stop_flag = False
+    _stop_lock = _th_inf.Lock()
+    _stop_reason = ""
+
+    def _stop_poller():
+        """后台线程: 每 5s 查 server 是否要停推理. 失败默认继续 (网络挂时不误停)."""
+        nonlocal _stop_flag, _stop_reason
+        while True:
+            try:
+                if not job_id:
+                    time.sleep(5)
+                    continue
+                r = client.get(f"/api/training/jobs/{job_id}/check-inference", timeout=3.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    should_stop = False
+                    reason = ""
+                    if "should_stop" in data:
+                        should_stop = bool(data.get("should_stop"))
+                        reason = data.get("stop_reason") or "server requested"
+                    else:
+                        # 旧 server 兼容
+                        if not data.get("running", True):
+                            should_stop, reason = True, "server: not running"
+                        elif not data.get("arm_online", True):
+                            should_stop, reason = True, "arm offline"
+                    if should_stop:
+                        with _stop_lock:
+                            _stop_flag = True
+                            _stop_reason = reason
+                        logger.info("[STOP-POLLER] 收到停止信号: %s", reason)
+                        return
+            except Exception as e:
+                # 网络抖动/server 重启 → 静默继续, 不误停推理 (用户不主动停就一直跑)
+                logger.debug("[STOP-POLLER] check 失败 (继续推理): %s", type(e).__name__)
+            # 已停就退出, 没停 sleep 5s 再查
+            with _stop_lock:
+                if _stop_flag:
+                    return
+            time.sleep(5)
+
+    _stop_poller_thread = _th_inf.Thread(target=_stop_poller, name="inference-stop-poller", daemon=True)
+    _stop_poller_thread.start()
+    logger.info("[INFERENCE] stop_poller 后台线程启动 (每 5s 查 server, 主循环不阻塞)")
 
     def _should_stop():
-        nonlocal last_stop_check
-        if _stop_flag:
-            return True
-        now = time.time()
-        if now - last_stop_check < 5:
-            return False
-        last_stop_check = now
-        if not job_id:
-            return False
-        try:
-            # 检查 Server 是否停止了推理
-            r = client.get(f"/api/training/jobs/{job_id}/check-inference")
-            if r.status_code == 200:
-                data = r.json()
-                # v1.0+ 单源信号 should_stop + stop_reason; 老 server 没这字段时回退到 running/arm_online
-                if "should_stop" in data:
-                    if data.get("should_stop"):
-                        logger.info("推理停止 (reason=%s)", data.get("stop_reason") or "unknown")
-                        return True
-                else:
-                    # 旧 server 兼容路径
-                    if not data.get("running", True):
-                        logger.info("推理已被 Server 停止")
-                        return True
-                    if not data.get("arm_online", True):
-                        logger.warning("机械臂离线，自动停止推理")
-                        return True
-        except Exception:
-            pass
-        return False
+        """主循环用. atomic 读 flag, 不阻塞."""
+        with _stop_lock:
+            return _stop_flag
 
     # ===== 共用工具函数 =====
     def _read_state():
         """读取舵机状态, 返回 (servo_ids, state_normalized) 或 (None, None)"""
         try:
-            r = client.get(f"/api/device/{device_id}/servos")
+            # timeout=2s: 推理循环 ~5Hz, 舵机 state 查询 server 慢就跳过本周期不卡死
+            r = client.get(f"/api/device/{device_id}/servos", timeout=2.0)
             servos = r.json().get("servos", [])
         except Exception:
             return None, None
@@ -2466,17 +2853,44 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
         sorted_s = sorted(servos, key=lambda s: s["id"])
         return [s["id"] for s in sorted_s], [s["pos"] / pos_max for s in sorted_s]
 
+    # 摄像头图像缓存: cam 短暂断连 (WiFi 抖动 / 重连) 时用最近一帧撑住, 推理不间断.
+    # 默认连续失败 30 帧 (约 3-6s) 才放弃, 给 cam 重连留时间.
+    _last_cam_image = None
+    _cam_fail_streak = 0
+    _CAM_FAIL_THRESHOLD = 30   # 连续失败 30 次才返 None (大概 3-6s)
+
     def _read_camera():
-        """读取摄像头图像"""
+        """读取摄像头图像. cam 短暂掉线时返回最近一帧 (推理连续性优先)."""
+        nonlocal _last_cam_image, _cam_fail_streak
         if not use_vision or not camera_id:
             return None
         try:
-            img_r = client.get(f"/api/camera/{camera_id}/frame")
+            # timeout=3s: 摄像头 frame 可能稍慢 (jpeg encode), 给 3s 上限
+            img_r = client.get(f"/api/camera/{camera_id}/frame", timeout=3.0)
             if img_r.status_code == 200 and img_r.content:
-                return Image.open(io.BytesIO(img_r.content)).convert("RGB").resize((640, 480))
-        except Exception:
-            pass
-        return None
+                img = Image.open(io.BytesIO(img_r.content)).convert("RGB").resize((640, 480))
+                _last_cam_image = img
+                if _cam_fail_streak > 0:
+                    logger.info("[CAM] 图像恢复 (前 %d 次失败已用缓存撑住)", _cam_fail_streak)
+                _cam_fail_streak = 0
+                return img
+        except Exception as e:
+            logger.debug("[CAM] frame 获取失败 (%d/%d): %s",
+                          _cam_fail_streak + 1, _CAM_FAIL_THRESHOLD, type(e).__name__)
+        # 取图失败 (网络 / 204 / cam 离线)
+        _cam_fail_streak += 1
+        if _cam_fail_streak == 1:
+            logger.debug("[CAM] 首次失败, 用缓存图继续推理")
+        elif _cam_fail_streak == 10:
+            logger.warning("[CAM] 连续 10 次失败, 仍用缓存图; 若达 %d 次放弃",
+                           _CAM_FAIL_THRESHOLD)
+        if _cam_fail_streak >= _CAM_FAIL_THRESHOLD:
+            if _last_cam_image is not None:
+                logger.warning("[CAM] 连续 %d 次失败, 放弃缓存返 None (用户应检查 cam)",
+                               _cam_fail_streak)
+                _last_cam_image = None
+            return None
+        return _last_cam_image   # 用上次成功的图撑住
 
     def _build_obs(state_list, cam_image):
         """构建 LeRobot 观测 dict.
@@ -2662,7 +3076,10 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                 cmds = [{"id": servo_ids[i], "position": positions[i], "speed": 0}
                         for i in range(min(len(positions), len(servo_ids)))]
                 try:
-                    client.post(f"/api/device/{device_id}/command", json={"commands": cmds})
+                    # timeout=2.0: 推理 5Hz 周期 200ms, 单次 HTTP 给 2s 容错;
+                    # 超时即跳过本周期 (server/ESP32 假死时不阻塞推理线程)
+                    client.post(f"/api/device/{device_id}/command",
+                                json={"commands": cmds}, timeout=2.0)
                 except Exception:
                     pass
 
@@ -2754,8 +3171,10 @@ def run_inference_server(model_dir: str, server_url: str, device_id: str,
                     frames.append({"t": base_t + i * frame_interval_ms, "p": positions})
 
                 try:
+                    # timeout=3.0: batch 帧多, 给 server 队列+ESP32 转发更长容错;
+                    # 超时即跳过本批 (避免阻塞推理线程, watchdog 由外层 _should_stop 兜底)
                     client.post(f"/api/device/{device_id}/inference/batch",
-                                json={"frames": frames, "ids": servo_ids})
+                                json={"frames": frames, "ids": servo_ids}, timeout=3.0)
                 except Exception:
                     pass
 
