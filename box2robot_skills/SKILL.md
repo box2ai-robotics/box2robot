@@ -1,7 +1,7 @@
 ---
 name: box2robot
-description: Control Box2Robot robotic arms via cloud API — move servos, record trajectories with camera, stream live frames, browse the ACT skill store, download datasets, generate videos, and orchestrate AI training/inference.
-version: 0.7.0
+description: Control Box2Robot robotic arms via cloud API — move servos, record trajectories with camera, stream live frames, browse the ACT skill store, download datasets, generate videos, and orchestrate AI training/inference. Authenticate with an account login or a user API key (`b2r login --key` / `B2R_API_KEY`).
+version: 0.8.0
 homepage: https://robot.box2ai.com
 emoji: "\U0001F916"
 metadata:
@@ -30,7 +30,7 @@ Control ESP32-based robotic arms through a cloud server API. Move servos, record
 > - **Built-in confirmation gate**: Every command that moves hardware or spends account credits is gated by a confirmation prompt — see *Confirmation & Safety Gating* below. AI agents cannot trigger these actions silently.
 > - **Privacy-sensitive operations** (`snapshot`, `frame`, `stream`, `record start --cam`) access camera hardware — only invoke with user consent. `stream` defaults to a 60-second cap; pass `--duration 0` only when explicitly required.
 > - **No OS shell access**: All operations are HTTP/WebSocket requests to `B2R_SERVER`. No arbitrary OS commands are executed. The only local subprocess is `ffmpeg` (optional, for `b2r video` generation from downloaded JPEG frames).
-> - **Token sensitivity**: `~/.b2r_token` stores a JWT that grants device control. Created with mode 0600 (owner-only). Treat like an SSH key. Run `b2r logout` (or delete the file) when no longer needed; change your account password to revoke server-side.
+> - **Token sensitivity**: `~/.b2r_token` stores a JWT or a user API key that grants device control. Created with mode 0600 (owner-only). Treat like an SSH key. Run `b2r logout` (or delete the file) when no longer needed; change your account password (JWT) or revoke the key in the web console (API key) to revoke server-side.
 
 ## Confirmation & Safety Gating
 
@@ -70,7 +70,18 @@ login → POST /api/auth/login → JWT token
   → all subsequent commands use this token automatically
   → override with B2R_TOKEN env var
   → delete ~/.b2r_token to revoke
+
+login --key <API_KEY> → no password exchange
+  → the user API key is saved to ~/.b2r_token as-is and sent as
+    `Authorization: Bearer <key>` by every subsequent command
+  → override with B2R_API_KEY env var (takes precedence over B2R_TOKEN)
+  → revoke the key in the web console (personal center) to invalidate it
 ```
+
+Both credential types travel in the same `Authorization: Bearer` header — the
+client does not care which one is stored. API keys may be scoped
+(device / camera / data / training / inference / store); an empty scope list
+means full access. The plaintext key is shown only once at creation.
 
 All network calls go exclusively to `B2R_SERVER` (default: `https://robot.box2ai.com`). No other endpoints are contacted.
 
@@ -80,9 +91,10 @@ All network calls go exclusively to `B2R_SERVER` (default: `https://robot.box2ai
 |----------|----------|-------------|---------|
 | `B2R_SERVER` | No | Server URL | `https://robot.box2ai.com` |
 | `B2R_TOKEN` | No | JWT token (overrides ~/.b2r_token) | — |
+| `B2R_API_KEY` | No | User API key (overrides B2R_TOKEN and ~/.b2r_token) | — |
 | `B2R_DEVICE` | No | Default device ID (overrides auto-select) | — |
 
-None are strictly required at install time. The `login` command handles authentication interactively and persists the token to `~/.b2r_token`. `B2R_TOKEN` is the primary credential variable and can be set to skip interactive login.
+None are strictly required at install time. The `login` command handles authentication interactively and persists the token to `~/.b2r_token`. `B2R_TOKEN` is the primary credential variable and can be set to skip interactive login; `B2R_API_KEY` takes precedence over it when both are set.
 
 ## Setup
 
@@ -92,6 +104,10 @@ pip install "aiohttp>=3.9,<4"
 
 # Login (one-time, token cached to ~/.b2r_token, mode 0600)
 python b2r.py login <username> <password>
+
+# ...or authenticate with a user API key (no password prompt)
+# Generate the key in the web console (personal center), then:
+python b2r.py login --key <API_KEY>
 
 # Revoke local token when done
 python b2r.py logout
@@ -192,7 +208,7 @@ All commands are thin wrappers over HTTP API calls to `B2R_SERVER`:
 
 | Command | Method | Endpoint |
 |---------|--------|----------|
-| login | POST | `/api/auth/login` |
+| login | POST | `/api/auth/login` (or `login --key <API_KEY>` — no password exchange, key saved locally) |
 | logout | (local) | Deletes `~/.b2r_token` — no network call |
 | devices | GET | `/api/devices` |
 | status | GET | `/api/device/{id}/servos` |

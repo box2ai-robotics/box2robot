@@ -10,7 +10,7 @@ English | [中文](README.md)
 
 Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robot arms and vision modules to a cloud platform for data collection, model training, and skill sharing. No complex setup — just flash, connect WiFi, bind your device, and start.
 
-> **Current Release: v0.6.6** (Arm firmware v0.6.6 / Camera firmware v0.6.3)
+> **Current Firmware Package: v0.7.0** (Arm firmware v0.7.0 / Camera firmware v0.6.9; both built, packaged, and published for OTA; device-side upgrade and torque-protection validation pending)
 
 ## Getting Started
 
@@ -167,6 +167,8 @@ The device ships with the latest firmware pre-flashed. **Online OTA update is re
 1. After binding, open [https://robot.box2ai.com](https://robot.box2ai.com/#/) → **Device Management**
 2. In device details, click **Firmware Update**. The cloud will push the latest firmware automatically.
 
+Current OTA versions are **ARM v0.7.0 / CAM v0.6.9**; update each device separately. Normal OTA writes only the application image and does not erase the entire flash. Stop recording, inference, and motion, support the arm, and keep power and networking stable. The version API, release notes, and SHA256 of both actual firmware downloads have been verified; publishing does not mean devices have already upgraded.
+
 **Manual flashing** (for first-time flashing of blank boards, devices that won't boot, or custom-built firmware): see [`bin/README_en.md`](bin/README_en.md).
 
 ---
@@ -175,6 +177,8 @@ The device ships with the latest firmware pre-flashed. **Online OTA update is re
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v0.6.9 (cam) | 2026-10-07 | OTA security and reliability: trusted HTTPS download URLs, no HTTP redirects, boot-partition switching only after inactive-image validation, a 30-minute overall timeout, a 60-second no-progress timeout, and failure-reason reporting. Firmware, bootloader, and partition images are provided; older packages are retained. Device-side OTA validation is pending. |
+| v0.7.0 (arm) | 2026-10-07 | Add independent protection for all six joints: a 20 ms check interval (target 50 Hz), three-sample load filtering, factory limits 500/600/650/550/450/150 for IDs 1–6 in raw load units, backdrive yield with reduced torque and slow return after release, thermal/stall safeguards, and fast WebSocket telemetry plus immediate `servo_protection` events. |
 | v0.6.6 (arm) | 2026-05-04 | Fix WS disconnect during recording (transport_poll_write): RAM recording buffer 1200→300 frames frees ~80KB BSS, heap recovers from 30KB to ~110KB; long recordings fall back to SPIFFS |
 | v0.6.5 (arm) | 2026-05-02 | CLI adds ACT Skill Store commands (`store list/info/buy/run/mine`); device/trajectory/job listings now show short codes; GPU Worker training/inference flow polished |
 | v0.6.3 | 2026-04-26 | Flash docs revamped (esptool + Flash Download Tool); legacy bin files archived under `History/` |

@@ -20,6 +20,9 @@ pip install aiohttp
 # Login (token saved to ~/.b2r_token)
 python b2r.py login <username> <password>
 
+# ...or with a user API key generated in the web console (no password prompt)
+python b2r.py login --key <API_KEY>
+
 # List devices
 python b2r.py devices
 
@@ -54,18 +57,25 @@ python b2r.py calibrate               # Auto-calibrate all servos
 |----------|-------------|---------|
 | `B2R_SERVER` | Server URL | `https://robot.box2ai.com` |
 | `B2R_TOKEN` | JWT token (overrides ~/.b2r_token) | — |
+| `B2R_API_KEY` | User API key (overrides B2R_TOKEN and ~/.b2r_token) | — |
 | `B2R_DEVICE` | Default device ID (overrides auto-select) | — |
 
 ## Authentication & Credential Storage
 
 ```
-login → POST /api/auth/login → JWT token → ~/.b2r_token (JSON)
+login            → POST /api/auth/login → JWT token → ~/.b2r_token (JSON)
+login --key <K>  → user API key saved as-is         → ~/.b2r_token (JSON)
 ```
 
 - **`~/.b2r_token`** stores `{ "token": "...", "server": "...", "device": "..." }`.
 - Created with owner-only permissions (0600).
 - Subsequent commands read this file automatically — no repeated login.
 - Override with `B2R_TOKEN` env var. Delete file to revoke.
+- **`token` may be a JWT or a user API key** (`b2r_...`) — both are sent as
+  `Authorization: Bearer <token>`. Generate a key in the web console
+  (personal center); the plaintext is shown only once, the server stores a
+  hash. Keys can be scoped (device / camera / data / training / inference /
+  store; empty = full access) and revoked at any time.
 
 > **Security note:** The token grants device control access. Treat it like an SSH key.
 
@@ -73,7 +83,7 @@ login → POST /api/auth/login → JWT token → ~/.b2r_token (JSON)
 
 | Command | Method | Endpoint |
 |---------|--------|----------|
-| login | POST | `/api/auth/login` |
+| login | POST | `/api/auth/login` (or `login --key <API_KEY>` — no password exchange, key saved locally) |
 | devices | GET | `/api/devices` |
 | status | GET | `/api/device/{id}/servos` |
 | move | POST | `/api/device/{id}/command` |

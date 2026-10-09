@@ -3,6 +3,34 @@
 All notable changes to the `box2robot` ClawHub skill are documented here. This
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-10-05
+
+### Added
+- `b2r login --key <API_KEY>` — authenticate with a user API key instead of
+  username/password. Skips the interactive prompt and the
+  `/api/auth/login` request: the key is stored in `~/.b2r_token` as-is and
+  is sent as `Authorization: Bearer <key>` by every subsequent command.
+  (It still lists devices once so a default arm can be auto-selected.)
+  Keys not starting with `b2r_` produce a warning but are accepted.
+- `B2R_API_KEY` environment variable — user API key, takes precedence over
+  `B2R_TOKEN` and the cached `~/.b2r_token` value. Both credential types
+  travel in the same `Bearer` header, so no other command changed.
+- Docs (SKILL.md / README.md / SKILLS.md) cover the key flow, including a
+  curl example that skips the login round-trip entirely.
+
+### Notes
+- API keys are generated in the web console (personal center). The
+  plaintext is shown only once; the server stores a hash.
+- Keys can carry scopes (`device` / `camera` / `data` / `training` /
+  `inference` / `store`; an empty scope list = full access) and can be
+  revoked at any time, independently of the account password.
+- Fully backward compatible: `b2r login <user> <pass>`, `b2r logout` and
+  existing JWT tokens behave exactly as before.
+
+### Changed
+- Skill metadata version bumped `0.7.0` → `0.8.0` (`pyproject.toml`,
+  SKILL.md frontmatter).
+
 ## [0.7.0] — 2026-05-05
 
 ### Added

@@ -11,13 +11,22 @@
 # Login (one-time, token cached to ~/.b2r_token)
 python b2r.py login <username> <password>
 
+# ...or with a user API key from the web console (personal center) — no password prompt
+python b2r.py login --key <API_KEY>
+
 # Or set environment variables directly
 export B2R_SERVER="https://robot.box2ai.com"
 export B2R_TOKEN="<jwt_token>"
+export B2R_API_KEY="b2r_..."          # user API key — overrides B2R_TOKEN
 export B2R_DEVICE="B2R-XXXXXXXXXXXX"
 ```
 
 Once logged in, all commands carry the token automatically — no repeated authentication needed.
+
+Both credential types are interchangeable: a JWT or a user API key (`b2r_...`)
+is sent as `Authorization: Bearer <token>`. API keys can be scoped
+(device / camera / data / training / inference / store; empty = full access)
+and revoked at any time from the web console.
 
 ---
 
@@ -252,6 +261,11 @@ curl -X POST https://robot.box2ai.com/api/auth/login \
 # List devices
 curl https://robot.box2ai.com/api/devices \
   -H "Authorization: Bearer <token>"
+
+# Skip the login call entirely with a user API key — the key is itself a
+# valid bearer credential. Same header, no /api/auth/login round-trip:
+curl https://robot.box2ai.com/api/devices \
+  -H "Authorization: Bearer b2r_AbCdEf123456..."
 
 # Move servo
 curl -X POST https://robot.box2ai.com/api/device/B2R-xxx/command \

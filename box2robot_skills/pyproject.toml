@@ -1,6 +1,6 @@
 [project]
 name = "box2robot-skills"
-version = "0.7.0"
+version = "0.8.0"
 description = "Standalone CLI for controlling Box2Robot robotic arms via server HTTP API"
 readme = "README.md"
 license = { text = "MIT" }
@@ -16,8 +16,11 @@ b2r = "b2r:main"
 # Environment variables (all optional):
 #   B2R_SERVER   Server URL          Default: https://robot.box2ai.com
 #   B2R_TOKEN    JWT bearer token    Overrides ~/.b2r_token
+#   B2R_API_KEY  User API key        Overrides B2R_TOKEN
 #   B2R_DEVICE   Default device ID   Overrides auto-select
 #
 # Credential storage:
 #   ~/.b2r_token   JSON file created on login with mode 0600.
 #                  Contains {token, server, device}. Treat like an SSH key.
+#                  `token` may be a JWT or a user API key (b2r_...); both
+#                  are sent in the Authorization: Bearer header.

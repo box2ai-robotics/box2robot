@@ -4,6 +4,7 @@ Box2Robot CLI — control your robotic arm with a single command.
 
 Usage:
   b2r login [user] [pass]                # Login (saves token to ~/.b2r_token)
+  b2r login --key <API_KEY>              # Login with API key (no password required)
   b2r logout                             # Delete cached token (revoke local access)
   b2r devices                            # List devices
   b2r status                             # Servo status
@@ -41,10 +42,14 @@ Global flag:
 Environment variables:
   B2R_SERVER   Server URL        (default: https://robot.box2ai.com)
   B2R_TOKEN    JWT bearer token  (overrides ~/.b2r_token)
+  B2R_API_KEY  User API key      (overrides B2R_TOKEN)
   B2R_DEVICE   Default device ID (overrides auto-select)
 
 Credential storage:
   ~/.b2r_token  JSON {token, server, device}. Owner-only (0600).
+                `token` may be a JWT (from `login`) or a user API key
+                (from `login --key` / B2R_API_KEY) — both are sent in the
+                Authorization: Bearer header.
                 Run `b2r logout` (or just delete the file) when done.
 """
 
@@ -92,6 +97,7 @@ def _resolve():
     token, server, device = load_token()
     server = os.environ.get("B2R_SERVER", server or "https://robot.box2ai.com")
     token = os.environ.get("B2R_TOKEN", token)
+    token = os.environ.get("B2R_API_KEY", token)  # API key overrides JWT; both travel in the Bearer header
     device = os.environ.get("B2R_DEVICE", device)
     return server, token, device
 
@@ -103,20 +109,35 @@ def _headers(token):
     return h
 
 
+def _check_auth_error(status, data):
+    """401/403 → print and exit (revoked key must not silently look like empty data)"""
+    if status in (401, 403):
+        msg = data.get("error", "") if isinstance(data, dict) else ""
+        hint = ""
+        if status == 401:
+            hint = " (token/API key invalid or revoked — run `b2r login` or check B2R_API_KEY)"
+        print(f"HTTP {status}: {msg or 'unauthorized'}{hint}")
+        sys.exit(1)
+
+
 async def _get(session, server, token, path, params=None):
     async with session.get(f"{server}{path}", headers=_headers(token),
                            params=params) as r:
-        return await r.json() if "json" in r.content_type else {"status": r.status}
+        data = await r.json() if "json" in r.content_type else {"status": r.status}
+        _check_auth_error(r.status, data)
+        return data
 
 
 async def _post(session, server, token, path, data=None):
     async with session.post(f"{server}{path}", headers=_headers(token),
                             json=data) as r:
-        return await r.json() if "json" in r.content_type else {"status": r.status}
+        resp = await r.json() if "json" in r.content_type else {"status": r.status}
+        _check_auth_error(r.status, resp)
+        return resp
 
 
 def _need_login():
-    print("Not logged in. Run: python b2r.py login")
+    print("Not logged in. Run: python b2r.py login  (or set B2R_API_KEY)")
     sys.exit(1)
 
 
@@ -216,7 +237,15 @@ def _confirm(action, details=None):
 
 async def cmd_login(args):
     server = os.environ.get("B2R_SERVER", "https://robot.box2ai.com")
-    if len(args) >= 2:
+    api_key = None
+    if args and args[0] == "--key":
+        if len(args) < 2:
+            print("Usage: b2r login --key <API_KEY>")
+            return
+        api_key = args[1]
+        if not api_key.startswith("b2r_"):
+            print("Warning: API keys normally start with 'b2r_' — continuing anyway.")
+    elif len(args) >= 2:
         user, pwd = args[0], args[1]
     elif len(args) == 1:
         user = args[0]
@@ -228,12 +257,17 @@ async def cmd_login(args):
         pwd = getpass.getpass("Password: ")
 
     async with aiohttp.ClientSession() as s:
-        resp = await _post(s, server, None, "/api/auth/login",
-                           {"username": user, "password": pwd})
-        token = resp.get("token")
-        if not token:
-            print(f"Login failed: {resp}")
-            return
+        if api_key:
+            # API key auth: no password exchange — the key itself is the
+            # bearer credential used by all subsequent commands.
+            token = api_key
+        else:
+            resp = await _post(s, server, None, "/api/auth/login",
+                               {"username": user, "password": pwd})
+            token = resp.get("token")
+            if not token:
+                print(f"Login failed: {resp}")
+                return
 
         # Auto-select first online arm
         devices = await _get(s, server, token, "/api/devices")
@@ -254,10 +288,11 @@ async def cmd_login(args):
 
 
 async def cmd_logout(args):
-    """Delete the cached JWT at ~/.b2r_token (revokes local device control).
+    """Delete the cached credential at ~/.b2r_token (stops local CLI usage).
 
-    Server-side sessions are not invalidated — change your password at
-    https://robot.box2ai.com to force-revoke a leaked token.
+    Server-side is not invalidated — to force-revoke a leaked credential,
+    change your password (JWT) or revoke the key in the web console
+    (个人中心 → API 密钥).
     """
     if os.path.exists(TOKEN_FILE):
         try:
