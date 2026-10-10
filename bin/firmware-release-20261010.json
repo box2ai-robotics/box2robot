@@ -1,0 +1,63 @@
+{
+  "date": "2026-10-10",
+  "versions": {
+    "Box2Robot-Arm": "0.7.1",
+    "Box2Robot-Cam": "0.7.0"
+  },
+  "files": [
+    {
+      "path": "box2robot_arm/box2arm_v0.7.1_firmware.bin",
+      "model": "Box2Robot-Arm",
+      "version": "0.7.1",
+      "kind": "firmware",
+      "bytes": 1262048,
+      "sha256": "5b618828e5dd6b7fa6ffa89bb05b2c65832916b4e2a59ba25906dc2c12889904",
+      "flash_offset": "0x10000"
+    },
+    {
+      "path": "box2robot_arm/box2arm_v0.7.1_bootloader.bin",
+      "model": "Box2Robot-Arm",
+      "version": "0.7.1",
+      "kind": "bootloader",
+      "bytes": 26048,
+      "sha256": "f2f2ed3b770d5589f38c884aee2d58bd73b858f1854627ebeb8297b2ff47c805",
+      "flash_offset": "0x1000"
+    },
+    {
+      "path": "box2robot_arm/box2arm_v0.7.1_partitions.bin",
+      "model": "Box2Robot-Arm",
+      "version": "0.7.1",
+      "kind": "partitions",
+      "bytes": 3072,
+      "sha256": "1ae446228d79cf83a4b83de41c33d1e01dc21a3557149d7da90fbcbfc303311d",
+      "flash_offset": "0x8000"
+    },
+    {
+      "path": "box2robot_cam/box2cam_v0.7.0_firmware.bin",
+      "model": "Box2Robot-Cam",
+      "version": "0.7.0",
+      "kind": "firmware",
+      "bytes": 3635952,
+      "sha256": "3a9e4b5a52640c4e8d0b24b2ec0f47cc5eb4c7025fb0a463ad1cdf7aed1c06fc",
+      "flash_offset": "0x10000"
+    },
+    {
+      "path": "box2robot_cam/box2cam_v0.7.0_bootloader.bin",
+      "model": "Box2Robot-Cam",
+      "version": "0.7.0",
+      "kind": "bootloader",
+      "bytes": 21024,
+      "sha256": "e7e697d0fbf5c42c15b56614a82577feef98da42048c45cf4147851ae96b84a4",
+      "flash_offset": "0x0"
+    },
+    {
+      "path": "box2robot_cam/box2cam_v0.7.0_partitions.bin",
+      "model": "Box2Robot-Cam",
+      "version": "0.7.0",
+      "kind": "partitions",
+      "bytes": 3072,
+      "sha256": "3937cfc1bd3731e5fde3c09b724005a4ff8fb562dd704a966988a5b0434aec18",
+      "flash_offset": "0x8000"
+    }
+  ]
+}

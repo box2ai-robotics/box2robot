@@ -15,30 +15,40 @@ This directory contains pre-built firmware for the Box2Robot Arm Driver Board an
 ```
 bin/
 ├── box2robot_arm/                       # Arm Driver Board firmware (ESP32)
-│   ├── box2arm_v0.7.0_bootloader.bin
-│   ├── box2arm_v0.7.0_partitions.bin
-│   ├── box2arm_v0.7.0_firmware.bin
+│   ├── box2arm_v0.7.1_bootloader.bin
+│   ├── box2arm_v0.7.1_partitions.bin
+│   ├── box2arm_v0.7.1_firmware.bin
 │   └── History/                         # Older versions
 ├── box2robot_cam/                       # Vision-Audio Module firmware (ESP32-S3)
-│   ├── box2cam_v0.6.9_bootloader.bin
-│   ├── box2cam_v0.6.9_partitions.bin
-│   ├── box2cam_v0.6.9_firmware.bin
+│   ├── box2cam_v0.7.0_bootloader.bin
+│   ├── box2cam_v0.7.0_partitions.bin
+│   ├── box2cam_v0.7.0_firmware.bin
 │   └── history/                         # Older versions
 ├── download_driver_CP210x_USB_TO_UART/  # CP210x USB-to-UART driver
 └── flash_download_tool_windows/         # Espressif Flash Download Tool (Windows)
     └── flash_download_tool_3.9.9_R2.exe
 ```
 
-> Current versions: Arm firmware v0.7.0 / Camera firmware v0.6.9. Update each device separately; their images are not interchangeable.
+> Current versions: Arm firmware v0.7.1 / Camera firmware v0.7.0. Update each device separately; their images are not interchangeable.
 
-## Release Notes (2026-10-07)
+## Release Notes (2026-10-10)
 
-- **ARM v0.7.0**: Independent torque protection for all six joints, a 20 ms check interval (target 50 Hz), and three-sample load filtering. Factory limits for IDs 1–6 are **500 / 600 / 650 / 550 / 450 / 150**; saved configuration can override these defaults. Backdriving reduces torque to yield, then slowly returns to the original target after release. Thermal and stall protection are also included.
-- **Telemetry**: ARM fast state frames carry each joint's load, protection limit, protection state, and torque-enable state. Protection transitions immediately send a `servo_protection` event without waiting for a regular state frame. Limits use the servo's raw load units, **not N·m**.
-- **CAM v0.6.9**: OTA accepts only trusted HTTPS download URLs, rejects HTTP redirects, and changes the boot partition only after writing and validating the inactive partition. It adds a 30-minute overall timeout, a 60-second no-progress timeout, and failure-reason reporting.
-- Both versions are built, packaged, and published for OTA. All six images have been checked for chip compatibility, partition capacity, and matching local/server SHA256; older packages are retained. Public version checks, release notes, and actual application-image download hashes pass verification. Backdrive behavior, real-load protection, and device-side OTA still require physical validation; publishing does not mean devices have already upgraded.
+- **ARM v0.7.1**: Adds a persistent torque-protection switch, enabled by default. Change it in the website's arm-debug page and wait for device confirmation. Protection may slow motion and reduce available load capacity to help protect the motors. Disabling it removes load-based torque limiting and target clamping, increasing force during collisions or stalls; thermal protection remains active. This is separate from the servo torque-enable switch.
+- **ARM v0.7.1 / CAM v0.7.0**: The `192.168.4.1` provisioning page keeps previous WiFi results selectable during rescans, displays `Scanning`, and prevents duplicate scans. Successful scans refresh the list; failures retain previous results. Chinese/English switching preserves the entered SSID and password.
+- **Configure and bind both devices separately**: Connect to `Box2Robot_XXXX` for the driver board and `Box2Cam_XXXX` for the camera. Each `192.168.4.1` page belongs to the device whose hotspot is currently connected. Configure 2.4 GHz WiFi for each device, then bind both to the same account using their separate codes (arm OLED / camera voice).
+- **Older firmware**: Unsupported firmware keeps the protection switch disabled while existing controls remain available. Upgrade ARM to 0.7.1 for the new switch; saved settings survive reboot.
+- The [public user manual](https://robot.box2ai.com/#/pages/developer/docs?section=connect) requires no login. Physical motion, protection behavior, and device-side OTA still require hardware validation.
+- Sizes and SHA256 hashes for all six images are in [`firmware-release-20261010.json`](firmware-release-20261010.json). Older files are retained.
 
-On 2026-10-07, ARM was rebuilt and all three `box2arm_v0.7.0_*.bin` files were replaced in the local package and on the OTA server, with backups retained. CAM is unchanged. The current ARM application image is **1,252,832 bytes**, with SHA256 `09d0ce0bfeca9890313286929f3115be1ff0b8c7659d95b26e31902e5d647fa1`; all three public downloads have been verified. The version remains **0.7.0**, so devices already running 0.7.0 will not discover this replacement through normal version checks; they need reflashing or a separate same-version update workflow. No device upgrade or reboot commands were sent for this replacement.
+### Torque-protection configuration command
+
+Send `POST /api/device/{device_id}/config` with authorized account/API credentials. To enable:
+
+```json
+{"params":{"torque_protection_enabled":true}}
+```
+
+Use `false` to disable; the value must be a JSON boolean. Check `torque_protection_supported` from `GET /api/device/{device_id}/servos` first. A successful configuration request means submitted, not applied: wait for the reported `torque_protection_enabled` state. `torque_protection_desired` is only the requested value.
 
 ### OTA vs. Offline Flashing
 
@@ -96,9 +106,9 @@ Write firmware (note: bootloader address is **0x1000**):
 
 ```bash
 python -m esptool --chip esp32 --baud 921600 write_flash \
-  0x1000  bin/box2robot_arm/box2arm_v0.7.0_bootloader.bin \
-  0x8000  bin/box2robot_arm/box2arm_v0.7.0_partitions.bin \
-  0x10000 bin/box2robot_arm/box2arm_v0.7.0_firmware.bin
+  0x1000  bin/box2robot_arm/box2arm_v0.7.1_bootloader.bin \
+  0x8000  bin/box2robot_arm/box2arm_v0.7.1_partitions.bin \
+  0x10000 bin/box2robot_arm/box2arm_v0.7.1_firmware.bin
 ```
 
 ### 3. Flash the Vision-Audio Module (ESP32-S3)
@@ -113,9 +123,9 @@ Write firmware (note: bootloader address is **0x0**, different from ESP32):
 
 ```bash
 python -m esptool --chip esp32s3 --baud 921600 write_flash \
-  0x0     bin/box2robot_cam/box2cam_v0.6.9_bootloader.bin \
-  0x8000  bin/box2robot_cam/box2cam_v0.6.9_partitions.bin \
-  0x10000 bin/box2robot_cam/box2cam_v0.6.9_firmware.bin
+  0x0     bin/box2robot_cam/box2cam_v0.7.0_bootloader.bin \
+  0x8000  bin/box2robot_cam/box2cam_v0.7.0_partitions.bin \
+  0x10000 bin/box2robot_cam/box2cam_v0.7.0_firmware.bin
 ```
 
 ### 4. Specify Serial Port Manually (Optional)
@@ -164,9 +174,9 @@ Click the `...` button to load each of the 3 bin files, and fill in the **corres
 
 | File | Address |
 |------|---------|
-| `box2arm_v0.7.0_bootloader.bin` | `0x1000` |
-| `box2arm_v0.7.0_partitions.bin` | `0x8000` |
-| `box2arm_v0.7.0_firmware.bin`   | `0x10000` |
+| `box2arm_v0.7.1_bootloader.bin` | `0x1000` |
+| `box2arm_v0.7.1_partitions.bin` | `0x8000` |
+| `box2arm_v0.7.1_firmware.bin`   | `0x10000` |
 
 Make sure **all 3 checkboxes are ticked**. Set `COM` port and `BAUD = 921600`, then click **START**:
 
@@ -196,9 +206,9 @@ Click **OK** to enter the main interface.
 
 | File | Address |
 |------|---------|
-| `box2cam_v0.6.9_bootloader.bin` | `0x0` |
-| `box2cam_v0.6.9_partitions.bin` | `0x8000` |
-| `box2cam_v0.6.9_firmware.bin`   | `0x10000` |
+| `box2cam_v0.7.0_bootloader.bin` | `0x0` |
+| `box2cam_v0.7.0_partitions.bin` | `0x8000` |
+| `box2cam_v0.7.0_firmware.bin`   | `0x10000` |
 
 Make sure **all 3 checkboxes are ticked**. Set `COM` port and `BAUD = 921600`, then click **START**:
 

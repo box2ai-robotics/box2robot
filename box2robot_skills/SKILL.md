@@ -8,272 +8,51 @@ metadata:
   openclaw:
     requires:
       anyBins: [python3, python]
-      config: [~/.b2r_token]
-    primaryEnv: B2R_TOKEN
+    primaryEnv: B2R_API_KEY
     install:
       - kind: uv
         package: "aiohttp>=3.9,<4"
         bins: []
 ---
 
-# Box2Robot — Robotic Arm Control Skill
+# Box2Robot — robot control through the standalone CLI
 
-Control ESP32-based robotic arms through a cloud server API. Move servos, record trajectories with camera, download datasets, generate replay videos, and orchestrate AI training/inference — all from a single CLI (`b2r.py`).
+Use the bundled `b2r.py` for device status, servo control, camera frames, recording, datasets, ACT training/inference and the skill store. Run commands from this skill directory with `python b2r.py ...` (or the installed `b2r` entrypoint).
 
-> **Official skill** published by the Box2Robot team (https://robot.box2ai.com).
+## Read the relevant guide
 
-## Safety & Supervision
+- First setup, API Key creation, Windows/Bash examples and troubleshooting: [README.md](README.md).
+- Command/API mapping, complete IDs and agent workflows: [SKILLS.md](SKILLS.md).
+- Web-only workflows (Code as Policy, context skills, personal skill repository, pose memory): README section 6 and the linked web guides. Do not invent `say`, `shell`, `exec` or `cap` subcommands: this standalone CLI does not implement them.
 
-> **This skill controls physical robotic hardware and camera/microphone peripherals.**
->
-> - **Human supervision required**: Do NOT run autonomously without operator oversight. Servo torque and motion commands cause physical movement that could injure people or damage objects.
-> - **Built-in confirmation gate**: Every command that moves hardware or spends account credits is gated by a confirmation prompt — see *Confirmation & Safety Gating* below. AI agents cannot trigger these actions silently.
-> - **Privacy-sensitive operations** (`snapshot`, `frame`, `stream`, `record start --cam`) access camera hardware — only invoke with user consent. `stream` defaults to a 60-second cap; pass `--duration 0` only when explicitly required.
-> - **No OS shell access**: All operations are HTTP/WebSocket requests to `B2R_SERVER`. No arbitrary OS commands are executed. The only local subprocess is `ffmpeg` (optional, for `b2r video` generation from downloaded JPEG frames).
-> - **Token sensitivity**: `~/.b2r_token` stores a JWT or a user API key that grants device control. Created with mode 0600 (owner-only). Treat like an SSH key. Run `b2r logout` (or delete the file) when no longer needed; change your account password (JWT) or revoke the key in the web console (API key) to revoke server-side.
+## Authentication and target selection
 
-## Confirmation & Safety Gating
+1. Have the user sign in at https://robot.box2ai.com, bind devices and open account → API 密钥 → 生成新密钥. Name the key, select functional scopes, generate, copy and save the one-time plaintext. A `b2r_...` platform key is different from a model provider key.
+2. Use `B2R_API_KEY` from the user's environment, or `python b2r.py login --key <API_KEY>` to persist it. Do not request plaintext in chat or expose it in logs. The latter command queries devices and caches the first online arm; always verify the target.
+3. Run `python b2r.py devices`, set `B2R_DEVICE` to the intended complete arm device ID, then run `python b2r.py status`. Use explicit camera IDs for `snapshot`, `frame` and `stream`.
 
-The CLI gates these high-impact commands behind an interactive confirmation prompt:
+Credential order: `B2R_API_KEY` > `B2R_TOKEN` > `~/.b2r_token`. `B2R_SERVER` overrides the cached server (default https://robot.box2ai.com); `B2R_DEVICE` overrides the cached arm. Both JWT and API Key use `Authorization: Bearer`.
 
-| Command | Reason it is gated |
-|---------|-------------------|
-| `move`, `home`, `play <id>` | Causes physical motion of the arm |
-| `torque on/off` | `off` may cause the arm to drop; `on` locks it suddenly |
-| `calibrate` | Drives servos to physical end-stops |
-| `deploy` | Starts autonomous ML inference loop |
-| `store buy` | Spends account credits |
-| `store run` | Causes physical motion via a community-uploaded skill |
+Scopes: device / camera / data / training / inference / store; empty means full access, not no access. Device routes including recording/trajectories require device. CLI deployment reads training jobs and devices before invoking inference, so use training + device + inference. Keys cannot manage `/api/keys`; use the signed-in web account.
 
-**Behavior:**
-- **Interactive TTY** → prompts `Proceed? [y/N]` (default: no).
-- **Non-interactive** (agent, CI, pipe) → command **refuses to run** unless `--yes` / `-y` is on the command line.
-- **`--yes` / `-y`** is a global flag that explicitly skips the prompt. AI agents wrapping this CLI MUST surface the action to the user and only pass `--yes` after explicit user approval.
+`logout` only removes the local cache. It does not clear environment variables or revoke server access. Revoke API Keys in the web account. The cache holds plaintext and attempts POSIX 0600 permissions; Windows access also depends on filesystem ACLs.
 
-```bash
-# Interactive use — prompted before motion:
-b2r move 1 2048
-#   CONFIRM: Move servo on B2R-XXXXXXXXXXXX (physical motion)  (id=1, position=2048, speed=1000)
-#   Proceed? [y/N]: y
+## Before physical actions
 
-# Agent use — must pass --yes after surfacing intent to user:
-b2r --yes move 1 2048    # or: b2r move 1 2048 --yes
-```
+- Confirm the user's intended device and operation, online state, calibration, valid joint range and unobstructed workspace. Human supervision is required for motion. Do not automatically calibrate or release someone else's control to make a command succeed.
+- Positions are encoder counts, not degrees. Never assume 2048 is safe or home for every joint. Start with a small movement relative to fresh feedback, within the actual calibrated range.
+- `move`, `home`, `torque`, `play <id>`, `calibrate`, `deploy`, `store buy` and `store run` use the CLI confirmation gate. Interactive callers answer `Proceed? [y/N]`; non-interactive callers must supply `--yes` / `-y`. Use it only for a concrete action already explicitly authorized by the user. Existing authorization for that action does not require another permission round.
+- Camera access and recording require user consent. `stream` defaults to 60 seconds; use bounded duration unless unlimited streaming is explicitly requested.
+- `torque off` removes support and may drop the arm. `home` causes motion. Neither is a general emergency stop. Use the operation-specific stop, observe the outcome, and report an unconfirmed stop.
+- HTTP submission success (`sent`, `queued`) is not proof of completed movement. Check returned errors, fresh state and actual task results; never blindly retry motion, purchases or job submission.
 
-Read-only commands (`devices`, `status`, `record status`, `play` without args, `jobs`, `store list/info/mine/meta`, `frame`, `snapshot`, `download`, `dataset`, `video`) and the safety-stop command (`stop-infer`) are **not** gated.
+## Workflow boundaries
 
-## Credential Flow
+- `play` with no arguments lists trajectories; it does not play them. The CLI truncates trajectory and job IDs in lists. Obtain complete IDs from create/stop responses or authenticated HTTP lists before subsequent commands.
+- `snapshot CAM_ID` requests capture; `frame CAM_ID out.jpg` saves the cached JPEG; `stream CAM_ID --duration 15` starts a bounded live preview. A 204 frame response means no cached frame.
+- `record start --cam CAM_ID` → user demonstration → `record stop NAME` → inspect data → authorized playback. `dataset ID DIR` downloads JSON/images; `download` downloads images only. `video` needs ffmpeg or opencv-python.
+- `train` is interactive and currently submits ACT with batch size 32 and chunk size 20. Training may consume credits. `deploy JOB_ID` interactively selects an online GPU, arm, camera and mode; `--yes` does not answer selection prompts. Use the web training page for other models and official compute configuration.
+- `stop-infer JOB_ID` stops that inference job without the motion confirmation gate. The CLI has no playback-stop subcommand; use the corresponding web controls or a verified HTTP stop endpoint.
+- Read `store info` before buying/running. Execution depends on skill type and requirements; `store mine` lists purchases, not the personal VLA/CaP/context skill repository.
 
-```
-login → POST /api/auth/login → JWT token
-  → saved to ~/.b2r_token (mode 0600, owner-only)
-  → all subsequent commands use this token automatically
-  → override with B2R_TOKEN env var
-  → delete ~/.b2r_token to revoke
-
-login --key <API_KEY> → no password exchange
-  → the user API key is saved to ~/.b2r_token as-is and sent as
-    `Authorization: Bearer <key>` by every subsequent command
-  → override with B2R_API_KEY env var (takes precedence over B2R_TOKEN)
-  → revoke the key in the web console (personal center) to invalidate it
-```
-
-Both credential types travel in the same `Authorization: Bearer` header — the
-client does not care which one is stored. API keys may be scoped
-(device / camera / data / training / inference / store); an empty scope list
-means full access. The plaintext key is shown only once at creation.
-
-All network calls go exclusively to `B2R_SERVER` (default: `https://robot.box2ai.com`). No other endpoints are contacted.
-
-## Environment Variables
-
-| Variable | Required | Description | Default |
-|----------|----------|-------------|---------|
-| `B2R_SERVER` | No | Server URL | `https://robot.box2ai.com` |
-| `B2R_TOKEN` | No | JWT token (overrides ~/.b2r_token) | — |
-| `B2R_API_KEY` | No | User API key (overrides B2R_TOKEN and ~/.b2r_token) | — |
-| `B2R_DEVICE` | No | Default device ID (overrides auto-select) | — |
-
-None are strictly required at install time. The `login` command handles authentication interactively and persists the token to `~/.b2r_token`. `B2R_TOKEN` is the primary credential variable and can be set to skip interactive login; `B2R_API_KEY` takes precedence over it when both are set.
-
-## Setup
-
-```bash
-# Install pinned dependency (3.9 ≤ aiohttp < 4)
-pip install "aiohttp>=3.9,<4"
-
-# Login (one-time, token cached to ~/.b2r_token, mode 0600)
-python b2r.py login <username> <password>
-
-# ...or authenticate with a user API key (no password prompt)
-# Generate the key in the web console (personal center), then:
-python b2r.py login --key <API_KEY>
-
-# Revoke local token when done
-python b2r.py logout
-```
-
-## Commands
-
-### Device & Status
-```bash
-b2r.py devices                     # List devices (* = online)
-b2r.py status                      # Servo positions, load, temperature
-```
-
-### Servo Control
-```bash
-b2r.py torque on                   # Lock servos
-b2r.py torque off                  # Release (allows manual dragging)
-b2r.py home                        # Return to home position
-b2r.py move <servo_id> <pos> [spd] # Move a single servo
-# Position: 0-4095 (home varies per joint), Speed: 0-4000 (default 1000)
-```
-
-### Recording & Playback
-```bash
-b2r.py record start                # Start recording (servo data only)
-b2r.py record start --cam CAM-xxx  # Record with camera (servo + images)
-b2r.py record stop [name]          # Stop and save
-b2r.py record status               # Current recording status
-b2r.py play                        # List all trajectories
-b2r.py play <traj_id>              # Play a trajectory
-```
-
-When starting a recording, if online cameras are detected, the CLI offers an interactive prompt to select one. Camera recording captures synchronized JPEG frames alongside servo position data.
-
-### Camera
-```bash
-b2r.py snapshot                    # Request camera snapshot
-b2r.py frame [cam_id] [out.jpg]   # Download latest JPEG frame to local file
-b2r.py stream <cam_id> [--out DIR] [--latest FILE] [--duration SEC]
-                                   # Live MJPEG-over-WebSocket stream @ ~10Hz
-# Default: writes ./frame.jpg, auto-stops after 60s (privacy cap)
-# --out DIR     : save every frame as DIR/000001.jpg, 000002.jpg, ...
-# --latest FILE : overwrite a single rolling file (default: ./frame.jpg)
-# --duration SEC: auto-stop after N seconds. Default 60. Pass 0 for unlimited.
-```
-
-`stream` connects to `/ws/camera/{cam_id}`. The server auto-switches the camera into 10fps preview mode on first viewer and back to idle when all viewers disconnect — no manual mode toggle needed.
-
-> **Privacy note**: These commands access camera hardware. Only invoke with user consent.
-
-### ACT Skill Store
-```bash
-b2r.py store list [keyword] [--type T] [--cat C]   # Browse community-uploaded skills
-b2r.py store info <task>                            # Skill detail (TASK-... code or task_id)
-b2r.py store buy <task>                             # Purchase a paid skill (deducts credits)
-b2r.py store run <task> [device]                    # Execute a purchased skill on a device
-b2r.py store mine                                   # List skills you've purchased
-b2r.py store meta                                   # List available categories / types / tags
-```
-
-The ACT Store is a marketplace of reusable, pre-trained robot skills (e.g. "wave", "pour water"). Free skills can be run directly; paid skills require `store buy` first. Execution sends the skill to the selected arm device and runs server-side inference — physical movement still requires human supervision.
-
-### Data Download
-```bash
-b2r.py download <traj_id> [dir]    # Download trajectory images only
-b2r.py dataset <traj_id> [dir]     # Download full dataset (JSON + images)
-b2r.py video <traj_id> [out.mp4]   # Generate MP4 video from trajectory images
-b2r.py video <traj_id> out.mp4 --fps 5  # Custom frame rate
-```
-
-`dataset` downloads the trajectory JSON (all frames with positions, timestamps, calibration snapshots) plus all camera images into a local directory.
-
-`video` downloads images to a temp directory and encodes them using `ffmpeg` (preferred) or `opencv-python` (fallback). Neither is required at install time — the command reports a clear error if both are missing.
-
-### Calibration
-```bash
-b2r.py calibrate [servo_id]        # Auto-calibrate (0 = all servos)
-```
-
-> **Hardware note**: Calibration physically moves servos to their limits. Ensure the arm is clear of obstacles.
-
-### Training & Inference
-```bash
-b2r.py train                       # Submit training job (interactive)
-b2r.py train --steps 50000 --name my_model
-b2r.py jobs                        # List training jobs and status
-b2r.py deploy <job_id>             # Deploy inference (interactive device selection)
-b2r.py stop-infer <job_id>         # Stop inference
-```
-
-`train` interactively lists available trajectories, lets you select datasets (e.g., `1,3,5` or `1-5` or `all`), confirms parameters, then submits to the server.
-
-`deploy` interactively selects GPU device, arm device, camera (optional), and execution mode (original/fixed/adaptive/overlap), then deploys.
-
-## API Endpoints Used
-
-All commands are thin wrappers over HTTP API calls to `B2R_SERVER`:
-
-| Command | Method | Endpoint |
-|---------|--------|----------|
-| login | POST | `/api/auth/login` (or `login --key <API_KEY>` — no password exchange, key saved locally) |
-| logout | (local) | Deletes `~/.b2r_token` — no network call |
-| devices | GET | `/api/devices` |
-| status | GET | `/api/device/{id}/servos` |
-| move | POST | `/api/device/{id}/command` |
-| home | POST | `/api/device/{id}/go_home` |
-| torque | POST | `/api/device/{id}/torque` |
-| record start | POST | `/api/device/{id}/record/start` |
-| record stop | POST | `/api/device/{id}/record/stop` |
-| record status | GET | `/api/device/{id}/record/status` |
-| play | GET/POST | `/api/device/{id}/trajectories`, `.../trajectory/{id}/play` |
-| snapshot | POST | `/api/camera/{id}/snapshot` |
-| frame | GET | `/api/camera/{id}/frame` |
-| stream | WS | `/ws/camera/{id}` (binary JPEG frames @ ~10Hz) |
-| store list | GET | `/api/act/tasks` |
-| store info | GET | `/api/act/tasks/{ref}` |
-| store buy | POST | `/api/act/tasks/{ref}/purchase` |
-| store run | POST | `/api/act/tasks/{ref}/execute` |
-| store mine | GET | `/api/act/my-purchases` |
-| store meta | GET | `/api/act/meta` |
-| download | GET | `.../trajectory/{id}/images`, `/api/traj-image/{id}/{idx}` |
-| dataset | GET | `.../trajectory/{id}/data`, `.../trajectory/{id}/images` |
-| video | GET | `.../trajectory/{id}/images`, `/api/traj-image/{id}/{idx}` |
-| calibrate | POST | `/api/device/{id}/calibrate` |
-| train | POST | `/api/training/jobs` |
-| jobs | GET | `/api/training/jobs` |
-| deploy | POST | `/api/training/jobs/{id}/deploy` |
-| stop-infer | POST | `/api/training/jobs/{id}/stop-inference` |
-
-## Preflight Checks (for AI Agents)
-
-Agents should verify before executing servo/recording commands:
-
-| Step | Check | On Failure |
-|------|-------|------------|
-| 1 | Device online | "Device offline — check power" |
-| 2 | Device type = arm | "Not a robotic arm" |
-| 3 | Calibration exists | Run `calibrate` first |
-
-## Orchestration Examples
-
-### Record training data with camera
-```
-1. b2r torque off
-2. b2r record start --cam CAM-xxx
-3. [user demonstrates task by hand]
-4. b2r record stop my_dataset
-5. b2r dataset <traj_id>           # download locally
-6. b2r video <traj_id> demo.mp4    # generate preview video
-```
-
-### Train and deploy
-```
-1. b2r train                       # select datasets, submit job
-2. b2r jobs                        # monitor progress
-3. b2r deploy <job_id>             # deploy to GPU + arm  (confirmation required)
-4. [robot executes learned skill]
-5. b2r stop-infer <job_id>         # stop when done       (no confirmation — safety stop)
-```
-
-## Review Findings Addressed (ClawHub Security Review)
-
-| Finding | Mitigation in this version |
-|---------|---------------------------|
-| **Tool Misuse — physical motion without confirmation** (High) | All motion commands (`move`, `home`, `torque`, `play <id>`, `calibrate`, `deploy`, `store run`) are gated by `_confirm()`. Non-interactive callers must pass `--yes`/`-y` after explicit user approval. |
-| **Tool Misuse — store buy/run without approval** (Medium) | `store buy` and `store run` go through the same confirmation gate; `--yes` flag is the only bypass. |
-| **Supply Chain — unpinned aiohttp** (Low) | `aiohttp` pinned to `>=3.9,<4` in both `pyproject.toml` and the SKILL.md install spec. |
-| **Identity — JWT persistence** (Medium, Note) | New `b2r logout` command for one-shot revocation. Token storage path, mode (0600), and revocation steps documented in *Safety & Supervision*. |
-| **Privacy — camera stream** (Medium, Note) | `b2r stream` now defaults to `--duration 60` (auto-stop after 60s). A privacy banner is printed at stream start. Unlimited streaming requires explicit `--duration 0`. |
+Only call the configured server for robot operations. Video generation may invoke local ffmpeg on downloaded images. Do not claim web-only features are available through this CLI.

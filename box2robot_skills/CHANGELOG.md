@@ -3,6 +3,14 @@
 All notable changes to the `box2robot` ClawHub skill are documented here. This
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — documentation update 2026-10-10
+
+- Added a step-by-step API Key, PowerShell/Bash setup and first-motion guide.
+- Documented camera streaming, recording, exports, ACT training/inference, store workflows and web-only features.
+- Replaced unsupported standalone `say` / `shell` / `exec` examples; clarified full IDs, permission combinations, explicit camera selection and key revocation.
+- Made `B2R_API_KEY` the skill's primary environment variable and removed the mandatory cache-file prerequisite so environment-only authentication is discoverable.
+- Updated the public repository READMEs and the web API guide. No CLI runtime commands changed.
+
 ## [0.8.0] — 2026-10-05
 
 ### Added

@@ -15,30 +15,40 @@
 ```
 bin/
 ├── box2robot_arm/                       # 机械臂驱动板固件 (ESP32)
-│   ├── box2arm_v0.7.0_bootloader.bin
-│   ├── box2arm_v0.7.0_partitions.bin
-│   ├── box2arm_v0.7.0_firmware.bin
+│   ├── box2arm_v0.7.1_bootloader.bin
+│   ├── box2arm_v0.7.1_partitions.bin
+│   ├── box2arm_v0.7.1_firmware.bin
 │   └── History/                         # 历史版本
 ├── box2robot_cam/                       # 视觉语音模块固件 (ESP32-S3)
-│   ├── box2cam_v0.6.9_bootloader.bin
-│   ├── box2cam_v0.6.9_partitions.bin
-│   ├── box2cam_v0.6.9_firmware.bin
+│   ├── box2cam_v0.7.0_bootloader.bin
+│   ├── box2cam_v0.7.0_partitions.bin
+│   ├── box2cam_v0.7.0_firmware.bin
 │   └── history/                         # 历史版本
 ├── download_driver_CP210x_USB_TO_UART/  # CP210x USB 转串口驱动
 └── flash_download_tool_windows/         # 乐鑫官方 Windows 烧录工具
     └── flash_download_tool_3.9.9_R2.exe
 ```
 
-> 当前版本：机械臂固件 v0.7.0 / 摄像头固件 v0.6.9。两个设备需要分别升级，不能混用固件。
+> 当前版本：机械臂固件 v0.7.1 / 摄像头固件 v0.7.0。两个设备需要分别升级，不能混用固件。
 
-## 本次更新（2026-10-07）
+## 本次更新（2026-10-10）
 
-- **ARM v0.7.0**：六个关节独立力矩保护；20 ms 检测周期（目标 50 Hz）和三采样负载滤波。ID 1–6 出厂阈值分别为 **500 / 600 / 650 / 550 / 450 / 150**，已保存的配置可覆盖默认值。支持手动回驱时降低力矩让位、松手后缓慢返回原目标，并包含温度与堵转保护。
-- **状态上报**：ARM 快速状态帧携带各关节负载、保护阈值、保护状态和力矩使能状态；保护状态变化时立即发送 `servo_protection` 事件，不必等常规状态帧。这里的阈值是舵机原始负载值，**不是 N·m**。
-- **CAM v0.6.9**：OTA 限定受信任的 HTTPS 下载地址、禁止 HTTP 跳转，并在备用分区写入及镜像校验成功后才切换启动分区；增加 30 分钟总超时、60 秒无进度退出和失败原因上报。
-- 两个版本均已编译、打包并发布 OTA；六个镜像已核对芯片、分区容量及本地与服务器 SHA256，保留旧版本。公网版本检查、更新说明和两份应用固件实际下载校验已通过。机械臂回驱手感、真实负载保护及设备端 OTA 仍需实机验证，服务器发布不代表设备已经升级。
+- **ARM v0.7.1**：新增可持久保存的力矩保护使能开关，默认开启。在官网「机械臂调试」切换，并以设备上报状态为准。开启后运动可能减缓、可承受负载降低，以尽可能保护电机；关闭后取消负载限力与目标钳位，碰撞或堵转时受力增大，温度保护仍保留。此开关与控制舵机通断的「力矩」开关不同。
+- **ARM v0.7.1 / CAM v0.7.0**：`192.168.4.1` 配网页重新扫描时保留旧列表供选择，按钮显示 `Scanning` 并防止重复扫描；成功后刷新列表，失败保留旧结果。页面支持中英文切换，切换时保留输入的 WiFi 名称与密码。
+- **分别配网、分别绑定**：驱动板连接 `Box2Robot_XXXX`，摄像头连接 `Box2Cam_XXXX`；每次访问的 `192.168.4.1` 只属于当前连接的设备。分别配置 2.4 GHz WiFi，然后用驱动板 OLED 和摄像头语音提供的绑定码，将两台设备分别绑定到同一账号。
+- **旧固件兼容**：不支持保护开关的旧固件会禁用网页开关，其他原有控制仍可使用。ARM 需升级到 0.7.1 才能使用本次开关；重启保留已保存的设置。
+- 详细操作见[官网公开使用手册](https://robot.box2ai.com/#/pages/developer/docs?section=connect)，无需登录即可阅读。设备端实际运动、保护效果和 OTA 重启后的功能仍需实机验证。
+- 本次六个镜像的文件大小与 SHA256 见 [`firmware-release-20261010.json`](firmware-release-20261010.json)，旧版本文件保留。
 
-2026-10-07 已重新编译 ARM，并替换本地发布包和 OTA 服务器的三个 `box2arm_v0.7.0_*.bin` 同名文件，保留旧包备份；CAM 不变。当前 ARM 应用镜像为 **1,252,832 字节**，SHA256 为 `09d0ce0bfeca9890313286929f3115be1ff0b8c7659d95b26e31902e5d647fa1`，三个公网下载均已核验。版本号仍为 **0.7.0**，已安装 0.7.0 的设备不会通过常规版本检查发现这次替换，需要重新烧录或单独安排同版本重刷；本次未向设备发送升级或重启命令。
+### 力矩保护配置指令
+
+开发接口：`POST /api/device/{device_id}/config`（使用已授权的账号/API 凭据）。开启时发送：
+
+```json
+{"params":{"torque_protection_enabled":true}}
+```
+
+关闭时将 `true` 改为 `false`，必须使用 JSON 布尔值。先检查 `GET /api/device/{device_id}/servos` 返回的 `torque_protection_supported`；不支持时不要下发。配置请求成功只表示已提交，需等 `torque_protection_enabled` 的设备上报确认，不要把 `torque_protection_desired` 当作已生效状态。
 
 ### OTA 与离线烧录
 
@@ -95,7 +105,7 @@ python -m esptool --chip esp32 erase_flash
 写入固件（注意 bootloader 起始地址为 **0x1000**）：
 
 ```bash
-python -m esptool --chip esp32 --baud 921600 write_flash   0x1000  bin/box2robot_arm/box2arm_v0.7.0_bootloader.bin  0x8000  bin/box2robot_arm/box2arm_v0.7.0_partitions.bin  0x10000 bin/box2robot_arm/box2arm_v0.7.0_firmware.bin
+python -m esptool --chip esp32 --baud 921600 write_flash   0x1000  bin/box2robot_arm/box2arm_v0.7.1_bootloader.bin  0x8000  bin/box2robot_arm/box2arm_v0.7.1_partitions.bin  0x10000 bin/box2robot_arm/box2arm_v0.7.1_firmware.bin
 ```
 
 ### 3. 烧录视觉语音模块（ESP32-S3）
@@ -109,7 +119,7 @@ python -m esptool --chip esp32s3 erase_flash
 写入固件（注意 bootloader 起始地址为 **0x0**，与 ESP32 不同）：
 
 ```bash
-python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0  bin/box2robot_cam/box2cam_v0.6.9_bootloader.bin  0x8000  bin/box2robot_cam/box2cam_v0.6.9_partitions.bin   0x10000 bin/box2robot_cam/box2cam_v0.6.9_firmware.bin
+python -m esptool --chip esp32s3 --baud 921600 write_flash  0x0  bin/box2robot_cam/box2cam_v0.7.0_bootloader.bin  0x8000  bin/box2robot_cam/box2cam_v0.7.0_partitions.bin   0x10000 bin/box2robot_cam/box2cam_v0.7.0_firmware.bin
 ```
 
 ### 4. 手动指定串口（可选）
@@ -158,9 +168,9 @@ python -m esptool --chip esp32 --port /dev/ttyUSB0 erase_flash
 
 | 文件 | 地址 |
 |------|------|
-| `box2arm_v0.7.0_bootloader.bin` | `0x1000` |
-| `box2arm_v0.7.0_partitions.bin` | `0x8000` |
-| `box2arm_v0.7.0_firmware.bin`   | `0x10000` |
+| `box2arm_v0.7.1_bootloader.bin` | `0x1000` |
+| `box2arm_v0.7.1_partitions.bin` | `0x8000` |
+| `box2arm_v0.7.1_firmware.bin`   | `0x10000` |
 
 确认 3 行前面的**复选框全部勾选**，下方设置 `COM` 端口与 `BAUD = 921600`，点击 **START**：
 
@@ -190,9 +200,9 @@ python -m esptool --chip esp32 --port /dev/ttyUSB0 erase_flash
 
 | 文件 | 地址 |
 |------|------|
-| `box2cam_v0.6.9_bootloader.bin` | `0x0` |
-| `box2cam_v0.6.9_partitions.bin` | `0x8000` |
-| `box2cam_v0.6.9_firmware.bin`   | `0x10000` |
+| `box2cam_v0.7.0_bootloader.bin` | `0x0` |
+| `box2cam_v0.7.0_partitions.bin` | `0x8000` |
+| `box2cam_v0.7.0_firmware.bin`   | `0x10000` |
 
 确认 3 行前面的**复选框全部勾选**，下方设置 `COM` 端口与 `BAUD = 921600`，点击 **START**：
 

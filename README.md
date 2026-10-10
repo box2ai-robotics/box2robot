@@ -10,7 +10,7 @@
 
 Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块连接到云端平台，实现数据采集、模型训练和技能共享。无需复杂配置 —— 烧录固件、连 WiFi、绑定设备，即可开始。
 
-> **当前固件包：v0.7.0**（机械臂固件 v0.7.0 / 摄像头固件 v0.6.9，均已编译、打包并发布 OTA；设备端升级与力矩保护仍待实机验证）
+> **当前固件包：ARM v0.7.1 / CAM v0.7.0**（机械臂固件 v0.7.1 / 摄像头固件 v0.7.0，均已编译、打包并发布 OTA；设备端升级与力矩保护仍待实机验证）
 
 ## 快速开始
 
@@ -51,6 +51,9 @@ Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块
   <img src="assets/battery_install.jpg" style="width:45%;max-width:360px;"/>
 </div>
 
+> **驱动板与摄像头是两台独立设备，必须分别连接 WiFi、分别绑定到同一账号。** 完成驱动板配置后，再连接摄像头热点重复配网与绑定。两者同为 `192.168.4.1`，但访问的是当前热点对应的设备。
+> [完整使用手册（无需登录）](https://robot.box2ai.com/#/pages/developer/docs?section=connect) · [新版固件、烧录与力矩保护指令](bin/README.md)
+
 ### 2. 连接设备热点
 
 给设备上电，设备会创建 WiFi 热点：
@@ -61,7 +64,7 @@ Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块
 
 ### 3. 配置 WiFi
 
-在配网页面输入 WiFi 名称和密码。设备会保存凭据、重启并连接到你的网络。
+在配网页面输入 2.4 GHz WiFi 名称和密码。设备会保存凭据、重启并连接到你的网络。页面可切换中英文；重新扫描时按钮显示 `Scanning`，旧列表仍可选择，成功后再刷新。
 
 ### 4. 绑定设备
 
@@ -91,54 +94,26 @@ Box2Robot 是一个开源具身智能平台。将 ESP32 机械臂和视觉模块
 
 ## AI 智能体控制 (Skills CLI)
 
-让 **Claude Code**、**GPT** 等 AI 智能体直接控制你的机械臂。Box2Robot 提供两种接入方式：
+从 [Skills 分步使用说明](box2robot_skills/README.md) 开始：获取 API Key → 安装 CLI → 指定机械臂 → 查询状态 → 小幅动作 → 相机采集、训练推理与技能商店。
 
-### 方式一：从 ClawHub 一键安装（推荐）
-
-[**ClawHub · box2robot-skills →**](https://clawhub.ai/boxjod/box2robot-skills)
-
-无需克隆代码，直接从 ClawHub 平台下载并安装 `box2robot-skills` 技能包，AI Agent 即可接入云端控制机械臂。适合大多数用户。
-
-### 方式二：克隆仓库本地使用（开发者）
-
-如果你想自定义 Action、修改源码或离线运行 CLI，克隆仓库使用：
+1. 登录 [工作台](https://robot.box2ai.com)，绑定设备并确认在线与校准。
+2. 账户 / 个人中心 → [API 密钥](https://robot.box2ai.com/#/pages/profile/api-keys) → “＋ 生成新密钥”。填写名称，选择权限，生成后复制并保存完整 Key（只显示一次）。基础控制选择 `device`，其他功能按需增加权限。
+3. 获取 [ClawHub 技能包](https://clawhub.ai/boxjod/box2robot-skills)，或克隆本仓库进入 `box2robot_skills`，安装依赖：
 
 ```bash
-git clone https://github.com/box2ai-robotics/box2robot.git
-cd box2robot/box2robot_skills
-
-# 登录 (token 缓存，后续免登录)
-python b2r.py login <username> <password>
-
-# 操控
-python b2r.py devices                # 查看设备
-python b2r.py home                   # 回零位
-python b2r.py move 1 2048 500        # 1号舵机转到2048
-python b2r.py torque off             # 释放力矩
-python b2r.py record start           # 开始录制
-python b2r.py record stop            # 停止录制
-python b2r.py play                   # 列出并播放轨迹
-
-# 技能商店（ACT Store —— 浏览/购买/运行他人共享的技能）
-python b2r.py store list             # 浏览技能商店
-python b2r.py store info <task>      # 查看技能详情
-python b2r.py store buy <task>       # 购买付费技能
-python b2r.py store run <task>       # 在自己的设备上执行技能
-python b2r.py store mine             # 已购技能列表
-
-python b2r.py say "拍个照"            # 自然语言指令
-python b2r.py shell                  # 交互式 Shell
+python -m pip install "aiohttp>=3.9,<4"
+python b2r.py --help
+# 按分步说明设置 B2R_API_KEY 和 B2R_DEVICE 后：
+python b2r.py devices
+python b2r.py status
 ```
 
-### 配合 Claude Code 使用
+4. 对照实时位置和关节限位，在人工看护下执行明确的小幅动作。完整 PowerShell / Bash 示例见 [使用说明](box2robot_skills/README.md)。API 返回已下发不等于动作已完成。
+5. 教程覆盖实时相机帧、带图像录制、数据集下载、视频生成、ACT 训练推理和商店技能，并介绍 Code as Policy、上下文技能、个人技能仓库与姿态记忆的网页入口。
 
-```
-"读一下 box2robot_skills/SKILLS.md，然后把1号舵机转到2048"
-"录一段轨迹，录完后播放一遍"
-"查看舵机状态，然后回零位"
-```
+让智能体先读取 [SKILL.md](box2robot_skills/SKILL.md)，再按任务查阅 [SKILLS.md](box2robot_skills/SKILLS.md)。例如：“先查询我指定机械臂的状态，不发送运动；确认后再做一次小幅测试。”独立 `b2r.py` 不支持旧文档中的 `say`、`shell`、`exec`。
 
-详见 `box2robot_skills/SKILLS.md`（AI 智能体调度手册，79 个 Action、预检规则、工作流模板）。
+[网页开发文档：API 与 CLI](https://robot.box2ai.com/#/pages/developer/docs?section=api) · [Code as Policy](https://robot.box2ai.com/#/pages/developer/docs?section=code-policy)。平台 API Key 和模型供应商 API Key 用途不同；退出 CLI 不会吊销 Key，停用时到网页吊销。
 
 ---
 
@@ -167,7 +142,7 @@ git clone --recurse-submodules https://github.com/box2ai-robotics/box2robot.git
 1. 设备绑定后进入 [https://robot.box2ai.com](https://robot.box2ai.com/#/) → **设备管理**
 2. 在设备详情中点击 **固件升级**，云端会自动推送最新固件并完成升级
 
-当前 OTA 版本为 **ARM v0.7.0 / CAM v0.6.9**，两个设备分别升级。正常 OTA 只写入应用固件，不执行整片擦除；升级前停止录制、推理和动作执行，支撑机械臂，并保持设备供电与网络稳定。版本接口、更新说明及两份固件的实际下载 SHA256 已核验；服务器发布成功不等于设备已升级。
+当前 OTA 版本为 **ARM v0.7.1 / CAM v0.7.0**，两个设备分别升级。正常 OTA 只写入应用固件，不执行整片擦除；升级前停止录制、推理和动作执行，支撑机械臂，并保持设备供电与网络稳定。版本接口、更新说明及两份固件的实际下载 SHA256 已核验；服务器发布成功不等于设备已升级。
 
 **手动烧录**（适用于首次烧录空板、设备无法启动、需要刷写自编译固件等场景）：详见 [`bin/README.md`](bin/README.md)。
 
@@ -177,6 +152,8 @@ git clone --recurse-submodules https://github.com/box2ai-robotics/box2robot.git
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| v0.7.1 (arm) | 2026-10-10 | 默认开启、持久保存的力矩保护开关；关闭取消负载限力与目标钳位，温度保护保留；配网页扫描保留旧列表、Scanning 状态与中英文切换 |
+| v0.7.0 (cam) | 2026-10-10 | 配网页扫描期间保留可选择的旧列表，防重复扫描、超时恢复与中英文切换；沿用受信任 HTTPS OTA 校验 |
 | v0.6.9 (cam) | 2026-10-07 | OTA 安全与可靠性更新：受信任 HTTPS 下载地址、禁止 HTTP 跳转、备用分区写入校验后切换启动、30 分钟总超时与 60 秒无进度退出、失败原因上报；提供固件、引导程序和分区表三个镜像，保留旧版本；设备端升级仍待实机验证 |
 | v0.7.0 (arm) | 2026-10-07 | 新增六关节逐关节力矩保护：20 ms 周期（目标 50 Hz）的三采样负载检测、出厂差异化阈值（ID1~6：500/600/650/550/450/150，原始负载单位），支持手动回驱时降力矩让位、松手后按原目标缓慢回位；增加温度/堵转保护，并通过快速状态帧和 `servo_protection` 事件向 Server 实时上报负载、阈值、保护状态和触发原因 |
 | v0.6.6 (arm) | 2026-05-04 | 修复录制中 WS 断连（transport_poll_write）：RAM 录制缓冲 1200→300 帧释放约 80KB BSS，heap 从 30KB 恢复至约 110KB；长录制由 SPIFFS 兜底 |
