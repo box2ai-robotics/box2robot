@@ -10,7 +10,7 @@ English | [中文](README.md)
 
 Box2Robot is an open-source embodied AI platform. It connects ESP32-powered robot arms and vision modules to a cloud platform for data collection, model training, and skill sharing. No complex setup — just flash, connect WiFi, bind your device, and start.
 
-> **Current Firmware Package: ARM v0.7.1 / CAM v0.7.0** (Arm firmware v0.7.1 / Camera firmware v0.7.0; both built, packaged, and published for OTA; device-side upgrade and torque-protection validation pending)
+> **Current Firmware Package: ARM v0.7.2 / CAM v0.7.1** (Arm firmware v0.7.2 / Camera firmware v0.7.1; both built, packaged, and published for OTA; device-side upgrade and torque-protection validation pending)
 
 ## Getting Started
 
@@ -142,7 +142,7 @@ The device ships with the latest firmware pre-flashed. **Online OTA update is re
 1. After binding, open [https://robot.box2ai.com](https://robot.box2ai.com/#/) → **Device Management**
 2. In device details, click **Firmware Update**. The cloud will push the latest firmware automatically.
 
-Current OTA versions are **ARM v0.7.1 / CAM v0.7.0**; update each device separately. Normal OTA writes only the application image and does not erase the entire flash. Stop recording, inference, and motion, support the arm, and keep power and networking stable. The version API, release notes, and SHA256 of both actual firmware downloads have been verified; publishing does not mean devices have already upgraded.
+Current OTA versions are **ARM v0.7.2 / CAM v0.7.1**; update each device separately. Normal OTA writes only the application image and does not erase the entire flash. Stop recording, inference, and motion, support the arm, and keep power and networking stable. The version API, release notes, and SHA256 of both actual firmware downloads have been verified; publishing does not mean devices have already upgraded.
 
 **Manual flashing** (for first-time flashing of blank boards, devices that won't boot, or custom-built firmware): see [`bin/README_en.md`](bin/README_en.md).
 
@@ -152,7 +152,9 @@ Current OTA versions are **ARM v0.7.1 / CAM v0.7.0**; update each device separat
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v0.7.2 (arm) | 2026-10-10 | Compensate UART time in slider paths and skip repeated samples; per-joint raw-load thresholds, fixed 100-tick lead, no trip at equality; protection off restores output limit 1000; raw model and output-limit telemetry. |
 | v0.7.1 (arm) | 2026-10-10 | Persistent torque-protection switch, on by default; disabling removes load limiting and target clamping while retaining thermal protection. WiFi rescans preserve previous results, show Scanning, and support Chinese/English. |
+| v0.7.1 (cam) | 2026-10-12 | Fix WiFi provisioning after factory reset/scanning: stop scans, clear stale state and explicitly connect. Preserve bilingual setup and saved-network reconnection. |
 | v0.7.0 (cam) | 2026-10-10 | WiFi provisioning retains selectable results while scanning, prevents duplicate scans, recovers from timeouts, and supports Chinese/English. Trusted HTTPS OTA validation is retained. |
 | v0.6.9 (cam) | 2026-10-07 | OTA security and reliability: trusted HTTPS download URLs, no HTTP redirects, boot-partition switching only after inactive-image validation, a 30-minute overall timeout, a 60-second no-progress timeout, and failure-reason reporting. Firmware, bootloader, and partition images are provided; older packages are retained. Device-side OTA validation is pending. |
 | v0.7.0 (arm) | 2026-10-07 | Add independent protection for all six joints: a 20 ms check interval (target 50 Hz), three-sample load filtering, factory limits 500/600/650/550/450/150 for IDs 1–6 in raw load units, backdrive yield with reduced torque and slow return after release, thermal/stall safeguards, and fast WebSocket telemetry plus immediate `servo_protection` events. |

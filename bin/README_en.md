@@ -10,26 +10,34 @@ This directory contains pre-built firmware for the Box2Robot Arm Driver Board an
 
 ---
 
+
+### CAM v0.7.1 WiFi connection fix
+
+- Fix connection failures/timeouts when provisioning after a factory reset or WiFi scan. Stop scanning, clear stale connection state and explicitly connect with the submitted credentials.
+- Preserve Chinese/English provisioning and saved-network reconnection. Windows configuration subprocesses use UTF-8.
+- Image sizes, flash offsets and SHA256: [firmware-release-cam-0.7.1.json](firmware-release-cam-0.7.1.json). All three public downloads verified; device upgrade validation remains pending.
+
+
 ## Directory Layout
 
 ```
 bin/
 ├── box2robot_arm/                       # Arm Driver Board firmware (ESP32)
-│   ├── box2arm_v0.7.1_bootloader.bin
-│   ├── box2arm_v0.7.1_partitions.bin
-│   ├── box2arm_v0.7.1_firmware.bin
+│   ├── box2arm_v0.7.2_bootloader.bin
+│   ├── box2arm_v0.7.2_partitions.bin
+│   ├── box2arm_v0.7.2_firmware.bin
 │   └── History/                         # Older versions
 ├── box2robot_cam/                       # Vision-Audio Module firmware (ESP32-S3)
-│   ├── box2cam_v0.7.0_bootloader.bin
-│   ├── box2cam_v0.7.0_partitions.bin
-│   ├── box2cam_v0.7.0_firmware.bin
+│   ├── box2cam_v0.7.1_bootloader.bin
+│   ├── box2cam_v0.7.1_partitions.bin
+│   ├── box2cam_v0.7.1_firmware.bin
 │   └── history/                         # Older versions
 ├── download_driver_CP210x_USB_TO_UART/  # CP210x USB-to-UART driver
 └── flash_download_tool_windows/         # Espressif Flash Download Tool (Windows)
     └── flash_download_tool_3.9.9_R2.exe
 ```
 
-> Current versions: Arm firmware v0.7.1 / Camera firmware v0.7.0. Update each device separately; their images are not interchangeable.
+> Current versions: Arm firmware v0.7.2 / Camera firmware v0.7.1. Update each device separately; their images are not interchangeable.
 
 ## Release Notes (2026-10-10)
 
@@ -38,9 +46,29 @@ bin/
 - **Configure and bind both devices separately**: Connect to `Box2Robot_XXXX` for the driver board and `Box2Cam_XXXX` for the camera. Each `192.168.4.1` page belongs to the device whose hotspot is currently connected. Configure 2.4 GHz WiFi for each device, then bind both to the same account using their separate codes (arm OLED / camera voice).
 - **Older firmware**: Unsupported firmware keeps the protection switch disabled while existing controls remain available. Upgrade ARM to 0.7.1 for the new switch; saved settings survive reboot.
 - The [public user manual](https://robot.box2ai.com/#/pages/developer/docs?section=connect) requires no login. Physical motion, protection behavior, and device-side OTA still require hardware validation.
-- Sizes and SHA256 hashes for all six images are in [`firmware-release-20261010.json`](firmware-release-20261010.json). Older files are retained.
+- Sizes and SHA256 hashes for the previous ARM 0.7.1 / CAM 0.7.0 images are in [`firmware-release-20261010.json`](firmware-release-20261010.json). Older files are retained.
+
+### ARM 0.7.2 update
+
+- Slider batches target 10ms sample spacing after accounting for UART work; overruns do not cause catch-up bursts. Duplicate positions within a batch are skipped. The web slider retains two 45ms filter stages.
+- Independent raw-load thresholds default to 500/600/650/550/450/200. Configure `protect_limits` per actual motor, gearing and load; custom NVS values survive OTA. Disabling protection removes load/100-tick clamping and restores the confirmed output limit to 1000; thermal protection remains.
+- STS/HX-compatible output-limit writes require readback. Model names or a 50kg rating are not converted into torque thresholds; gear ratios are not inferred and ST3250 hardware calibration is not claimed. New models require a compatible output-limit register layout; reading an identity is not proof of compatibility.
+- No adaptive lead reduction, stall timer, recovery delay or added fixed speed cap. Telemetry reports `model_raw`, last-confirmed `output_limit` and `adaptive_lead=100`; the latter does not clamp movement when protection is disabled.
+- ARM image hashes: [firmware-release-arm-0.7.2.json](firmware-release-arm-0.7.2.json). CAM is now 0.7.1; old images are retained. Physical jitter and protection across models still need hardware validation.
 
 ### Torque-protection configuration command
+
+Configure `protect_limits` per servo ID for different motors or gear ratios.
+The first entry addresses ID1. Values are 100–1000 in raw output/load units,
+not kg·cm or Nm. The current six-joint defaults are:
+
+```json
+{"params":{"protect_limits":[500,600,650,550,450,200]}}
+```
+
+This array replaces the entire per-ID override table; omitted IDs or zero
+entries revert to defaults. Review the corresponding ID after replacing a
+motor; OTA does not automatically calibrate thresholds for a new model.
 
 Send `POST /api/device/{device_id}/config` with authorized account/API credentials. To enable:
 
@@ -106,9 +134,9 @@ Write firmware (note: bootloader address is **0x1000**):
 
 ```bash
 python -m esptool --chip esp32 --baud 921600 write_flash \
-  0x1000  bin/box2robot_arm/box2arm_v0.7.1_bootloader.bin \
-  0x8000  bin/box2robot_arm/box2arm_v0.7.1_partitions.bin \
-  0x10000 bin/box2robot_arm/box2arm_v0.7.1_firmware.bin
+  0x1000  bin/box2robot_arm/box2arm_v0.7.2_bootloader.bin \
+  0x8000  bin/box2robot_arm/box2arm_v0.7.2_partitions.bin \
+  0x10000 bin/box2robot_arm/box2arm_v0.7.2_firmware.bin
 ```
 
 ### 3. Flash the Vision-Audio Module (ESP32-S3)
@@ -123,9 +151,9 @@ Write firmware (note: bootloader address is **0x0**, different from ESP32):
 
 ```bash
 python -m esptool --chip esp32s3 --baud 921600 write_flash \
-  0x0     bin/box2robot_cam/box2cam_v0.7.0_bootloader.bin \
-  0x8000  bin/box2robot_cam/box2cam_v0.7.0_partitions.bin \
-  0x10000 bin/box2robot_cam/box2cam_v0.7.0_firmware.bin
+  0x0     bin/box2robot_cam/box2cam_v0.7.1_bootloader.bin \
+  0x8000  bin/box2robot_cam/box2cam_v0.7.1_partitions.bin \
+  0x10000 bin/box2robot_cam/box2cam_v0.7.1_firmware.bin
 ```
 
 ### 4. Specify Serial Port Manually (Optional)
@@ -174,9 +202,9 @@ Click the `...` button to load each of the 3 bin files, and fill in the **corres
 
 | File | Address |
 |------|---------|
-| `box2arm_v0.7.1_bootloader.bin` | `0x1000` |
-| `box2arm_v0.7.1_partitions.bin` | `0x8000` |
-| `box2arm_v0.7.1_firmware.bin`   | `0x10000` |
+| `box2arm_v0.7.2_bootloader.bin` | `0x1000` |
+| `box2arm_v0.7.2_partitions.bin` | `0x8000` |
+| `box2arm_v0.7.2_firmware.bin`   | `0x10000` |
 
 Make sure **all 3 checkboxes are ticked**. Set `COM` port and `BAUD = 921600`, then click **START**:
 
@@ -206,9 +234,9 @@ Click **OK** to enter the main interface.
 
 | File | Address |
 |------|---------|
-| `box2cam_v0.7.0_bootloader.bin` | `0x0` |
-| `box2cam_v0.7.0_partitions.bin` | `0x8000` |
-| `box2cam_v0.7.0_firmware.bin`   | `0x10000` |
+| `box2cam_v0.7.1_bootloader.bin` | `0x0` |
+| `box2cam_v0.7.1_partitions.bin` | `0x8000` |
+| `box2cam_v0.7.1_firmware.bin`   | `0x10000` |
 
 Make sure **all 3 checkboxes are ticked**. Set `COM` port and `BAUD = 921600`, then click **START**:
 

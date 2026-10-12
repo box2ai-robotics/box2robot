@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-10",
+  "versions": {
+    "Box2Robot-Arm": "0.7.2"
+  },
+  "files": [
+    {
+      "path": "box2robot_arm/box2arm_v0.7.2_firmware.bin",
+      "model": "Box2Robot-Arm",
+      "version": "0.7.2",
+      "kind": "firmware",
+      "bytes": 1262272,
+      "sha256": "bb28acdb48edb99e538f042162ec12c3e8ca38c50efc4ebbe9da8aa91d530027",
+      "flash_offset": "0x10000"
+    },
+    {
+      "path": "box2robot_arm/box2arm_v0.7.2_bootloader.bin",
+      "model": "Box2Robot-Arm",
+      "version": "0.7.2",
+      "kind": "bootloader",
+      "bytes": 26048,
+      "sha256": "07515ab0f256e2ab74e38acd67204be7954844a946043b342ad154f3c91e3b52",
+      "flash_offset": "0x1000"
+    },
+    {
+      "path": "box2robot_arm/box2arm_v0.7.2_partitions.bin",
+      "model": "Box2Robot-Arm",
+      "version": "0.7.2",
+      "kind": "partitions",
+      "bytes": 3072,
+      "sha256": "1ae446228d79cf83a4b83de41c33d1e01dc21a3557149d7da90fbcbfc303311d",
+      "flash_offset": "0x8000"
+    }
+  ]
+}
